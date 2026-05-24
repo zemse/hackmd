@@ -11,7 +11,6 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::error::{Error, Result};
-use crate::types::User;
 
 /// Default base URL used when callers don't override the endpoint.
 pub const DEFAULT_ENDPOINT: &str = "https://api.hackmd.io/v1";
@@ -109,11 +108,6 @@ impl Client {
         })
     }
 
-    /// `GET /me` — the authenticated user profile.
-    pub async fn me(&self) -> Result<User> {
-        self.request_json::<(), User>(Method::GET, "me", None).await
-    }
-
     // ─── Internal request plumbing ──────────────────────────────────────
 
     fn url(&self, path: &str) -> String {
@@ -137,7 +131,6 @@ impl Client {
     }
 
     /// Send an ETag-aware GET; returns [`CachedResponse`].
-    #[allow(dead_code)] // used by the note endpoints landing in M2
     pub(crate) async fn request_with_etag<T>(
         &self,
         path: &str,
