@@ -130,7 +130,8 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/teams/demo/notes"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!([note_json("tn1", "T1")])),
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!([note_json("tn1", "T1")])),
             )
             .expect(1)
             .mount(&server)
@@ -152,9 +153,7 @@ mod tests {
                 "title": "Hi",
                 "content": "# Hi"
             })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(single_note_json("tn1", "# Hi")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(single_note_json("tn1", "# Hi")))
             .expect(1)
             .mount(&server)
             .await;
@@ -180,9 +179,7 @@ mod tests {
         Mock::given(method("PATCH"))
             .and(path("/teams/demo/notes/tn1"))
             .and(body_json(serde_json::json!({ "content": "new" })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(single_note_json("tn1", "new")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(single_note_json("tn1", "new")))
             .expect(1)
             .mount(&server)
             .await;
@@ -201,9 +198,7 @@ mod tests {
         Mock::given(method("PATCH"))
             .and(path("/teams/demo/notes/tn1"))
             .and(body_json(serde_json::json!({ "title": "T2" })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(single_note_json("tn1", "body")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(single_note_json("tn1", "body")))
             .expect(1)
             .mount(&server)
             .await;
@@ -225,9 +220,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
             .and(path("/teams/demo/notes/tn1"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(single_note_json("tn1", "gone")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(single_note_json("tn1", "gone")))
             .expect(1)
             .mount(&server)
             .await;

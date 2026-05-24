@@ -24,12 +24,8 @@ impl Client {
 
     /// `POST /folders` — create a new user folder.
     pub async fn create_folder(&self, body: CreateUserFolderBody) -> Result<ApiFolder> {
-        self.request_json::<CreateUserFolderBody, ApiFolder>(
-            Method::POST,
-            "folders",
-            Some(&body),
-        )
-        .await
+        self.request_json::<CreateUserFolderBody, ApiFolder>(Method::POST, "folders", Some(&body))
+            .await
     }
 
     /// `GET /folders/{id}` — fetch a single folder by id.
@@ -42,11 +38,7 @@ impl Client {
     /// `PATCH /folders/{id}` — update folder metadata. Absent fields are
     /// untouched; fields set to `Some(None)` are explicitly cleared on the
     /// server side.
-    pub async fn update_folder(
-        &self,
-        id: &str,
-        body: UpdateUserFolderBody,
-    ) -> Result<ApiFolder> {
+    pub async fn update_folder(&self, id: &str, body: UpdateUserFolderBody) -> Result<ApiFolder> {
         let path = format!("folders/{id}");
         self.request_json::<UpdateUserFolderBody, ApiFolder>(Method::PATCH, &path, Some(&body))
             .await
@@ -115,12 +107,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/folders"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!([
-                    folder_json("f1", "Alpha"),
-                    folder_json("f2", "Beta"),
-                ])),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                folder_json("f1", "Alpha"),
+                folder_json("f2", "Beta"),
+            ])))
             .expect(1)
             .mount(&server)
             .await;

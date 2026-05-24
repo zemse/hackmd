@@ -55,10 +55,7 @@ fn each_subcommand_help_succeeds() {
         "team-notes",
         "tui",
     ] {
-        bin()
-            .args([sub, "--help"])
-            .assert()
-            .success();
+        bin().args([sub, "--help"]).assert().success();
     }
 }
 
@@ -241,11 +238,14 @@ async fn logout_clears_token_in_config() {
     );
 }
 
+/// When the binary is built without the `tui` feature (the default for
+/// `cargo test`), the subcommand explains how to opt in.
+#[cfg(not(feature = "tui"))]
 #[tokio::test]
-async fn tui_subcommand_prints_stub() {
+async fn tui_subcommand_explains_missing_feature() {
     bin()
         .args(["tui"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("tui not yet implemented"));
+        .stdout(predicate::str::contains("built without the `tui` feature"));
 }

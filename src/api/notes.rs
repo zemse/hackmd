@@ -59,11 +59,7 @@ impl Client {
     }
 
     /// `PATCH /notes/{id}` — update arbitrary note metadata + content.
-    pub async fn update_note(
-        &self,
-        note_id: &str,
-        opts: UpdateNoteOptions,
-    ) -> Result<SingleNote> {
+    pub async fn update_note(&self, note_id: &str, opts: UpdateNoteOptions) -> Result<SingleNote> {
         let path = format!("notes/{note_id}");
         self.request_json::<UpdateNoteOptions, SingleNote>(Method::PATCH, &path, Some(&opts))
             .await
@@ -128,10 +124,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/notes"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!([note_json("n1", "T1"), note_json("n2", "T2")])),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                note_json("n1", "T1"),
+                note_json("n2", "T2")
+            ])))
             .expect(1)
             .mount(&server)
             .await;
@@ -268,9 +264,7 @@ mod tests {
                 "title": "T2",
                 "tags": ["x"]
             })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(single_note_json("n1", "body")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(single_note_json("n1", "body")))
             .expect(1)
             .mount(&server)
             .await;
@@ -290,9 +284,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
             .and(path("/notes/n1"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(single_note_json("n1", "gone")),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(single_note_json("n1", "gone")))
             .expect(1)
             .mount(&server)
             .await;

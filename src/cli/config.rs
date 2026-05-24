@@ -115,13 +115,21 @@ pub fn effective(
 
     let endpoint = cli_endpoint
         .map(|s| s.to_string())
-        .or_else(|| std::env::var(ENV_ENDPOINT_URL).ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var(ENV_ENDPOINT_URL)
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
         .or(file.hackmd_api_endpoint_url)
         .unwrap_or_else(|| crate::client::DEFAULT_ENDPOINT.to_string());
 
     let token = cli_token
         .map(|s| s.to_string())
-        .or_else(|| std::env::var(ENV_ACCESS_TOKEN).ok().filter(|s| !s.is_empty()))
+        .or_else(|| {
+            std::env::var(ENV_ACCESS_TOKEN)
+                .ok()
+                .filter(|s| !s.is_empty())
+        })
         .or(file.access_token)
         .filter(|s| !s.is_empty());
 
@@ -213,8 +221,12 @@ mod tests {
         };
         cfg.save_to(dir.path()).expect("save");
 
-        let eff = effective(Some(dir.path()), Some("https://cli.test/v1"), Some("cli-token"))
-            .expect("effective");
+        let eff = effective(
+            Some(dir.path()),
+            Some("https://cli.test/v1"),
+            Some("cli-token"),
+        )
+        .expect("effective");
         assert_eq!(eff.endpoint, "https://cli.test/v1");
         assert_eq!(eff.token.as_deref(), Some("cli-token"));
     }

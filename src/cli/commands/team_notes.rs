@@ -43,7 +43,9 @@ pub async fn create(
         Some(open_in_editor()?)
     } else if !std::io::stdin().is_terminal() {
         let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf).map_err(Error::Io)?;
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(Error::Io)?;
         if buf.is_empty() { content } else { Some(buf) }
     } else {
         content

@@ -2,7 +2,7 @@
 
 Rust client library and CLI for [HackMD](https://hackmd.io).
 
-Ports the official [`@hackmd/api`](https://github.com/hackmdio/api-client) SDK and [`@hackmd/hackmd-cli`](https://github.com/hackmdio/hackmd-cli) to Rust, with an optional TUI mode planned in a follow-up release.
+Ports the official [`@hackmd/api`](https://github.com/hackmdio/api-client) SDK and [`@hackmd/hackmd-cli`](https://github.com/hackmdio/hackmd-cli) to Rust, plus an optional terminal UI behind the `tui` feature.
 
 ## Install
 
@@ -56,7 +56,7 @@ hackmd team-notes --team-path <p> create  ...         # same flags as `notes cre
 hackmd team-notes --team-path <p> update --note-id <id> --content <c>
 hackmd team-notes --team-path <p> delete --note-id <id>
 
-hackmd tui                                            # TUI placeholder (coming in v0.0.3)
+hackmd tui                                            # interactive TUI (requires --features tui at install)
 ```
 
 Every list-style command accepts shared output flags:
@@ -106,6 +106,28 @@ cat draft.md | hackmd notes create --title "Draft"
 hackmd team-notes --team-path my-team create --editor --title "RFC"
 ```
 
+### TUI
+
+Install with the `tui` feature, then run `hackmd tui` to browse and edit your notes interactively:
+
+```sh
+cargo install hackmd --features tui
+hackmd tui
+```
+
+Two-pane layout: note list on the left, selected-note content on the right.
+
+| key             | action                                                  |
+|-----------------|---------------------------------------------------------|
+| `j` / `↓`       | move selection down                                     |
+| `k` / `↑`       | move selection up                                       |
+| `Enter` / `o`   | load the selected note into the right pane              |
+| `r`             | refresh the note list                                   |
+| `e`             | open the selected note in `$EDITOR` and save on exit    |
+| `q` / `Esc`     | quit                                                    |
+
+The TUI currently covers user notes only — team notes and folders are still CLI-only for this release.
+
 ## Library
 
 ```toml
@@ -133,7 +155,7 @@ The full SDK surface (user notes, team notes, folders + folder-order, ETag-aware
 | feature | default | what it pulls in |
 |---|---|---|
 | `cli` | yes | CLI binary and its dependencies |
-| `tui` | no  | TUI subcommand (implies `cli`) — coming in v0.0.3 |
+| `tui` | no  | TUI subcommand (implies `cli`) — install with `cargo install hackmd --features tui` |
 
 The `cli` feature gates compilation of `src/cli/` and the `hackmd` binary. The binary's `required-features = ["cli"]` means `cargo build --no-default-features` simply skips the binary build.
 

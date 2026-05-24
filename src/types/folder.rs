@@ -271,10 +271,7 @@ mod tests {
     #[test]
     fn api_folder_order_round_trip() {
         let mut order: ApiFolderOrder = HashMap::new();
-        order.insert(
-            "root".into(),
-            vec!["folder-1".into(), "folder-2".into()],
-        );
+        order.insert("root".into(), vec!["folder-1".into(), "folder-2".into()]);
         order.insert("folder-1".into(), vec!["folder-3".into()]);
         let json = serde_json::to_value(&order).expect("to_value");
         assert_eq!(json["root"], serde_json::json!(["folder-1", "folder-2"]));
@@ -294,6 +291,9 @@ mod tests {
         assert_eq!(json, serde_json::json!({ "order": { "root": ["a", "b"] } }));
 
         let parsed: UpdateFolderOrderBody = serde_json::from_value(json).expect("parse");
-        assert_eq!(parsed.order.get("root"), Some(&vec!["a".into(), "b".into()]));
+        assert_eq!(
+            parsed.order.get("root"),
+            Some(&vec!["a".into(), "b".into()])
+        );
     }
 }

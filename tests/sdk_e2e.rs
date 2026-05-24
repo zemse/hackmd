@@ -135,10 +135,7 @@ async fn e2e_create_update_fetch_delete_note_cycle() {
         }
     }
 
-    client
-        .delete_note(&created.id)
-        .await
-        .expect("delete_note");
+    client.delete_note(&created.id).await.expect("delete_note");
 }
 
 #[tokio::test]

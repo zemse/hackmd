@@ -63,7 +63,7 @@ pub enum Command {
     /// Manage team notes (list, create, update, delete).
     #[command(name = "team-notes")]
     TeamNotes(TeamNotesArgs),
-    /// Launch the TUI (placeholder — coming in v0.0.3).
+    /// Launch the TUI (requires the `tui` feature at build time).
     Tui,
 }
 
@@ -301,7 +301,9 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
             commands::teams::run(config_dir, endpoint, token, &args.output).await
         }
         Command::Notes(n) => match n.action {
-            NotesCmd::List(a) => commands::notes::list(config_dir, endpoint, token, &a.output).await,
+            NotesCmd::List(a) => {
+                commands::notes::list(config_dir, endpoint, token, &a.output).await
+            }
             NotesCmd::Get(a) => {
                 commands::notes::get(config_dir, endpoint, token, &a.note_id, &a.output).await
             }
@@ -356,27 +358,18 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 }
                 TeamNotesCmd::Update(a) => {
                     commands::team_notes::update(
-                        config_dir,
-                        endpoint,
-                        token,
-                        &team_path,
-                        &a.note_id,
-                        a.content,
+                        config_dir, endpoint, token, &team_path, &a.note_id, a.content,
                     )
                     .await
                 }
                 TeamNotesCmd::Delete(a) => {
                     commands::team_notes::delete(
-                        config_dir,
-                        endpoint,
-                        token,
-                        &team_path,
-                        &a.note_id,
+                        config_dir, endpoint, token, &team_path, &a.note_id,
                     )
                     .await
                 }
             }
         }
-        Command::Tui => commands::tui::run(),
+        Command::Tui => commands::tui::run(config_dir, endpoint, token).await,
     }
 }

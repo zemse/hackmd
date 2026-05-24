@@ -121,7 +121,11 @@ pub fn print_table_to<W: Write, T: Serialize>(
             for row in &array {
                 let line = columns
                     .iter()
-                    .map(|c| csv_escape(&json_field_to_string(row.get(c).unwrap_or(&serde_json::Value::Null))))
+                    .map(|c| {
+                        csv_escape(&json_field_to_string(
+                            row.get(c).unwrap_or(&serde_json::Value::Null),
+                        ))
+                    })
                     .collect::<Vec<_>>()
                     .join(",");
                 writeln!(out, "{line}").map_err(Error::Io)?;
@@ -153,7 +157,10 @@ pub fn print_table_to<W: Write, T: Serialize>(
     Ok(())
 }
 
-fn project(rows: &[serde_json::Value], columns: &[String]) -> Vec<serde_json::Map<String, serde_json::Value>> {
+fn project(
+    rows: &[serde_json::Value],
+    columns: &[String],
+) -> Vec<serde_json::Map<String, serde_json::Value>> {
     rows.iter()
         .map(|row| {
             let mut m = serde_json::Map::new();

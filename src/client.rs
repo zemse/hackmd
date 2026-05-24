@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, IF_NONE_MATCH};
+use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, IF_NONE_MATCH};
 use reqwest::{Method, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -275,8 +275,8 @@ async fn sleep_backoff(base: Duration, attempt: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -321,8 +321,8 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = Client::with_config("test-token", server.uri(), fast_config())
-            .expect("client builds");
+        let client =
+            Client::with_config("test-token", server.uri(), fast_config()).expect("client builds");
         let user = client.me().await.expect("me ok");
         assert_eq!(user.id, "u1");
         assert_eq!(user.name, "Alice");
@@ -619,7 +619,10 @@ mod tests {
         // bounded by initial+retries per task (5 × 4 = 20).
         let hits = counter.load(Ordering::SeqCst);
         assert!(hits >= 5, "expected >= 5 hits, got {hits}");
-        assert!(hits <= 20, "expected <= 20 hits (5 tasks × 4 tries), got {hits}");
+        assert!(
+            hits <= 20,
+            "expected <= 20 hits (5 tasks × 4 tries), got {hits}"
+        );
     }
 
     /// `x-ratelimit-userlimit` missing entirely → zero in the parsed error,
@@ -648,7 +651,11 @@ mod tests {
         let client = Client::with_config("t", server.uri(), cfg).expect("client");
         let err = client.me().await.expect_err("expected error");
         match err {
-            Error::RateLimit { user_limit, user_remaining, reset_after } => {
+            Error::RateLimit {
+                user_limit,
+                user_remaining,
+                reset_after,
+            } => {
                 assert_eq!(user_limit, 0);
                 assert_eq!(user_remaining, 5);
                 assert_eq!(reset_after, Some(1700000000));
@@ -681,7 +688,11 @@ mod tests {
         let client = Client::with_config("t", server.uri(), cfg).expect("client");
         let err = client.me().await.expect_err("expected error");
         match err {
-            Error::RateLimit { user_limit, user_remaining, reset_after } => {
+            Error::RateLimit {
+                user_limit,
+                user_remaining,
+                reset_after,
+            } => {
                 assert_eq!(user_limit, 100);
                 assert_eq!(user_remaining, 0);
                 assert!(reset_after.is_none());

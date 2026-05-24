@@ -67,7 +67,12 @@ fn note_list_json(id: &str, title: &str, team_path: Option<&str>) -> serde_json:
     })
 }
 
-fn folder_json(id: &str, name: &str, description: Option<&str>, color: Option<&str>) -> serde_json::Value {
+fn folder_json(
+    id: &str,
+    name: &str,
+    description: Option<&str>,
+    color: Option<&str>,
+) -> serde_json::Value {
     serde_json::json!({
         "id": id,
         "name": name,
@@ -94,7 +99,9 @@ async fn user_note_full_lifecycle_with_etag_cache() {
             "title": "Hello",
             "content": "# v1"
         })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(note_json("n1", "Hello", "# v1", None)))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(note_json("n1", "Hello", "# v1", None)),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -106,7 +113,9 @@ async fn user_note_full_lifecycle_with_etag_cache() {
             "content": "# v2",
             "title": "Hello v2"
         })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(note_json("n1", "Hello v2", "# v2", None)))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(note_json("n1", "Hello v2", "# v2", None)),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -135,7 +144,9 @@ async fn user_note_full_lifecycle_with_etag_cache() {
     // 5. DELETE → returns the deleted note
     Mock::given(method("DELETE"))
         .and(path("/notes/n1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(note_json("n1", "Hello v2", "# v2", None)))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(note_json("n1", "Hello v2", "# v2", None)),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -194,9 +205,12 @@ async fn team_note_flow_create_update_list_delete() {
     Mock::given(method("POST"))
         .and(path("/teams/demo/notes"))
         .and(body_json(serde_json::json!({ "title": "Spec" })))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(note_json("tn1", "Spec", "", Some("demo"))),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(note_json(
+            "tn1",
+            "Spec",
+            "",
+            Some("demo"),
+        )))
         .expect(1)
         .mount(&server)
         .await;
@@ -205,9 +219,12 @@ async fn team_note_flow_create_update_list_delete() {
     Mock::given(method("PATCH"))
         .and(path("/teams/demo/notes/tn1"))
         .and(body_json(serde_json::json!({ "content": "## body" })))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(note_json("tn1", "Spec", "## body", Some("demo"))),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(note_json(
+            "tn1",
+            "Spec",
+            "## body",
+            Some("demo"),
+        )))
         .expect(1)
         .mount(&server)
         .await;
@@ -215,9 +232,9 @@ async fn team_note_flow_create_update_list_delete() {
     // LIST
     Mock::given(method("GET"))
         .and(path("/teams/demo/notes"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!([note_list_json("tn1", "Spec", Some("demo"))])),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            note_list_json("tn1", "Spec", Some("demo"))
+        ])))
         .expect(1)
         .mount(&server)
         .await;
@@ -225,9 +242,12 @@ async fn team_note_flow_create_update_list_delete() {
     // DELETE
     Mock::given(method("DELETE"))
         .and(path("/teams/demo/notes/tn1"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(note_json("tn1", "Spec", "## body", Some("demo"))),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(note_json(
+            "tn1",
+            "Spec",
+            "## body",
+            Some("demo"),
+        )))
         .expect(1)
         .mount(&server)
         .await;
@@ -257,7 +277,10 @@ async fn team_note_flow_create_update_list_delete() {
     assert_eq!(listed[0].id, "tn1");
     assert_eq!(listed[0].team_path.as_deref(), Some("demo"));
 
-    let deleted = client.delete_team_note("demo", "tn1").await.expect("delete");
+    let deleted = client
+        .delete_team_note("demo", "tn1")
+        .await
+        .expect("delete");
     assert_eq!(deleted.id, "tn1");
 }
 
@@ -274,10 +297,12 @@ async fn folder_flow_create_update_list_delete_with_double_option() {
             "name": "Research",
             "color": "#abcdef"
         })))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(folder_json("f1", "Research", None, Some("#abcdef"))),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(folder_json(
+            "f1",
+            "Research",
+            None,
+            Some("#abcdef"),
+        )))
         .expect(1)
         .mount(&server)
         .await;
@@ -289,10 +314,12 @@ async fn folder_flow_create_update_list_delete_with_double_option() {
             "description": "now with words",
             "color": null
         })))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(folder_json("f1", "Research", Some("now with words"), None)),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(folder_json(
+            "f1",
+            "Research",
+            Some("now with words"),
+            None,
+        )))
         .expect(1)
         .mount(&server)
         .await;
@@ -302,7 +329,10 @@ async fn folder_flow_create_update_list_delete_with_double_option() {
         .and(path("/folders"))
         .respond_with(
             ResponseTemplate::new(200).set_body_json(serde_json::json!([folder_json(
-                "f1", "Research", Some("now with words"), None
+                "f1",
+                "Research",
+                Some("now with words"),
+                None
             )])),
         )
         .expect(1)
@@ -418,7 +448,9 @@ async fn folder_order_get_then_put_round_trip() {
         .and(body_json(serde_json::json!({
             "order": { "root": ["f1", "f2"] }
         })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(folder_json("f1", "Research", None, None)))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(folder_json("f1", "Research", None, None)),
+        )
         .expect(1)
         .mount(&server)
         .await;

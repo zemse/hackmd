@@ -33,13 +33,15 @@ pub mod api;
 pub mod cli;
 pub mod client;
 pub mod error;
+#[cfg(feature = "tui")]
+pub mod tui;
 pub mod types;
 
-pub use client::{CachedResponse, Client, ClientConfig, RetryConfig, DEFAULT_ENDPOINT};
+pub use client::{CachedResponse, Client, ClientConfig, DEFAULT_ENDPOINT, RetryConfig};
 pub use error::{Error, Result};
 pub use types::{
     ApiFolder, ApiFolderOrder, CommentPermissionType, CreateNoteOptions, CreateTeamFolderBody,
-    CreateUserFolderBody, FolderPath, Note, NotePermissionRole, NotePublishType,
-    SimpleUserProfile, SingleNote, Team, TeamVisibilityType, UpdateFolderOrderBody,
-    UpdateNoteOptions, UpdateTeamFolderBody, UpdateUserFolderBody, User,
+    CreateUserFolderBody, FolderPath, Note, NotePermissionRole, NotePublishType, SimpleUserProfile,
+    SingleNote, Team, TeamVisibilityType, UpdateFolderOrderBody, UpdateNoteOptions,
+    UpdateTeamFolderBody, UpdateUserFolderBody, User,
 };
