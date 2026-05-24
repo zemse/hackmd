@@ -130,6 +130,22 @@ impl Client {
         serde_json::from_str::<T>(&text).map_err(Error::Json)
     }
 
+    /// Send a request and discard the response body. Used for endpoints whose
+    /// upstream contract is `Promise<void>` (the folder DELETE family, for
+    /// example).
+    pub(crate) async fn request_empty<B>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<()>
+    where
+        B: Serialize + ?Sized,
+    {
+        let (_text, _headers, _status) = self.send_with_retry(method, path, body, None).await?;
+        Ok(())
+    }
+
     /// Send an ETag-aware GET; returns [`CachedResponse`].
     pub(crate) async fn request_with_etag<T>(
         &self,

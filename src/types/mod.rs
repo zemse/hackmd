@@ -7,7 +7,10 @@ mod folder;
 mod note;
 mod user;
 
-pub use folder::{ApiFolder, FolderPath};
+pub use folder::{
+    ApiFolder, ApiFolderOrder, CreateTeamFolderBody, CreateUserFolderBody, FolderPath,
+    UpdateFolderOrderBody, UpdateTeamFolderBody, UpdateUserFolderBody,
+};
 pub use note::{
     CommentPermissionType, CreateNoteOptions, Note, NotePermissionRole, NotePublishType,
     SingleNote, UpdateNoteOptions,

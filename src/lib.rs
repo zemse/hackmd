@@ -22,7 +22,8 @@ pub mod types;
 pub use client::{CachedResponse, Client, ClientConfig, RetryConfig, DEFAULT_ENDPOINT};
 pub use error::{Error, Result};
 pub use types::{
-    ApiFolder, CommentPermissionType, CreateNoteOptions, FolderPath, Note, NotePermissionRole,
-    NotePublishType, SimpleUserProfile, SingleNote, Team, TeamVisibilityType, UpdateNoteOptions,
-    User,
+    ApiFolder, ApiFolderOrder, CommentPermissionType, CreateNoteOptions, CreateTeamFolderBody,
+    CreateUserFolderBody, FolderPath, Note, NotePermissionRole, NotePublishType,
+    SimpleUserProfile, SingleNote, Team, TeamVisibilityType, UpdateFolderOrderBody,
+    UpdateNoteOptions, UpdateTeamFolderBody, UpdateUserFolderBody, User,
 };
