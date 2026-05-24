@@ -48,3 +48,8 @@ wiremock = "0.6"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 assert_cmd = "2"
 predicates = "3"
+dotenvy = "0.15"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

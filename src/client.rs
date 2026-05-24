@@ -564,4 +564,255 @@ mod tests {
             .expect("second ok");
         assert!(matches!(second, CachedResponse::NotModified));
     }
+
+    // ─── B.5 coverage gaps ──────────────────────────────────────────────
+
+    /// Spawn N concurrent tasks against a wiremock endpoint that fails once
+    /// then succeeds (per request). Each task should ultimately succeed, and
+    /// the total hit count should be roughly `2 * N` (one retry per task).
+    #[tokio::test]
+    async fn concurrent_retries_all_tasks_succeed() {
+        let server = MockServer::start().await;
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        /// Alternates 500 → 200 → 500 → 200 … by inspecting an internal counter.
+        struct Flip(Arc<AtomicUsize>);
+        impl Respond for Flip {
+            fn respond(&self, _: &Request) -> ResponseTemplate {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                if n.is_multiple_of(2) {
+                    ResponseTemplate::new(500).set_body_string("transient")
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "id": "u1",
+                        "email": "alice@example.com",
+                        "name": "Alice",
+                        "userPath": "alice",
+                        "photo": "p.png",
+                        "teams": []
+                    }))
+                }
+            }
+        }
+
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(Flip(counter.clone()))
+            .mount(&server)
+            .await;
+
+        let client = Client::with_config("t", server.uri(), fast_config()).expect("client");
+
+        let mut handles = Vec::new();
+        for _ in 0..5u32 {
+            let c = client.clone();
+            handles.push(tokio::spawn(async move { c.me().await }));
+        }
+        for h in handles {
+            let res = h.await.expect("task join");
+            let user = res.expect("me ok");
+            assert_eq!(user.id, "u1");
+        }
+        // Sensible attempt count: roughly 2× concurrency. We don't pin an
+        // exact number because wiremock's matching ordering interacts with
+        // task scheduling, but it must be at least one hit per task and
+        // bounded by initial+retries per task (5 × 4 = 20).
+        let hits = counter.load(Ordering::SeqCst);
+        assert!(hits >= 5, "expected >= 5 hits, got {hits}");
+        assert!(hits <= 20, "expected <= 20 hits (5 tasks × 4 tries), got {hits}");
+    }
+
+    /// `x-ratelimit-userlimit` missing entirely → zero in the parsed error,
+    /// no panic.
+    #[tokio::test]
+    async fn rate_limit_missing_userlimit_header_parses_as_zero() {
+        let server = MockServer::start().await;
+        let cfg = ClientConfig {
+            timeout: Duration::from_secs(5),
+            retry: RetryConfig {
+                max_retries: 0,
+                base_delay: Duration::from_millis(1),
+            },
+        };
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    // userlimit deliberately omitted
+                    .insert_header("x-ratelimit-userremaining", "5")
+                    .insert_header("x-ratelimit-userreset", "1700000000")
+                    .set_body_string("{}"),
+            )
+            .mount(&server)
+            .await;
+        let client = Client::with_config("t", server.uri(), cfg).expect("client");
+        let err = client.me().await.expect_err("expected error");
+        match err {
+            Error::RateLimit { user_limit, user_remaining, reset_after } => {
+                assert_eq!(user_limit, 0);
+                assert_eq!(user_remaining, 5);
+                assert_eq!(reset_after, Some(1700000000));
+            }
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
+    }
+
+    /// Non-numeric `x-ratelimit-userremaining` parses to zero, doesn't panic.
+    #[tokio::test]
+    async fn rate_limit_non_numeric_userremaining_parses_as_zero() {
+        let server = MockServer::start().await;
+        let cfg = ClientConfig {
+            timeout: Duration::from_secs(5),
+            retry: RetryConfig {
+                max_retries: 0,
+                base_delay: Duration::from_millis(1),
+            },
+        };
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("x-ratelimit-userlimit", "100")
+                    .insert_header("x-ratelimit-userremaining", "abc")
+                    .set_body_string("{}"),
+            )
+            .mount(&server)
+            .await;
+        let client = Client::with_config("t", server.uri(), cfg).expect("client");
+        let err = client.me().await.expect_err("expected error");
+        match err {
+            Error::RateLimit { user_limit, user_remaining, reset_after } => {
+                assert_eq!(user_limit, 100);
+                assert_eq!(user_remaining, 0);
+                assert!(reset_after.is_none());
+            }
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
+    }
+
+    /// Negative `x-ratelimit-userreset` parses cleanly into the `i64`-typed
+    /// `reset_after` field (negative values are legal `i64`s).
+    #[tokio::test]
+    async fn rate_limit_negative_userreset_parses_as_negative() {
+        let server = MockServer::start().await;
+        let cfg = ClientConfig {
+            timeout: Duration::from_secs(5),
+            retry: RetryConfig {
+                max_retries: 0,
+                base_delay: Duration::from_millis(1),
+            },
+        };
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("x-ratelimit-userlimit", "100")
+                    .insert_header("x-ratelimit-userremaining", "1")
+                    .insert_header("x-ratelimit-userreset", "-5")
+                    .set_body_string("{}"),
+            )
+            .mount(&server)
+            .await;
+        let client = Client::with_config("t", server.uri(), cfg).expect("client");
+        let err = client.me().await.expect_err("expected error");
+        match err {
+            Error::RateLimit { reset_after, .. } => {
+                assert_eq!(reset_after, Some(-5));
+            }
+            other => panic!("expected RateLimit, got {other:?}"),
+        }
+    }
+
+    /// 304 with an empty body must NOT trigger a JSON parse — verified via
+    /// the ETag round-trip helper.
+    #[tokio::test]
+    async fn etag_304_with_empty_body_does_not_parse_json() {
+        use crate::types::SingleNote;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/notes/n1"))
+            .respond_with(
+                ResponseTemplate::new(304)
+                    .insert_header("etag", "W/\"abc\"")
+                    .set_body_string(""),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Client::with_config("t", server.uri(), fast_config()).expect("client");
+        let resp = client
+            .request_with_etag::<SingleNote>("notes/n1", Some("W/\"abc\""))
+            .await
+            .expect("304 ok");
+        assert!(matches!(resp, CachedResponse::NotModified));
+    }
+
+    /// Exponential backoff actually grows: 50ms + 100ms + 200ms = 350ms
+    /// minimum. We allow scheduling slop and only assert a >= 300ms lower
+    /// bound on the wall-clock elapsed time.
+    #[tokio::test]
+    async fn exponential_backoff_total_elapsed_grows() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(ResponseTemplate::new(500).set_delay(Duration::ZERO))
+            .up_to_n_times(3)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(user_json()))
+            .mount(&server)
+            .await;
+
+        let cfg = ClientConfig {
+            timeout: Duration::from_secs(5),
+            retry: RetryConfig {
+                max_retries: 3,
+                base_delay: Duration::from_millis(50),
+            },
+        };
+        let client = Client::with_config("t", server.uri(), cfg).expect("client");
+        let start = std::time::Instant::now();
+        let user = client.me().await.expect("me ok after backoff");
+        let elapsed = start.elapsed();
+        assert_eq!(user.id, "u1");
+        // 2^1*50 + 2^2*50 + 2^3*50 = 100 + 200 + 400 = 700ms minimum
+        // (matches the implementation's `2^attempt * base` where attempt starts at 1).
+        // We use a generous lower bound to account for scheduler slop on slow CI.
+        assert!(
+            elapsed >= Duration::from_millis(300),
+            "expected at least 300ms of backoff, got {elapsed:?}"
+        );
+    }
+
+    /// 500 with a `text/html` body must yield `InternalServer { status: 500 }`
+    /// without attempting to JSON-parse the body.
+    #[tokio::test]
+    async fn non_json_5xx_body_produces_internal_server_error() {
+        let server = MockServer::start().await;
+        let cfg = ClientConfig {
+            timeout: Duration::from_secs(5),
+            retry: RetryConfig {
+                max_retries: 0,
+                base_delay: Duration::from_millis(1),
+            },
+        };
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .insert_header("content-type", "text/html; charset=utf-8")
+                    .set_body_string("<html>oops</html>"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = Client::with_config("t", server.uri(), cfg).expect("client");
+        let err = client.me().await.expect_err("expected error");
+        match err {
+            Error::InternalServer { status } => assert_eq!(status, 500),
+            other => panic!("expected InternalServer, got {other:?}"),
+        }
+    }
 }

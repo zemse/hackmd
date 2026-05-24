@@ -1,3 +1,6 @@
 /target
 /_ref
 Cargo.lock
+.env
+.env.*
+

@@ -4,8 +4,8 @@
 //!
 //! Note: some HackMD-compatible hosts (notably self-hosted CodiMD forks)
 //! don't implement the folder API and respond `404`. The SDK surfaces that
-//! transparently as [`Error::Http`] — interpreting it as "feature
-//! unavailable" is the CLI's job, not the SDK's.
+//! transparently as [`Error::Http`](crate::Error::Http) — interpreting it as
+//! "feature unavailable" is the CLI's job, not the SDK's.
 
 use reqwest::Method;
 

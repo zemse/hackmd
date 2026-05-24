@@ -9,10 +9,24 @@
 //! let client = hackmd::Client::new(std::env::var("HMD_API_ACCESS_TOKEN").unwrap())?;
 //! let me = client.me().await?;
 //! println!("hello {}", me.name);
+//!
+//! // List the authenticated user's notes (may be empty).
+//! let notes = client.notes().await?;
+//! for n in &notes {
+//!     println!("- {} ({})", n.title, n.id);
+//! }
 //! # Ok(()) }
 //! ```
 //!
 //! Requires a tokio runtime.
+//!
+//! # Feature flags
+//!
+//! * `cli` (default) — builds the `hackmd` binary and the [`cli`] module.
+//! * `tui` — enables the `hackmd tui` subcommand (implies `cli`).
+//!
+//! With `default-features = false` you get a pure async SDK with no clap /
+//! comfy-table / etc. dependencies pulled into the binary.
 
 pub mod api;
 #[cfg(feature = "cli")]
