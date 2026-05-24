@@ -15,6 +15,8 @@
 //! Requires a tokio runtime.
 
 pub mod api;
+#[cfg(feature = "cli")]
+pub mod cli;
 pub mod client;
 pub mod error;
 pub mod types;
