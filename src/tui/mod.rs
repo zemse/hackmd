@@ -263,4 +263,3 @@ fn resolve_editor() -> String {
         "vim".to_string()
     }
 }
-
