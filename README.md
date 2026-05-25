@@ -1,16 +1,25 @@
 # hackmd
 
+[![crates.io](https://img.shields.io/crates/v/hackmd.svg)](https://crates.io/crates/hackmd)
+[![docs.rs](https://img.shields.io/docsrs/hackmd)](https://docs.rs/hackmd)
+[![license](https://img.shields.io/crates/l/hackmd.svg)](#license)
+
 Rust client library and CLI for [HackMD](https://hackmd.io).
 
 Ports the official [`@hackmd/api`](https://github.com/hackmdio/api-client) SDK and [`@hackmd/hackmd-cli`](https://github.com/hackmdio/hackmd-cli) to Rust, plus an optional terminal UI behind the `tui` feature.
 
+- **SDK** — async `Client` with the full HackMD v1 surface: user, notes, teams, team-notes, folders, folder-order, ETag-aware GETs, retries with exponential backoff, and `429` rate-limit parsing.
+- **CLI** — `hackmd` binary with parity to `@hackmd/hackmd-cli`: `login`/`logout`/`whoami`, `history`, `export`, `teams`, `notes` and `team-notes` CRUD, shared `--output table|json|csv|yaml` formatting.
+- **TUI** *(opt-in)* — `hackmd tui` two-pane browser/editor built on `ratatui`.
+
 ## Install
 
 ```sh
-cargo install hackmd
+cargo install hackmd                  # SDK + CLI
+cargo install hackmd --features tui   # also enables `hackmd tui`
 ```
 
-This installs the `hackmd` binary. The `cli` feature is on by default; library-only consumers should opt out (see below).
+The `cli` feature is on by default; library-only consumers should opt out (see [Library](#library)).
 
 ## CLI
 
@@ -132,8 +141,11 @@ The TUI currently covers user notes only — team notes and folders are still CL
 
 ```toml
 [dependencies]
-hackmd = { version = "0.0", default-features = false }
+hackmd = { version = "0.0.2", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
+
+`default-features = false` drops the CLI/TUI deps (`clap`, `comfy-table`, `ratatui`, …) and leaves you with a lean async SDK.
 
 ```rust,no_run
 # async fn run() -> hackmd::Result<()> {
@@ -148,7 +160,7 @@ for n in &notes {
 # Ok(()) }
 ```
 
-The full SDK surface (user notes, team notes, folders + folder-order, ETag-aware GET, retries, rate-limit parsing) lives on [`Client`](https://docs.rs/hackmd/latest/hackmd/client/struct.Client.html). Requires a `tokio` runtime.
+Every endpoint hangs off [`Client`](https://docs.rs/hackmd/latest/hackmd/client/struct.Client.html); tunable retry/timeout behavior lives on [`ClientConfig`](https://docs.rs/hackmd/latest/hackmd/client/struct.ClientConfig.html) and [`RetryConfig`](https://docs.rs/hackmd/latest/hackmd/client/struct.RetryConfig.html). `GET` for a single note returns a [`CachedResponse`](https://docs.rs/hackmd/latest/hackmd/client/enum.CachedResponse.html) so you can plug in an `ETag` cache.
 
 ## Features
 
@@ -158,6 +170,10 @@ The full SDK surface (user notes, team notes, folders + folder-order, ETag-aware
 | `tui` | no  | TUI subcommand (implies `cli`) — install with `cargo install hackmd --features tui` |
 
 The `cli` feature gates compilation of `src/cli/` and the `hackmd` binary. The binary's `required-features = ["cli"]` means `cargo build --no-default-features` simply skips the binary build.
+
+## Status
+
+v0.0.x — full SDK surface, CLI parity, and an opt-in TUI. The CLI's `--sort` / `--filter` use string comparison only; the TUI ships user notes only (team notes + folders remain CLI-only for this release).
 
 ## License
 
