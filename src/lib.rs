@@ -23,10 +23,10 @@
 //! # Feature flags
 //!
 //! * `cli` (default) — builds the `hackmd` binary and the [`cli`] module.
-//! * `tui` — builds the `md` binary and enables `hackmd tui` (implies
-//!   `cli`): a full terminal markdown reader/browser/editor (the merged
-//!   md-tui v0.3.0) with HackMD cloud mode behind the `H`/`gh` keybind —
-//!   browse, read, edit, publish, push and download notes.
+//! * `tui` — enables `hackmd tui` (implies `cli`): a full terminal
+//!   markdown reader/browser/editor (the merged md-tui v0.3.0) with
+//!   HackMD cloud mode behind the `H`/`gh` keybind — browse, read,
+//!   edit, publish, push and download notes.
 //!
 //! With `default-features = false` you get a pure async SDK with no clap /
 //! comfy-table / ratatui / etc. dependencies pulled into the binary.

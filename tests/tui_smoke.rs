@@ -1,4 +1,6 @@
-//! Smoke tests for the `md` binary's CLI surface (requires `--features tui`).
+//! Smoke tests for the `hackmd` binary's TUI surface (requires
+//! `--features tui`). The `md` binary was dropped for now (may return
+//! later); the TUI ships behind `hackmd tui` only.
 
 #![cfg(feature = "tui")]
 
@@ -6,8 +8,8 @@ use assert_cmd::Command;
 use predicates::prelude::*;
 
 #[test]
-fn md_version_reports_crate_version() {
-    Command::cargo_bin("md")
+fn hackmd_version_reports_crate_version() {
+    Command::cargo_bin("hackmd")
         .unwrap()
         .arg("--version")
         .assert()
@@ -16,18 +18,22 @@ fn md_version_reports_crate_version() {
 }
 
 #[test]
-fn md_help_locks_cli_surface() {
-    let assert = Command::cargo_bin("md").unwrap().arg("--help").assert();
-    let out = assert.success();
-    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
-    for flag in [
-        "--width",
-        "--line-numbers",
-        "--style",
-        "--pager",
-        "--tui",
-        "[PATH]",
-    ] {
-        assert!(stdout.contains(flag), "missing {flag} in --help:\n{stdout}");
-    }
+fn hackmd_help_lists_tui_subcommand() {
+    Command::cargo_bin("hackmd")
+        .unwrap()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tui"));
+}
+
+#[test]
+fn hackmd_tui_help_succeeds() {
+    // `tui --help` exercises the subcommand's clap wiring without
+    // touching the terminal.
+    Command::cargo_bin("hackmd")
+        .unwrap()
+        .args(["tui", "--help"])
+        .assert()
+        .success();
 }

@@ -7,6 +7,7 @@ The user owns two crates: `hackmd` (v0.0.2 — async SDK + CLI + minimal TUI for
 **User decisions (fixed):**
 - Combined app lives in the **hackmd repo**; md-tui's source is ported in, replacing the current minimal `src/tui/`.
 - Ship **two binaries**: `hackmd` (existing CLI, `hackmd tui` opens the TUI in cloud view) and `md` (`required-features=["tui"]`, exact md-tui CLI surface: `md`, `md file.md`, `md dir/`, stdin, `-w/-s/-l`).
+  - **Update (2026-06-10):** ship the `hackmd` binary **only** for now — the `md` bin was built (M0–M6) and then dropped post-M7 (`src/bin/md.rs` removed; recoverable from git history). May return later.
 - Cloud is a **separate mode behind a keybind** (`H` in browser views, `gh` chord anywhere) — not mixed into the local file browser.
 - Cloud scope v1: browse (own + team notes), read, edit (Ctrl-S PATCH), publish controls, push/download transfer, create + delete. **No comments.**
 

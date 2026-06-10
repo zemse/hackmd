@@ -30,6 +30,8 @@ pub async fn run(
         width: 0,
         line_numbers: false,
         style: "auto".to_string(),
+        // Cloud view first when logged in; cwd browser otherwise.
+        start_cloud: true,
     };
     // The event loop is sync and blocks until quit; `block_in_place` keeps
     // the (multi-thread) runtime healthy while this worker is occupied.

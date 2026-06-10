@@ -4,36 +4,36 @@
 [![docs.rs](https://img.shields.io/docsrs/hackmd)](https://docs.rs/hackmd)
 [![license](https://img.shields.io/crates/l/hackmd.svg)](#license)
 
-Rust SDK, CLI, and terminal markdown reader/editor for [HackMD](https://hackmd.io) — one crate, two binaries.
+Rust SDK, CLI, and terminal markdown reader/editor for [HackMD](https://hackmd.io).
 
 - **SDK** — async `Client` with the full HackMD v1 surface: user, notes, teams, team-notes, folders, folder-order, ETag-aware GETs, retries with exponential backoff, and `429` rate-limit parsing. Ports the official [`@hackmd/api`](https://github.com/hackmdio/api-client) SDK.
 - **CLI** — `hackmd` binary with parity to [`@hackmd/hackmd-cli`](https://github.com/hackmdio/hackmd-cli): `login`/`logout`/`whoami`, `history`, `export`, `teams`, `notes` and `team-notes` CRUD, shared `--output table|json|csv|yaml` formatting.
-- **TUI** *(opt-in)* — `md`, a full terminal markdown reader/browser/editor (mouse support, clickable links, images, split live-preview editing), with your HackMD notes one keypress away: browse, read, edit, publish, push and download — all without leaving the terminal. [md-tui](https://github.com/zemse/md-tui) v0.3.0 merged in.
+- **TUI** *(opt-in)* — `hackmd tui`, a full terminal markdown reader/browser/editor (mouse support, clickable links, images, split live-preview editing), with your HackMD notes one keypress away: browse, read, edit, publish, push and download — all without leaving the terminal. [md-tui](https://github.com/zemse/md-tui) v0.3.0 merged in.
 
 ## Install
 
 ```sh
-cargo install hackmd                  # `hackmd` (SDK + CLI)
-cargo install hackmd --features tui   # also builds `md` and enables `hackmd tui`
+cargo install hackmd                  # SDK + CLI
+cargo install hackmd --features tui   # also enables `hackmd tui`
 ```
 
 The `cli` feature is on by default; library-only consumers should opt out (see [Library](#library)).
 
-## `md` — terminal markdown reader/editor
+## `hackmd tui` — terminal markdown reader/editor
 
 ```sh
-md README.md          # read a file (markdown, code, JSON, …)
-md docs/              # browse a directory (gitignore-aware)
-md                    # browse the current directory
-cat notes.md | md     # read stdin
-md -w 100 -l -s dark  # wrap width, line numbers, theme (dark|light|auto)
+hackmd tui            # cloud view when logged in, else browses the cwd
 ```
+
+Logged in, it opens straight onto your hackmd.io notes; the local file browser is one `H` (or `Esc`) away — and without a token it simply starts there.
 
 Reader: vim-style scrolling (`j/k`, `d/u`, `gg/G`, counts), in-document search (`/`, `n/N`), fuzzy file search (`T`), Tab-cycle across links and checkboxes, click-to-follow links, click-to-toggle checkboxes, inline images (kitty/iTerm2/sixel terminals), tables with click-to-expand, JSON-line pretty-print, git lens (`Ctrl-G`, diff vs HEAD), read/unread badges in the browser.
 
 Editor (`e`): HackMD-style split view — raw markdown on one side, live preview on the other, scroll-synced both ways. `Ctrl-S` saves, `Ctrl-Z`/`Ctrl-Y` undo/redo, `Esc Esc` discards. Checkbox toggles persist straight to disk from read mode.
 
-Config lives at `~/.config/md/config.toml` (`theme`, `width`, `line_numbers`) — unchanged from md-tui, your existing file keeps working. `?` shows the full key map.
+Config lives at `~/.config/md/config.toml` (`theme`, `width`, `line_numbers`) — unchanged from md-tui, an existing file keeps working. `?` shows the full key map.
+
+> The standalone `md` binary from md-tui isn't shipped right now — the whole reader/editor lives behind `hackmd tui`. It may return as a second binary later.
 
 ### HackMD cloud mode
 
@@ -181,9 +181,9 @@ Every endpoint hangs off [`Client`](https://docs.rs/hackmd/latest/hackmd/client/
 | feature | default | what it pulls in |
 |---|---|---|
 | `cli` | yes | the `hackmd` binary and its dependencies |
-| `tui` | no  | the `md` binary + `hackmd tui` (implies `cli`) — `ratatui`, `syntect`, image decoding, … |
+| `tui` | no  | the `hackmd tui` terminal UI (implies `cli`) — `ratatui`, `syntect`, image decoding, … |
 
-`cargo build --no-default-features` skips both binaries (each is gated by `required-features`) and compiles the SDK alone.
+`cargo build --no-default-features` skips the binary (gated by `required-features = ["cli"]`) and compiles the SDK alone.
 
 ## Credits
 

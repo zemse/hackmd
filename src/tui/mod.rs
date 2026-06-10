@@ -20,14 +20,18 @@ pub mod ui;
 
 use anyhow::Result;
 
-/// Launch parameters shared by the `md` binary and the `hackmd tui` subcommand.
+/// Launch parameters for the `hackmd tui` subcommand.
 pub struct LaunchOpts {
+    /// Local fallback view (and the `Esc`/`H` target out of cloud mode).
     pub source: app::Source,
     /// Word-wrap width (0 = terminal width).
     pub width: u16,
     pub line_numbers: bool,
     /// Theme name: `dark` | `light` | `auto`.
     pub style: String,
+    /// Open in the HackMD cloud browser when a token is configured;
+    /// without one the TUI starts (and stays usable) on `source`.
+    pub start_cloud: bool,
 }
 
 /// Run the TUI event loop on the calling thread until the user quits.
@@ -46,6 +50,10 @@ pub fn run_blocking(opts: LaunchOpts, cloud: cloud::CloudContext) -> Result<()> 
     };
 
     let mut app = app::App::with_cloud(opts.source, app_opts, cloud)?;
+    if opts.start_cloud && app.cloud.is_connected() {
+        // Open on the cloud browser; the local view stays one Esc/H away.
+        let _ = app.navigate_to(app::EntryKind::CloudList, 0);
+    }
     let mut term = ui::setup_terminal()?;
     // Probe for graphics support only after entering the alt screen, so any
     // unrecognized response bytes don't pollute the user's shell on exit.

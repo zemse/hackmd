@@ -23,11 +23,6 @@ name = "hackmd"
 path = "src/main.rs"
 required-features = ["cli"]
 
-[[bin]]
-name = "md"
-path = "src/bin/md.rs"
-required-features = ["tui"]
-
 [features]
 default = ["cli"]
 cli = []
