@@ -34,6 +34,17 @@ pub async fn login(
         }
     }
 
+    // Point the user at the exact page where tokens are created. Only for
+    // the official endpoint — a self-hosted instance has its own URL.
+    if eff.endpoint == crate::client::DEFAULT_ENDPOINT {
+        const TOKEN_SETTINGS_URL: &str = "https://hackmd.io/settings#api";
+        println!("Create an access token at: {TOKEN_SETTINGS_URL}");
+        // Best-effort: opens locally, silently does nothing over SSH.
+        if open::that_detached(TOKEN_SETTINGS_URL).is_ok() {
+            println!("(opened in your browser)");
+        }
+    }
+
     let token = rpassword::prompt_password("Enter your HackMD access token: ")
         .map_err(|e| Error::Config(format!("could not read token: {e}")))?;
     let token = token.trim().to_string();

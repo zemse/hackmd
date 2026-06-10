@@ -61,10 +61,12 @@ Publishing flips the note's `readPermission` between `guest` and `owner` — tha
 
 ### Authentication
 
-Create a HackMD access token at <https://hackmd.io/settings#api>, then log in:
+Run `hackmd login` — it opens <https://hackmd.io/settings#api> (where access tokens are created) in your browser and prompts for the token:
 
 ```sh
 $ hackmd login
+Create an access token at: https://hackmd.io/settings#api
+(opened in your browser)
 Enter your HackMD access token: ********
 Login successfully
 ```
