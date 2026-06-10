@@ -15,7 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
 use crate::tui::app::{
-    self, App, BrowserEntryKind, DiffRowKind, EditMode, Focus, ReaderOrigin, View,
+    self, App, BrowserEntryKind, CloudRow, DiffRowKind, EditMode, Focus, ReaderOrigin, View,
 };
 use crate::tui::links::LinkTarget;
 
@@ -100,6 +100,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 }
             }
             View::Browser(_) => draw_browser(f, app, body),
+            View::Cloud(_) => draw_cloud_browser(f, app, body),
         }
         if matches!(app.view, View::Reader(_)) {
             // Image rendering is read-only; in split-edit mode we still
@@ -161,7 +162,7 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
     let mark_read_path = if r.edit.is_none() && r.scroll as usize + visible_h >= total {
         match &r.origin {
             ReaderOrigin::File(p) => Some(p.clone()),
-            ReaderOrigin::Stdin => None,
+            ReaderOrigin::Stdin | ReaderOrigin::CloudNote { .. } => None,
         }
     } else {
         None
@@ -790,6 +791,73 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, inner, &mut state);
 }
 
+/// Render the HackMD note browser: "My notes" + per-team sections in one
+/// flat list. Headers are bold/colored and not selectable; published notes
+/// get a `[pub]` badge.
+fn draw_cloud_browser(f: &mut Frame, app: &App, area: Rect) {
+    let View::Cloud(c) = &app.view else {
+        return;
+    };
+    let theme = &app.opts.theme;
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" hackmd.io ")
+        .border_style(Style::default().fg(theme.muted));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if c.rows.is_empty() {
+        let msg = if app.cloud.is_connected() {
+            "Loading notes from hackmd.io…"
+        } else {
+            app::NO_TOKEN_HINT
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                msg,
+                Style::default().fg(theme.muted),
+            ))),
+            inner,
+        );
+        return;
+    }
+
+    let badge_style = Style::default()
+        .fg(theme.heading[3])
+        .add_modifier(Modifier::BOLD);
+    let items: Vec<ListItem> = c
+        .rows
+        .iter()
+        .map(|row| match row {
+            CloudRow::Header(h) => ListItem::new(Span::styled(
+                h.clone(),
+                Style::default()
+                    .fg(theme.heading[0])
+                    .add_modifier(Modifier::BOLD),
+            )),
+            CloudRow::Note(n) => {
+                let mut spans = vec![Span::raw("  "), Span::raw(n.title.clone())];
+                if n.published {
+                    spans.push(Span::styled(" [pub]", badge_style));
+                }
+                ListItem::new(Line::from(spans))
+            }
+        })
+        .collect();
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(theme.status_bg)
+                .fg(theme.status_fg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    let mut state = ListState::default()
+        .with_offset(c.scroll as usize)
+        .with_selected(Some(c.selected));
+    f.render_stateful_widget(list, inner, &mut state);
+}
+
 fn browser_entry_style(kind: BrowserEntryKind, theme: &crate::tui::theme::Theme) -> Style {
     match kind {
         BrowserEntryKind::ParentDir => Style::default().fg(theme.muted),
@@ -918,8 +986,10 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
         View::Reader(r) => match &r.origin {
             crate::tui::app::ReaderOrigin::File(p) => display_path(p, &app.root),
             crate::tui::app::ReaderOrigin::Stdin => "<stdin>".to_string(),
+            crate::tui::app::ReaderOrigin::CloudNote { title, .. } => format!("☁ {title}"),
         },
         View::Browser(b) => format!("{}/", display_path(&b.dir, &app.root)),
+        View::Cloud(_) => "☁ hackmd.io".to_string(),
     };
 
     let scroll_pos = match &app.view {
@@ -935,6 +1005,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
             }
         }
         View::Browser(b) => format!("{}/{}", b.selected + 1, b.entries.len().max(1)),
+        View::Cloud(c) => format!("{}/{}", c.selected + 1, c.rows.len().max(1)),
     };
 
     // Resolve middle content + classify the mode (search / hover / hint).
@@ -1198,7 +1269,8 @@ fn compute_middle(app: &App) -> Mid {
 fn default_hint(app: &App) -> String {
     match &app.view {
         View::Reader(_) => "j/k  d/u  /search  Tab:link  o:open  e:edit  ?:help  q:quit".into(),
-        View::Browser(_) => "j/k  Enter:open  /search  T:fuzzy  ?:help  q:quit".into(),
+        View::Browser(_) => "j/k  Enter:open  /search  T:fuzzy  H:hackmd  ?:help  q:quit".into(),
+        View::Cloud(_) => "j/k  Enter:open  R:refresh  H:local  ?:help  q:quit".into(),
     }
 }
 

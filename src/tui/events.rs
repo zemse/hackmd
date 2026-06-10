@@ -130,11 +130,19 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
     }
 
-    // Resolve `gg` / `zz` chord completions before falling into the main match.
+    // Resolve `gg` / `gh` / `zz` chord completions before falling into the
+    // main match.
     if app.pending_g.is_some() {
         app.pending_g = None;
         if let KeyCode::Char('g') = key.code {
             scroll_to(app, 0);
+            app.count_prefix = None;
+            return Ok(());
+        }
+        // `gh` toggles local ↔ HackMD from anywhere (including the Reader,
+        // where plain `H` keeps its vim viewport meaning).
+        if let KeyCode::Char('h') = key.code {
+            app.toggle_cloud_mode();
             app.count_prefix = None;
             return Ok(());
         }
@@ -193,7 +201,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('?') => app.help_open = !app.help_open,
         KeyCode::Char('/') => match &app.view {
             View::Reader(_) => app.open_doc_search(),
-            View::Browser(_) => app.open_search(),
+            // The fuzzy file search indexes local files only; cloud notes
+            // are browsed via their flat list.
+            View::Browser(_) | View::Cloud(_) => app.open_search(),
         },
         KeyCode::Char('T') => app.open_search(),
         KeyCode::Char('n') => app.doc_search_step(true),
@@ -271,8 +281,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             app.pending_z = Some(std::time::Instant::now());
         }
 
-        // Viewport-relative jumps (vim H/M/L).
-        KeyCode::Char('H') => scroll_viewport_relative(app, ViewportTarget::Top),
+        // `H` in browser views toggles local ↔ HackMD; in the Reader it keeps
+        // its vim viewport-relative meaning (use `gh` there instead).
+        KeyCode::Char('H') => match &app.view {
+            View::Reader(_) => scroll_viewport_relative(app, ViewportTarget::Top),
+            View::Browser(_) | View::Cloud(_) => app.toggle_cloud_mode(),
+        },
         KeyCode::Char('M') => scroll_viewport_relative(app, ViewportTarget::Middle),
         KeyCode::Char('L') => scroll_viewport_relative(app, ViewportTarget::Bottom),
 
@@ -281,6 +295,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::BackTab => focus_prev(app),
         KeyCode::Enter => activate(app)?,
         KeyCode::Char('o') => open_focused(app)?,
+
+        // Cloud browser: refetch the note lists.
+        KeyCode::Char('R') if matches!(app.view, View::Cloud(_)) => {
+            app.refresh_cloud_lists();
+        }
 
         // Browser only: mark the selected entry read. On a directory this marks
         // every text file under it read recursively, clearing its `[unread]`
@@ -942,6 +961,7 @@ fn body_pos(app: &App, col: u16, row: u16) -> Option<(usize, u16)> {
     let scroll = match &app.view {
         View::Reader(r) => r.scroll as usize,
         View::Browser(b) => b.scroll as usize,
+        View::Cloud(c) => c.scroll as usize,
     };
     let local_row = (row - body.y) as usize;
     let local_col = col - body.x - line_num_w;
@@ -1400,6 +1420,10 @@ fn scroll_by(app: &mut App, delta: i32) {
                 b.scroll = (b.selected + 1 - h.max(1)) as u16;
             }
         }
+        View::Cloud(c) => {
+            let h = app.viewport.height;
+            c.move_selection(delta, h);
+        }
     }
 }
 
@@ -1422,6 +1446,13 @@ fn scroll_to(app: &mut App, line: u16) {
 /// the current view, pushing it onto history) or open a file. No-op
 /// outside Browser.
 fn enter_or_open(app: &mut App) -> Result<()> {
+    if let View::Cloud(c) = &app.view {
+        if let Some(n) = c.selected_note() {
+            let (id, title) = (n.id.clone(), n.title.clone());
+            app.open_cloud_note(id, title);
+        }
+        return Ok(());
+    }
     let entry = match &app.view {
         View::Browser(b) => b.entries.get(b.selected).cloned(),
         _ => return Ok(()),
@@ -1502,6 +1533,12 @@ fn activate(app: &mut App) -> Result<()> {
             activate_browser_entry(app, e)?;
         }
     }
+    if let View::Cloud(c) = &app.view {
+        if let Some(n) = c.selected_note() {
+            let (id, title) = (n.id.clone(), n.title.clone());
+            app.open_cloud_note(id, title);
+        }
+    }
     Ok(())
 }
 
@@ -1566,6 +1603,21 @@ fn update_hover(app: &mut App, col: u16, row: u16) {
 
 fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
     let area = app.viewport;
+    // Cloud browser: click selects + opens a note row; headers are inert.
+    if let View::Cloud(c) = &mut app.view {
+        // Row 0 is the bordered title; list rows start at 1.
+        let visual = ((row - area.y) as usize).saturating_sub(1);
+        let idx = visual + c.scroll as usize;
+        let target = match c.rows.get(idx) {
+            Some(crate::tui::app::CloudRow::Note(n)) => Some((n.id.clone(), n.title.clone())),
+            _ => None,
+        };
+        if let Some((id, title)) = target {
+            c.selected = idx;
+            app.open_cloud_note(id, title);
+        }
+        return Ok(());
+    }
     let entry_to_open = match &mut app.view {
         View::Reader(r) => {
             let Some(rendered) = &r.rendered else {
@@ -1645,6 +1697,8 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
                 None
             }
         }
+        // Handled by the early return above.
+        View::Cloud(_) => None,
     };
     if let Some(entry) = entry_to_open {
         activate_browser_entry(app, entry)?;

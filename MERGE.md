@@ -52,7 +52,7 @@ Reuse the shipped 0.0.2 TUI pattern (spawn + `tokio::sync::mpsc::unbounded` + `t
 - `App` gains `cloud: CloudState { ctx, lists, note_cache: HashMap<id, CachedNote{note, etag}>, saving: HashSet<id>, pending: u32, ... }`; `App::new` takes the `CloudContext` arg (both bins pass it).
 - Hook in `events::run` (`events.rs:23`): `app.drain_cloud_msgs()` beside `poll_external_change()`. Statusline shows "⟳ syncing…" while `pending > 0`; errors go to the existing `app.status`.
 
-### [ ] M3 — Cloud state model + cloud browser + H toggle
+### [x] M3 — Cloud state model + cloud browser + H toggle
 In `src/tui/app.rs`:
 - `EntryKind` (+`CloudList`, `CloudNote{id,title}`); `ReaderOrigin` (+`CloudNote{id, title, team_path, publish_link, read_permission, etag}`); `View` (+`Cloud(CloudBrowser)` — flat list grouped by "My notes"/team headers, `[pub]` badge; folders deferred).
 - `App::load`: `CloudList` builds from `cloud.lists` (spawns fetch if absent); `CloudNote` from `note_cache` synchronously, else `pending_nav = Some((id, scroll))` + spawn fetch and **stay put** — history is pushed only when `CloudMsg::Note` completes the navigation (failed fetch leaves history clean; stale responses dropped by id mismatch). `Reader::from_cloud(&SingleNote)` next to `from_file` (app.rs:1580).

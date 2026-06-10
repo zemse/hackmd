@@ -12,6 +12,9 @@ use ratatui_image::picker::Picker;
 use ratatui_image::protocol::StatefulProtocol;
 use std::collections::{HashMap, HashSet};
 
+/// Statusline hint shown when a cloud action is attempted with no token.
+pub const NO_TOKEN_HINT: &str = "No HackMD token — run `hackmd login` or set HMD_API_ACCESS_TOKEN";
+
 #[derive(Clone, Debug)]
 pub enum Source {
     File(PathBuf),
@@ -106,11 +109,16 @@ pub struct App {
     pub read_state: crate::tui::read_state::ReadState,
     /// HackMD connection + caches. Disconnected (and inert) without a token.
     pub cloud: CloudState,
+    /// Most recent local (file/dir/stdin) view, so the cloud toggle can
+    /// land back where the user came from instead of resetting to the root.
+    pub last_local: Option<EntryKind>,
 }
 
 pub enum View {
     Reader(Reader),
     Browser(Browser),
+    /// HackMD note browser — entered via `H` / `gh`.
+    Cloud(CloudBrowser),
 }
 
 #[derive(Clone)]
@@ -126,6 +134,14 @@ pub enum EntryKind {
     File(PathBuf),
     Directory(PathBuf),
     Stdin(String),
+    /// The HackMD note browser.
+    CloudList,
+    /// A single HackMD note. Title is carried so history navigation to an
+    /// evicted note can still label its placeholder while it refetches.
+    CloudNote {
+        id: String,
+        title: String,
+    },
 }
 
 pub struct Reader {
@@ -306,6 +322,116 @@ pub struct DocMatch {
 pub enum ReaderOrigin {
     File(PathBuf),
     Stdin,
+    /// A note living on hackmd.io. Mirrors the metadata the cloud actions
+    /// (publish toggle, copy link, save) need without a cache lookup.
+    CloudNote {
+        id: String,
+        title: String,
+        team_path: Option<String>,
+        publish_link: String,
+        read_permission: crate::types::NotePermissionRole,
+        /// ETag of the fetched revision, for conditional revalidation.
+        etag: Option<String>,
+    },
+}
+
+/// The cloud browser: a flat list of "My notes" + per-team sections.
+/// Folders are deliberately not modeled (v1 keeps the list flat).
+pub struct CloudBrowser {
+    pub rows: Vec<CloudRow>,
+    pub selected: usize,
+    pub scroll: u16,
+}
+
+pub enum CloudRow {
+    /// Section header ("My notes" / team name) — not selectable.
+    Header(String),
+    Note(CloudNoteRow),
+}
+
+pub struct CloudNoteRow {
+    pub id: String,
+    pub title: String,
+    /// `Some` when the note belongs to a team (drives the team API variants).
+    pub team_path: Option<String>,
+    /// True when `readPermission == guest` — shown as a `[pub]` badge.
+    pub published: bool,
+}
+
+impl CloudBrowser {
+    /// Flatten the cached lists into display rows. With no lists yet (still
+    /// fetching, or not logged in) the browser comes up empty and the draw
+    /// layer shows an explanatory line instead.
+    pub fn from_lists(lists: Option<&crate::tui::cloud::CloudLists>) -> Self {
+        let mut rows = Vec::new();
+        if let Some(l) = lists {
+            rows.push(CloudRow::Header("My notes".to_string()));
+            for n in &l.notes {
+                rows.push(CloudRow::Note(CloudNoteRow {
+                    id: n.id.clone(),
+                    title: n.title.clone(),
+                    team_path: None,
+                    published: matches!(n.read_permission, crate::types::NotePermissionRole::Guest),
+                }));
+            }
+            for t in &l.teams {
+                rows.push(CloudRow::Header(format!("Team: {}", t.team.name)));
+                for n in &t.notes {
+                    rows.push(CloudRow::Note(CloudNoteRow {
+                        id: n.id.clone(),
+                        title: n.title.clone(),
+                        team_path: Some(t.team.path.clone()),
+                        published: matches!(
+                            n.read_permission,
+                            crate::types::NotePermissionRole::Guest
+                        ),
+                    }));
+                }
+            }
+        }
+        let selected = rows
+            .iter()
+            .position(|r| matches!(r, CloudRow::Note(_)))
+            .unwrap_or(0);
+        Self {
+            rows,
+            selected,
+            scroll: 0,
+        }
+    }
+
+    /// The currently selected note row, if the cursor is on one.
+    pub fn selected_note(&self) -> Option<&CloudNoteRow> {
+        match self.rows.get(self.selected) {
+            Some(CloudRow::Note(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Step the selection by `delta` across note rows only (headers are
+    /// skipped), wrapping at either end like the local browser. Keeps the
+    /// selection visible within `viewport_h` (minus the border rows).
+    pub fn move_selection(&mut self, delta: i32, viewport_h: u16) {
+        let notes: Vec<usize> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| matches!(r, CloudRow::Note(_)))
+            .map(|(i, _)| i)
+            .collect();
+        if notes.is_empty() {
+            return;
+        }
+        let cur = notes.iter().position(|&i| i == self.selected).unwrap_or(0);
+        let new = (cur as i32 + delta).rem_euclid(notes.len() as i32) as usize;
+        self.selected = notes[new];
+        let h = viewport_h.saturating_sub(2) as usize;
+        if self.selected < self.scroll as usize {
+            self.scroll = self.selected.saturating_sub(1) as u16;
+        } else if self.selected >= self.scroll as usize + h.max(1) {
+            self.scroll = (self.selected + 1 - h.max(1)) as u16;
+        }
+    }
 }
 
 pub struct Browser {
@@ -409,6 +535,7 @@ impl App {
             edit_preview_area: Rect::default(),
             read_state,
             cloud: CloudState::new(cloud),
+            last_local: None,
         })
     }
 
@@ -430,16 +557,81 @@ impl App {
         match msg {
             CloudMsg::Lists(Ok(lists)) => {
                 self.cloud.lists = Some(lists);
+                // If the user is looking at the cloud browser, rebuild it in
+                // place, keeping the cursor on the same note when it survives.
+                if let View::Cloud(c) = &mut self.view {
+                    let sel_id = c.selected_note().map(|n| n.id.clone());
+                    let mut fresh = CloudBrowser::from_lists(self.cloud.lists.as_ref());
+                    if let Some(id) = sel_id
+                        && let Some(i) = fresh
+                            .rows
+                            .iter()
+                            .position(|r| matches!(r, CloudRow::Note(n) if n.id == id))
+                    {
+                        fresh.selected = i;
+                        fresh.scroll = c.scroll;
+                    }
+                    *c = fresh;
+                }
             }
             CloudMsg::Lists(Err(e)) => self.status = format!("HackMD lists: {e}"),
             CloudMsg::Note { id, intent, result } => match result {
                 Ok(FetchedNote::Fresh { note, etag }) => {
-                    self.cloud
-                        .note_cache
-                        .insert(id, CachedNote { note: *note, etag });
-                    // Navigation / download / revalidation follow-ups land in
-                    // M3+; the cache insert alone already serves reopen-fast.
+                    let note = *note;
+                    self.cloud.note_cache.insert(
+                        id.clone(),
+                        CachedNote {
+                            note: note.clone(),
+                            etag,
+                        },
+                    );
                     let _ = intent;
+                    // A navigation armed for this id completes now: history is
+                    // pushed only here, so a failed/stale fetch never lands a
+                    // phantom entry.
+                    if self
+                        .cloud
+                        .pending_nav
+                        .as_ref()
+                        .is_some_and(|(nid, _)| *nid == id)
+                    {
+                        let (_, scroll) = self.cloud.pending_nav.take().expect("checked");
+                        let title = note.title.clone();
+                        if let Err(e) = self.navigate_to(EntryKind::CloudNote { id, title }, scroll)
+                        {
+                            self.status = format!("HackMD open: {e}");
+                        }
+                        return;
+                    }
+                    // No nav armed — if the note is open right now (history
+                    // placeholder or remote-change revalidation), refresh it
+                    // in place. Never clobber an in-flight edit.
+                    if let View::Reader(r) = &mut self.view
+                        && let ReaderOrigin::CloudNote {
+                            id: cur_id,
+                            title,
+                            team_path,
+                            publish_link,
+                            read_permission,
+                            etag: cur_etag,
+                        } = &mut r.origin
+                        && *cur_id == id
+                        && r.edit.is_none()
+                    {
+                        *title = note.title.clone();
+                        *team_path = note.team_path.clone();
+                        *publish_link = note.publish_link.clone();
+                        *read_permission = note.read_permission;
+                        *cur_etag = self.cloud.note_cache.get(&id).and_then(|c| c.etag.clone());
+                        if r.raw != note.content {
+                            r.raw = note.content;
+                            r.rendered = None;
+                            r.focus = None;
+                            r.hover_link = None;
+                            r.hover_checkbox = None;
+                            self.status = "Note updated remotely".into();
+                        }
+                    }
                 }
                 Ok(FetchedNote::NotModified) => {}
                 Err(e) => {
@@ -553,6 +745,10 @@ impl App {
                 kind: match &r.origin {
                     ReaderOrigin::File(p) => EntryKind::File(p.clone()),
                     ReaderOrigin::Stdin => EntryKind::Stdin(r.raw.clone()),
+                    ReaderOrigin::CloudNote { id, title, .. } => EntryKind::CloudNote {
+                        id: id.clone(),
+                        title: title.clone(),
+                    },
                 },
                 scroll: r.scroll,
                 selected: None,
@@ -561,6 +757,11 @@ impl App {
                 kind: EntryKind::Directory(b.dir.clone()),
                 scroll: b.scroll,
                 selected: Some(b.selected),
+            },
+            View::Cloud(c) => HistoryEntry {
+                kind: EntryKind::CloudList,
+                scroll: c.scroll,
+                selected: Some(c.selected),
             },
         }
     }
@@ -591,6 +792,13 @@ impl App {
     }
 
     fn load(&mut self, kind: EntryKind, scroll: u16, selected: Option<usize>) -> Result<()> {
+        // Remember the latest local view so the cloud toggle can return to it.
+        if matches!(
+            kind,
+            EntryKind::File(_) | EntryKind::Directory(_) | EntryKind::Stdin(_)
+        ) {
+            self.last_local = Some(kind.clone());
+        }
         self.view = match kind {
             EntryKind::File(p) => {
                 let mut r = Reader::from_file(&p)?;
@@ -611,8 +819,92 @@ impl App {
                 r.scroll = scroll;
                 View::Reader(r)
             }
+            EntryKind::CloudList => {
+                let mut c = CloudBrowser::from_lists(self.cloud.lists.as_ref());
+                c.scroll = scroll;
+                if let Some(sel) = selected {
+                    let max = c.rows.len().saturating_sub(1);
+                    c.selected = sel.min(max);
+                }
+                if self.cloud.lists.is_none() {
+                    self.cloud.request_lists();
+                }
+                View::Cloud(c)
+            }
+            EntryKind::CloudNote { id, title } => {
+                if let Some(cached) = self.cloud.note_cache.get(&id) {
+                    let mut r = Reader::from_cloud(&cached.note, cached.etag.clone());
+                    r.scroll = scroll;
+                    View::Reader(r)
+                } else {
+                    // History navigation to a note that's no longer cached:
+                    // show a placeholder and refill it in place when the
+                    // fetch lands (`apply_cloud_msg` matches on the open id).
+                    self.cloud.request_note(
+                        id.clone(),
+                        crate::tui::cloud::FetchIntent::OpenReader { scroll },
+                    );
+                    View::Reader(Reader::cloud_placeholder(id, title))
+                }
+            }
         };
         Ok(())
+    }
+
+    /// Open a HackMD note from the cloud browser. Cache hit navigates
+    /// immediately; a miss arms `pending_nav` and stays put — history is
+    /// pushed only when the fetch completes, so failures leave it clean.
+    pub fn open_cloud_note(&mut self, id: String, title: String) {
+        if self.cloud.note_cache.contains_key(&id) {
+            if let Err(e) = self.navigate_to(EntryKind::CloudNote { id, title }, 0) {
+                self.status = format!("HackMD open: {e}");
+            }
+            return;
+        }
+        if self.cloud.request_note(
+            id.clone(),
+            crate::tui::cloud::FetchIntent::OpenReader { scroll: 0 },
+        ) {
+            self.cloud.pending_nav = Some((id, 0));
+        } else {
+            self.status = NO_TOKEN_HINT.into();
+        }
+    }
+
+    /// `H` (browsers) / `gh` (anywhere): flip between the local file world
+    /// and the HackMD cloud browser. Toggling out of cloud returns to the
+    /// most recent local view.
+    pub fn toggle_cloud_mode(&mut self) {
+        let in_cloud = match &self.view {
+            View::Cloud(_) => true,
+            View::Reader(r) => matches!(r.origin, ReaderOrigin::CloudNote { .. }),
+            View::Browser(_) => false,
+        };
+        let result = if in_cloud {
+            let kind = self
+                .last_local
+                .clone()
+                .unwrap_or_else(|| EntryKind::Directory(self.root.clone()));
+            self.navigate_to(kind, 0)
+        } else {
+            if !self.cloud.is_connected() {
+                self.status = NO_TOKEN_HINT.into();
+                return;
+            }
+            self.navigate_to(EntryKind::CloudList, 0)
+        };
+        if let Err(e) = result {
+            self.status = format!("{e}");
+        }
+    }
+
+    /// `R` in the cloud browser: refetch the note lists.
+    pub fn refresh_cloud_lists(&mut self) {
+        if self.cloud.request_lists() {
+            self.status = "Refreshing…".into();
+        } else {
+            self.status = NO_TOKEN_HINT.into();
+        }
     }
 
     pub fn open_search(&mut self) {
@@ -708,7 +1000,9 @@ impl App {
         }
         let path = match &r.origin {
             ReaderOrigin::File(p) => p.clone(),
-            ReaderOrigin::Stdin => return false,
+            // Stdin has no source to watch; cloud freshness is handled by
+            // ETag revalidation on open, not a per-tick poll.
+            ReaderOrigin::Stdin | ReaderOrigin::CloudNote { .. } => return false,
         };
         let Some(new_meta) = file_meta(&path) else {
             return false;
@@ -918,8 +1212,8 @@ impl App {
         let path = match &self.view {
             View::Reader(r) => match &r.origin {
                 ReaderOrigin::File(p) => p.clone(),
-                ReaderOrigin::Stdin => {
-                    self.status = "Git lens unavailable for stdin".into();
+                ReaderOrigin::Stdin | ReaderOrigin::CloudNote { .. } => {
+                    self.status = "Git lens needs a local file".into();
                     return;
                 }
             },
@@ -985,17 +1279,37 @@ impl App {
     }
 
     /// Discard buffer changes and exit edit mode. Reloads the file from disk
-    /// to drop any unsaved edits, then returns the reader to view mode.
+    /// (or the cloud cache) to drop any unsaved edits, then returns the
+    /// reader to view mode.
     pub fn exit_edit_discard(&mut self) {
+        let cached_raw = match &self.view {
+            View::Reader(r) => match &r.origin {
+                ReaderOrigin::CloudNote { id, .. } => self
+                    .cloud
+                    .note_cache
+                    .get(id)
+                    .map(|c| c.note.content.clone()),
+                _ => None,
+            },
+            _ => None,
+        };
         if let View::Reader(r) = &mut self.view {
             if r.edit.is_none() {
                 return;
             }
-            if let ReaderOrigin::File(path) = r.origin.clone() {
-                if let Ok(disk) = std::fs::read_to_string(&path) {
-                    r.raw = disk;
-                    r.last_meta = file_meta(&path);
+            match r.origin.clone() {
+                ReaderOrigin::File(path) => {
+                    if let Ok(disk) = std::fs::read_to_string(&path) {
+                        r.raw = disk;
+                        r.last_meta = file_meta(&path);
+                    }
                 }
+                ReaderOrigin::CloudNote { .. } => {
+                    if let Some(raw) = cached_raw {
+                        r.raw = raw;
+                    }
+                }
+                ReaderOrigin::Stdin => {}
             }
             r.edit = None;
             r.rendered = None;
@@ -1362,7 +1676,7 @@ impl App {
             if needs {
                 let base_dir = match &r.origin {
                     ReaderOrigin::File(p) => p.parent().map(|p| p.to_path_buf()),
-                    ReaderOrigin::Stdin => None,
+                    ReaderOrigin::Stdin | ReaderOrigin::CloudNote { .. } => None,
                 };
                 // In split-screen edit mode the preview pane shows the fully
                 // formatted markdown — no in-place block toggle. The cursor
@@ -1799,6 +2113,36 @@ impl Reader {
             self.tables.remove(&id);
         }
         self.rendered = None;
+    }
+
+    /// Build a reader over a fetched HackMD note. Sits next to `from_file`;
+    /// the origin carries the metadata cloud actions need.
+    pub fn from_cloud(note: &crate::types::SingleNote, etag: Option<String>) -> Self {
+        let mut r = Self::from_string(note.content.clone());
+        r.origin = ReaderOrigin::CloudNote {
+            id: note.id.clone(),
+            title: note.title.clone(),
+            team_path: note.team_path.clone(),
+            publish_link: note.publish_link.clone(),
+            read_permission: note.read_permission,
+            etag,
+        };
+        r
+    }
+
+    /// Placeholder shown while a history navigation refetches an uncached
+    /// note; `apply_cloud_msg` swaps the real content in when it lands.
+    pub fn cloud_placeholder(id: String, title: String) -> Self {
+        let mut r = Self::from_string(format!("# {title}\n\n*Fetching from hackmd.io…*\n"));
+        r.origin = ReaderOrigin::CloudNote {
+            id,
+            title,
+            team_path: None,
+            publish_link: String::new(),
+            read_permission: crate::types::NotePermissionRole::Owner,
+            etag: None,
+        };
+        r
     }
 
     pub fn from_string(raw: String) -> Self {
