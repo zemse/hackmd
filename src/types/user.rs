@@ -19,7 +19,11 @@ pub struct Team {
     pub name: String,
     pub logo: String,
     pub path: String,
-    pub description: String,
+    /// Null on the live API for teams without a description.
+    pub description: Option<String>,
+    /// Absent entirely on the live `/me` and `/teams` responses (despite
+    /// the upstream type declaring it) — defaults to `false`.
+    #[serde(default)]
     pub hard_breaks: bool,
     pub visibility: TeamVisibilityType,
     // Upstream types this as `Date`; the live wire value is an epoch-millis
@@ -48,7 +52,8 @@ pub struct SimpleUserProfile {
     pub user_path: String,
     pub photo: String,
     pub biography: Option<String>,
-    #[serde(deserialize_with = "super::de_date")]
+    /// The live API omits this on notes' `lastChangeUser` — defaults empty.
+    #[serde(default, deserialize_with = "super::de_date_default")]
     pub created_at: String,
 }
 
@@ -95,23 +100,41 @@ mod tests {
         assert_eq!(json["visibility"], "public");
     }
 
-    // Regression: the live `/me` endpoint returns teams whose `createdAt`
-    // is epoch milliseconds, not an ISO string.
+    // Regression: exact field set the live `/me` and `/teams` endpoints
+    // return (2026-06) — epoch-millis `createdAt`, NO `hardBreaks`,
+    // nullable `description`, extra `upgraded`.
     #[test]
-    fn team_accepts_epoch_millis_created_at() {
+    fn team_parses_live_api_shape() {
         let raw = r#"{
             "id": "team-1",
             "ownerId": "user-1",
-            "name": "Demo Team",
-            "logo": "logo.png",
             "path": "demo-team",
-            "description": "",
-            "hardBreaks": false,
-            "visibility": "private",
-            "createdAt": 1633693316914
+            "name": "Demo Team",
+            "logo": "data:image/svg+xml;base64,xxxx",
+            "description": null,
+            "visibility": "public",
+            "createdAt": 1633693316914,
+            "upgraded": false
         }"#;
-        let team: Team = serde_json::from_str(raw).expect("parse team with millis date");
+        let team: Team = serde_json::from_str(raw).expect("parse live-shape team");
         assert_eq!(team.created_at, "2021-10-08T11:41:56.914Z");
+        assert!(!team.hard_breaks, "absent hardBreaks defaults to false");
+        assert!(team.description.is_none());
+    }
+
+    // Regression: notes' `lastChangeUser` on the live API has no
+    // `createdAt` at all.
+    #[test]
+    fn simple_user_profile_parses_live_api_shape() {
+        let raw = r#"{
+            "name": "soham",
+            "userPath": "zemse",
+            "photo": "https://example.com/p.png",
+            "biography": "hi"
+        }"#;
+        let p: SimpleUserProfile = serde_json::from_str(raw).expect("parse live-shape profile");
+        assert_eq!(p.created_at, "", "absent createdAt defaults empty");
+        assert_eq!(p.biography.as_deref(), Some("hi"));
     }
 
     #[test]

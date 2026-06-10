@@ -46,6 +46,26 @@ where
     }))
 }
 
+/// Like [`de_date`] but also tolerates an explicit `null` (→ empty string),
+/// for fields the live API sometimes omits or nulls.
+pub(crate) fn de_date_default<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        S(String),
+        Millis(i64),
+    }
+    Ok(match Option::<Raw>::deserialize(d)? {
+        Some(Raw::S(s)) => s,
+        Some(Raw::Millis(n)) => millis_to_rfc3339(n),
+        None => String::new(),
+    })
+}
+
 fn millis_to_rfc3339(n: i64) -> String {
     chrono::DateTime::from_timestamp_millis(n)
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
