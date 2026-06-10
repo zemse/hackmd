@@ -59,7 +59,7 @@ In `src/tui/app.rs`:
 - `H` toggles local↔cloud **in browser views only** (preserves vim viewport-`H` in Reader, events.rs:271); add `gh` chord via the existing `pending_g` machinery (events.rs:130-138) to work anywhere. No token → status "No HackMD token — run `hackmd login` or set HMD_API_ACCESS_TOKEN".
 - Cloud browser keys: `j/k`, `Enter` open, `Esc/b` back, `R` refetch lists.
 
-### [ ] M4 — Cloud editing
+### [x] M4 — Cloud editing
 - `save_edit` (app.rs:1185) dispatches on origin: `CloudNote` → guard `saving` set, spawn content PATCH, **keep `dirty` until `Saved{Ok}`** (pessimistic — failed PATCH never clears the dirty marker).
 - `toggle_checkbox` (app.rs:629): optimistic local mutate + same PATCH; on error, status + buffer intact.
 - Freshness: no per-tick poll for cloud; on cache-hit open, spawn ETag revalidate (`client.note(id, Some(etag))` → 304 short-circuit); if changed and not editing, swap content + "Note updated remotely" (mirrors local reload flow app.rs:590-601).

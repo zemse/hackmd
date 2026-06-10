@@ -655,12 +655,30 @@ impl App {
                         // The PATCH response carries no ETag; cache without one
                         // so the next open does a plain revalidating GET.
                         self.cloud.note_cache.insert(
-                            id,
+                            id.clone(),
                             CachedNote {
-                                note: *note,
+                                note: *note.clone(),
                                 etag: None,
                             },
                         );
+                        // Pessimistic dirty: cleared only here, and only when
+                        // the buffer still matches what the server accepted —
+                        // keystrokes typed after Ctrl-S keep the marker.
+                        if let View::Reader(r) = &mut self.view
+                            && let ReaderOrigin::CloudNote {
+                                id: cur_id,
+                                etag: cur_etag,
+                                ..
+                            } = &mut r.origin
+                            && *cur_id == id
+                        {
+                            *cur_etag = None;
+                            if let Some(e) = r.edit.as_mut()
+                                && r.raw == note.content
+                            {
+                                e.dirty = false;
+                            }
+                        }
                         self.status = "Saved to HackMD".into();
                     }
                     Err(e) => self.status = format!("HackMD save failed: {e}"),
@@ -835,6 +853,14 @@ impl App {
                 if let Some(cached) = self.cloud.note_cache.get(&id) {
                     let mut r = Reader::from_cloud(&cached.note, cached.etag.clone());
                     r.scroll = scroll;
+                    // Freshness check in the background: with an ETag a 304
+                    // costs nothing; without one a full fetch refreshes the
+                    // open reader in place (skipped while editing).
+                    let intent = match cached.etag.clone() {
+                        Some(etag) => crate::tui::cloud::FetchIntent::Revalidate { etag },
+                        None => crate::tui::cloud::FetchIntent::OpenReader { scroll },
+                    };
+                    self.cloud.request_note(id, intent);
                     View::Reader(r)
                 } else {
                     // History navigation to a note that's no longer cached:
@@ -1080,20 +1106,38 @@ impl App {
         new_raw.push_str(replacement);
         new_raw.push_str(&r.raw[offset + 3..]);
         r.raw = new_raw;
-        if let ReaderOrigin::File(p) = &r.origin {
-            let path = p.clone();
-            std::fs::write(&path, &r.raw)
-                .map_err(|e| anyhow!("write {}: {}", path.display(), e))?;
-            // Refresh fingerprint so the watcher doesn't see our own write
-            // as an external change and trigger a redundant reload.
-            r.last_meta = file_meta(&path);
-            self.status = if was_checked {
-                "Unchecked".into()
-            } else {
-                "Checked".into()
-            };
-        } else {
-            self.status = "Toggled (in-memory; stdin not persisted)".into();
+        match r.origin.clone() {
+            ReaderOrigin::File(path) => {
+                std::fs::write(&path, &r.raw)
+                    .map_err(|e| anyhow!("write {}: {}", path.display(), e))?;
+                // Refresh fingerprint so the watcher doesn't see our own write
+                // as an external change and trigger a redundant reload.
+                r.last_meta = file_meta(&path);
+                self.status = if was_checked {
+                    "Unchecked".into()
+                } else {
+                    "Checked".into()
+                };
+            }
+            ReaderOrigin::CloudNote { id, team_path, .. } => {
+                // Optimistic: the buffer already flipped; PATCH in the
+                // background. On failure the error hits the statusline and
+                // the local flip stays (the next revalidation reconciles).
+                if self.cloud.request_save(id, team_path, r.raw.clone()) {
+                    self.status = if was_checked {
+                        "Unchecked (syncing…)".into()
+                    } else {
+                        "Checked (syncing…)".into()
+                    };
+                } else if self.cloud.is_connected() {
+                    self.status = "Save already in flight — toggle kept locally".into();
+                } else {
+                    self.status = NO_TOKEN_HINT.into();
+                }
+            }
+            ReaderOrigin::Stdin => {
+                self.status = "Toggled (in-memory; stdin not persisted)".into();
+            }
         }
         r.rendered = None;
         r.hover_checkbox = None;
@@ -1642,16 +1686,35 @@ impl App {
         if r.edit.is_none() {
             return Ok(());
         }
-        let ReaderOrigin::File(path) = r.origin.clone() else {
-            return Ok(());
-        };
-        std::fs::write(&path, &r.raw).map_err(|e| anyhow!("write {}: {}", path.display(), e))?;
-        r.last_meta = file_meta(&path);
-        if let Some(e) = r.edit.as_mut() {
-            e.dirty = false;
-            e.discard_pending = false;
+        match r.origin.clone() {
+            ReaderOrigin::File(path) => {
+                std::fs::write(&path, &r.raw)
+                    .map_err(|e| anyhow!("write {}: {}", path.display(), e))?;
+                r.last_meta = file_meta(&path);
+                if let Some(e) = r.edit.as_mut() {
+                    e.dirty = false;
+                    e.discard_pending = false;
+                }
+                self.status = format!("Saved {}", path.display());
+            }
+            ReaderOrigin::CloudNote { id, team_path, .. } => {
+                // Pessimistic: `dirty` stays set until `Saved{Ok}` lands, so
+                // a failed PATCH can never silently lose the marker.
+                if self.cloud.saving.contains(&id) {
+                    self.status = "Save already in flight…".into();
+                    return Ok(());
+                }
+                if self.cloud.request_save(id, team_path, r.raw.clone()) {
+                    if let Some(e) = r.edit.as_mut() {
+                        e.discard_pending = false;
+                    }
+                    self.status = "⟳ saving to HackMD…".into();
+                } else {
+                    self.status = NO_TOKEN_HINT.into();
+                }
+            }
+            ReaderOrigin::Stdin => {}
         }
-        self.status = format!("Saved {}", path.display());
         Ok(())
     }
 
