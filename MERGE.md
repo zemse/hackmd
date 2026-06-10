@@ -81,7 +81,7 @@ In `src/tui/app.rs`:
 
 - Update `?` help overlay with a HackMD section (notes "not logged in" when applicable).
 
-### [ ] M6 — Tests
+### [x] M6 — Tests
 - Ported in-file tests run via `cargo test --features tui`; add `CloudContext::disconnected()` test constructor (no runtime needed).
 - Unit tests for `apply_cloud_msg` (pure sync, no terminal): lists populate, pending nav completes + pushes history, `Saved{Err}` keeps dirty, stale-id responses dropped, pending counter zeroes.
 - Wiremock integration `tests/tui_cloud.rs` (pattern from existing `tests/sdk_integration.rs`): real runtime + MockServer, assert PATCH bodies and channel delivery.

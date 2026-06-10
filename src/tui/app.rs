@@ -4075,3 +4075,255 @@ index abc..def 100644\n\
         assert!(!is_markdown_file(Path::new("foo")));
     }
 }
+
+#[cfg(test)]
+mod cloud_msg_tests {
+    use super::*;
+    use crate::tui::cloud::{CloudLists, CloudMsg, FetchIntent, FetchedNote};
+    use crate::types::{NotePermissionRole, NotePublishType, SingleNote};
+
+    fn opts() -> Options {
+        Options {
+            width: 80,
+            line_numbers: false,
+            theme: crate::tui::theme::Theme::dark(),
+        }
+    }
+
+    /// App over a stdin reader with a disconnected cloud — no disk, no
+    /// runtime. `apply_cloud_msg` is a pure state transition on top.
+    fn test_app() -> App {
+        App::new(Source::Stdin("local text".into()), opts()).expect("app")
+    }
+
+    fn note(id: &str, title: &str, content: &str) -> SingleNote {
+        SingleNote {
+            id: id.to_string(),
+            title: title.to_string(),
+            tags: Vec::new(),
+            last_changed_at: "2024-01-01T00:00:00.000Z".into(),
+            created_at: "2024-01-01T00:00:00.000Z".into(),
+            last_change_user: None,
+            publish_type: NotePublishType::View,
+            published_at: None,
+            user_path: None,
+            team_path: None,
+            permalink: None,
+            short_id: "s".into(),
+            publish_link: format!("https://hackmd.io/{id}"),
+            read_permission: NotePermissionRole::Owner,
+            write_permission: NotePermissionRole::Owner,
+            folder_paths: None,
+            content: content.to_string(),
+        }
+    }
+
+    fn fresh(id: &str, title: &str, content: &str) -> CloudMsg {
+        CloudMsg::Note {
+            id: id.to_string(),
+            intent: FetchIntent::OpenReader { scroll: 0 },
+            result: Ok(FetchedNote::Fresh {
+                note: Box::new(note(id, title, content)),
+                etag: Some("W/\"v1\"".into()),
+            }),
+        }
+    }
+
+    fn edit_state(dirty: bool) -> EditState {
+        EditState {
+            cursor: 0,
+            dirty,
+            discard_pending: false,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            mode: EditMode::Split,
+            last_drawn_cursor: None,
+        }
+    }
+
+    #[test]
+    fn lists_populate_and_pending_counter_zeroes() {
+        let mut app = test_app();
+        app.cloud.pending = 2;
+        app.apply_cloud_msg(CloudMsg::Lists(Ok(CloudLists {
+            notes: Vec::new(),
+            teams: Vec::new(),
+        })));
+        assert_eq!(app.cloud.pending, 1);
+        assert!(app.cloud.lists.is_some());
+
+        app.apply_cloud_msg(CloudMsg::Lists(Err("boom".into())));
+        assert_eq!(app.cloud.pending, 0);
+        assert!(app.status.contains("boom"));
+
+        // A surplus response must saturate, not underflow.
+        app.apply_cloud_msg(CloudMsg::Lists(Err("again".into())));
+        assert_eq!(app.cloud.pending, 0);
+    }
+
+    #[test]
+    fn pending_nav_completes_and_pushes_history() {
+        let mut app = test_app();
+        app.cloud.pending_nav = Some(("n1".into(), 5));
+        let h0 = app.history.len();
+
+        app.apply_cloud_msg(CloudMsg::Note {
+            id: "n1".into(),
+            intent: FetchIntent::OpenReader { scroll: 5 },
+            result: Ok(FetchedNote::Fresh {
+                note: Box::new(note("n1", "T", "# body")),
+                etag: None,
+            }),
+        });
+
+        assert!(app.cloud.pending_nav.is_none());
+        assert_eq!(app.history.len(), h0 + 1, "completion pushes history");
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader view");
+        };
+        assert_eq!(r.raw, "# body");
+        assert_eq!(r.scroll, 5);
+        assert!(matches!(&r.origin, ReaderOrigin::CloudNote { id, .. } if id == "n1"));
+    }
+
+    #[test]
+    fn stale_note_response_is_dropped() {
+        let mut app = test_app();
+        app.cloud.pending_nav = Some(("wanted".into(), 0));
+        let h0 = app.history.len();
+
+        app.apply_cloud_msg(fresh("other", "Other", "content"));
+
+        // The nav stays armed, the view and history are untouched, but the
+        // response body still lands in the cache.
+        assert_eq!(
+            app.cloud.pending_nav.as_ref().map(|(id, _)| id.as_str()),
+            Some("wanted")
+        );
+        assert_eq!(app.history.len(), h0);
+        assert!(matches!(&app.view, View::Reader(r) if matches!(r.origin, ReaderOrigin::Stdin)));
+        assert!(app.cloud.note_cache.contains_key("other"));
+    }
+
+    #[test]
+    fn failed_fetch_clears_pending_nav_and_keeps_history_clean() {
+        let mut app = test_app();
+        app.cloud.pending_nav = Some(("n1".into(), 0));
+        let h0 = app.history.len();
+
+        app.apply_cloud_msg(CloudMsg::Note {
+            id: "n1".into(),
+            intent: FetchIntent::OpenReader { scroll: 0 },
+            result: Err("404".into()),
+        });
+
+        assert!(app.cloud.pending_nav.is_none());
+        assert_eq!(app.history.len(), h0);
+        assert!(app.status.contains("404"));
+    }
+
+    #[test]
+    fn saved_err_keeps_dirty_marker() {
+        let mut app = test_app();
+        let n = note("n1", "T", "body");
+        let mut r = Reader::from_cloud(&n, None);
+        r.edit = Some(edit_state(true));
+        app.view = View::Reader(r);
+        app.cloud.saving.insert("n1".into());
+
+        app.apply_cloud_msg(CloudMsg::Saved {
+            id: "n1".into(),
+            result: Err("500".into()),
+        });
+
+        assert!(app.cloud.saving.is_empty(), "in-flight guard released");
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        assert!(
+            r.edit.as_ref().expect("still editing").dirty,
+            "failed PATCH must never clear dirty"
+        );
+        assert!(app.status.contains("save failed"));
+    }
+
+    #[test]
+    fn saved_ok_clears_dirty_only_when_buffer_matches() {
+        let mut app = test_app();
+        let n = note("n1", "T", "body");
+        let mut r = Reader::from_cloud(&n, None);
+        r.edit = Some(edit_state(true));
+        app.view = View::Reader(r);
+
+        app.apply_cloud_msg(CloudMsg::Saved {
+            id: "n1".into(),
+            result: Ok(Box::new(note("n1", "T", "body"))),
+        });
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        assert!(!r.edit.as_ref().expect("editing").dirty);
+
+        // Type more, then a (stale) save confirmation for the older content
+        // arrives — dirty must survive.
+        let mut app = test_app();
+        let mut r = Reader::from_cloud(&n, None);
+        r.raw = "body plus unsent keystrokes".into();
+        r.edit = Some(edit_state(true));
+        app.view = View::Reader(r);
+        app.apply_cloud_msg(CloudMsg::Saved {
+            id: "n1".into(),
+            result: Ok(Box::new(note("n1", "T", "body"))),
+        });
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        assert!(r.edit.as_ref().expect("editing").dirty);
+    }
+
+    #[test]
+    fn open_reader_refreshes_in_place_without_nav() {
+        let mut app = test_app();
+        let n = note("n1", "T", "old content");
+        app.view = View::Reader(Reader::from_cloud(&n, None));
+
+        app.apply_cloud_msg(fresh("n1", "T", "new content"));
+
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        assert_eq!(r.raw, "new content");
+        assert_eq!(app.status, "Note updated remotely");
+    }
+
+    #[test]
+    fn deleted_note_drops_reader_back_to_cloud_browser() {
+        let mut app = test_app();
+        let n = note("n1", "T", "body");
+        app.view = View::Reader(Reader::from_cloud(&n, None));
+        app.cloud.note_cache.insert(
+            "n1".into(),
+            CachedNote {
+                note: n,
+                etag: None,
+            },
+        );
+
+        app.apply_cloud_msg(CloudMsg::Deleted {
+            id: "n1".into(),
+            title: "T".into(),
+            result: Ok(()),
+        });
+
+        assert!(!app.cloud.note_cache.contains_key("n1"));
+        assert!(matches!(app.view, View::Cloud(_)));
+        assert!(app.status.contains("Deleted"));
+    }
+
+    #[test]
+    fn slugify_makes_safe_filenames() {
+        assert_eq!(slugify("Meeting Notes 2024"), "meeting-notes-2024");
+        assert_eq!(slugify("  --weird__ / title!  "), "weird-title");
+        assert_eq!(slugify("???"), "note");
+    }
+}
