@@ -112,6 +112,46 @@ pub struct App {
     /// Most recent local (file/dir/stdin) view, so the cloud toggle can
     /// land back where the user came from instead of resetting to the root.
     pub last_local: Option<EntryKind>,
+    /// `Some` while a text/confirm prompt overlay is active (new note title,
+    /// push title, download filename, delete confirmation).
+    pub prompt: Option<Prompt>,
+}
+
+/// Modal one-line prompt. Input handling mirrors the doc-search prompt:
+/// chars append, Backspace pops, Ctrl-U clears, Enter commits, Esc cancels.
+/// `ConfirmDelete` is the exception — `y`/Enter confirms, anything cancels.
+pub struct Prompt {
+    /// Box title shown to the user (already padded/decorated).
+    pub title: String,
+    pub input: String,
+    pub kind: PromptKind,
+}
+
+pub enum PromptKind {
+    /// `n` in the cloud browser — create a note with the typed title.
+    NewNoteTitle,
+    /// `U` on a local file — push it up as a new cloud note with this title.
+    PushTitle(PathBuf),
+    /// `S` on a cloud note — write its content under `app.root` as this name.
+    DownloadFilename { id: String },
+    /// `D` on a cloud note — destructive, so it gets an explicit confirm.
+    ConfirmDelete {
+        id: String,
+        title: String,
+        team_path: Option<String>,
+    },
+}
+
+/// The cloud note a context-sensitive action (`P`/`D`/`S`/`y`/`o`) applies
+/// to: the selected browser row, or the open cloud reader.
+pub struct CloudTarget {
+    pub id: String,
+    pub title: String,
+    pub team_path: Option<String>,
+    pub published: bool,
+    /// Empty when targeting a browser row (rows don't carry the link); the
+    /// reader origin always has it.
+    pub publish_link: String,
 }
 
 pub enum View {
@@ -536,6 +576,7 @@ impl App {
             read_state,
             cloud: CloudState::new(cloud),
             last_local: None,
+            prompt: None,
         })
     }
 
@@ -585,7 +626,15 @@ impl App {
                             etag,
                         },
                     );
-                    let _ = intent;
+                    // A download fetch writes the file and is done — it never
+                    // navigates or touches the open reader.
+                    if let crate::tui::cloud::FetchIntent::DownloadTo(path) = &intent {
+                        self.status = match std::fs::write(path, &note.content) {
+                            Ok(()) => format!("Downloaded to {}", path.display()),
+                            Err(e) => format!("write {}: {e}", path.display()),
+                        };
+                        return;
+                    }
                     // A navigation armed for this id completes now: history is
                     // pushed only here, so a failed/stale fetch never lands a
                     // phantom entry.
@@ -686,15 +735,35 @@ impl App {
             }
             CloudMsg::Created { intent, result } => match result {
                 Ok(note) => {
-                    self.status = format!("Created \"{}\"", note.title);
+                    let id = note.id.clone();
+                    let title = note.title.clone();
                     self.cloud.note_cache.insert(
-                        note.id.clone(),
+                        id.clone(),
                         CachedNote {
                             note: *note,
                             etag: None,
                         },
                     );
-                    let _ = intent;
+                    // The lists are stale now — refetch in the background so
+                    // the browser shows the new note.
+                    self.cloud.request_lists();
+                    match intent {
+                        crate::tui::cloud::CreateIntent::Blank => {
+                            self.status = format!("Created \"{title}\"");
+                            if let Err(e) = self.navigate_to(EntryKind::CloudNote { id, title }, 0)
+                            {
+                                self.status = format!("HackMD open: {e}");
+                            }
+                        }
+                        crate::tui::cloud::CreateIntent::PushedFrom(path) => {
+                            let name = path
+                                .file_name()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("file")
+                                .to_string();
+                            self.status = format!("Pushed {name} → \"{title}\"");
+                        }
+                    }
                 }
                 Err(e) => self.status = format!("HackMD create failed: {e}"),
             },
@@ -708,6 +777,15 @@ impl App {
                         for t in &mut lists.teams {
                             t.notes.retain(|n| n.id != id);
                         }
+                    }
+                    // Don't leave the user staring at a deleted note — drop
+                    // them back into the cloud browser. `load` (not
+                    // `navigate_to`) so the dead note isn't pushed to history.
+                    if matches!(
+                        &self.view,
+                        View::Reader(r) if matches!(&r.origin, ReaderOrigin::CloudNote { id: rid, .. } if *rid == id)
+                    ) {
+                        let _ = self.load(EntryKind::CloudList, 0, None);
                     }
                     self.status = format!("Deleted \"{title}\"");
                 }
@@ -736,6 +814,20 @@ impl App {
                     } else {
                         "Unpublished".into()
                     };
+                    // Keep an open reader's origin in sync so `P`/`y`/`o`
+                    // immediately reflect the new state.
+                    if let View::Reader(r) = &mut self.view
+                        && let ReaderOrigin::CloudNote {
+                            id: cur_id,
+                            publish_link,
+                            read_permission,
+                            ..
+                        } = &mut r.origin
+                        && *cur_id == id
+                    {
+                        *publish_link = note.publish_link.clone();
+                        *read_permission = note.read_permission;
+                    }
                     self.cloud.note_cache.insert(
                         id,
                         CachedNote {
@@ -930,6 +1022,216 @@ impl App {
             self.status = "Refreshing…".into();
         } else {
             self.status = NO_TOKEN_HINT.into();
+        }
+    }
+
+    /// The cloud note the context-sensitive actions apply to: the selected
+    /// browser row, or the open cloud reader. `None` in local contexts.
+    pub fn cloud_target(&self) -> Option<CloudTarget> {
+        match &self.view {
+            View::Cloud(c) => c.selected_note().map(|n| CloudTarget {
+                id: n.id.clone(),
+                title: n.title.clone(),
+                team_path: n.team_path.clone(),
+                published: n.published,
+                publish_link: String::new(),
+            }),
+            View::Reader(r) => match &r.origin {
+                ReaderOrigin::CloudNote {
+                    id,
+                    title,
+                    team_path,
+                    publish_link,
+                    read_permission,
+                    ..
+                } => Some(CloudTarget {
+                    id: id.clone(),
+                    title: title.clone(),
+                    team_path: team_path.clone(),
+                    published: matches!(read_permission, crate::types::NotePermissionRole::Guest),
+                    publish_link: publish_link.clone(),
+                }),
+                _ => None,
+            },
+            View::Browser(_) => None,
+        }
+    }
+
+    /// `n` in the cloud browser: prompt for a new note's title.
+    pub fn prompt_new_note(&mut self) {
+        if !self.cloud.is_connected() {
+            self.status = NO_TOKEN_HINT.into();
+            return;
+        }
+        self.prompt = Some(Prompt {
+            title: " New HackMD note — title ".into(),
+            input: String::new(),
+            kind: PromptKind::NewNoteTitle,
+        });
+    }
+
+    /// `U` on a local file: prompt for the pushed note's title (defaults to
+    /// the file stem).
+    pub fn prompt_push(&mut self, path: PathBuf) {
+        if !self.cloud.is_connected() {
+            self.status = NO_TOKEN_HINT.into();
+            return;
+        }
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("file")
+            .to_string();
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("untitled")
+            .to_string();
+        self.prompt = Some(Prompt {
+            title: format!(" Push {name} to HackMD — title "),
+            input: stem,
+            kind: PromptKind::PushTitle(path),
+        });
+    }
+
+    /// `S` on a cloud note: prompt for the local filename (defaults to the
+    /// slugified title). The file lands under `app.root`.
+    pub fn prompt_download(&mut self) {
+        let Some(t) = self.cloud_target() else {
+            return;
+        };
+        self.prompt = Some(Prompt {
+            title: format!(" Download to {}/ ", self.root.display()),
+            input: format!("{}.md", slugify(&t.title)),
+            kind: PromptKind::DownloadFilename { id: t.id },
+        });
+    }
+
+    /// `D` on a cloud note: arm the delete confirmation.
+    pub fn prompt_delete(&mut self) {
+        let Some(t) = self.cloud_target() else {
+            return;
+        };
+        if !self.cloud.is_connected() {
+            self.status = NO_TOKEN_HINT.into();
+            return;
+        }
+        self.prompt = Some(Prompt {
+            title: format!(" Delete \"{}\" from HackMD? ", t.title),
+            input: String::new(),
+            kind: PromptKind::ConfirmDelete {
+                id: t.id,
+                title: t.title,
+                team_path: t.team_path,
+            },
+        });
+    }
+
+    /// `P` on a cloud note: flip `readPermission` between `guest`
+    /// (published) and `owner` (private). The v1 API has no publish
+    /// endpoint; this is how publish works.
+    pub fn publish_toggle(&mut self) {
+        let Some(t) = self.cloud_target() else {
+            return;
+        };
+        let perm = if t.published {
+            crate::types::NotePermissionRole::Owner
+        } else {
+            crate::types::NotePermissionRole::Guest
+        };
+        if self
+            .cloud
+            .request_set_read_permission(t.id, t.team_path, perm)
+        {
+            self.status = if t.published {
+                "⟳ unpublishing…".into()
+            } else {
+                "⟳ publishing…".into()
+            };
+        } else {
+            self.status = NO_TOKEN_HINT.into();
+        }
+    }
+
+    /// Execute a committed prompt.
+    pub fn commit_prompt(&mut self, p: Prompt) {
+        match p.kind {
+            PromptKind::NewNoteTitle => {
+                let title = p.input.trim().to_string();
+                if title.is_empty() {
+                    self.status = "Cancelled — empty title".into();
+                    return;
+                }
+                let opts = crate::types::CreateNoteOptions {
+                    title: Some(title.clone()),
+                    content: Some(format!("# {title}\n")),
+                    ..Default::default()
+                };
+                if !self
+                    .cloud
+                    .request_create(None, opts, crate::tui::cloud::CreateIntent::Blank)
+                {
+                    self.status = NO_TOKEN_HINT.into();
+                }
+            }
+            PromptKind::PushTitle(path) => {
+                let title = p.input.trim().to_string();
+                if title.is_empty() {
+                    self.status = "Cancelled — empty title".into();
+                    return;
+                }
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.status = format!("read {}: {e}", path.display());
+                        return;
+                    }
+                };
+                let opts = crate::types::CreateNoteOptions {
+                    title: Some(title),
+                    content: Some(content),
+                    ..Default::default()
+                };
+                if !self.cloud.request_create(
+                    None,
+                    opts,
+                    crate::tui::cloud::CreateIntent::PushedFrom(path),
+                ) {
+                    self.status = NO_TOKEN_HINT.into();
+                }
+            }
+            PromptKind::DownloadFilename { id } => {
+                let name = p.input.trim();
+                if name.is_empty() {
+                    self.status = "Cancelled — empty filename".into();
+                    return;
+                }
+                let path = self.root.join(name);
+                if path.exists() {
+                    self.status = format!("Refusing to overwrite {}", path.display());
+                    return;
+                }
+                if let Some(cached) = self.cloud.note_cache.get(&id) {
+                    match std::fs::write(&path, &cached.note.content) {
+                        Ok(()) => self.status = format!("Downloaded to {}", path.display()),
+                        Err(e) => self.status = format!("write {}: {e}", path.display()),
+                    }
+                } else if !self
+                    .cloud
+                    .request_note(id, crate::tui::cloud::FetchIntent::DownloadTo(path))
+                {
+                    self.status = NO_TOKEN_HINT.into();
+                }
+            }
+            PromptKind::ConfirmDelete {
+                id,
+                title,
+                team_path,
+            } => {
+                if !self.cloud.request_delete(id, title, team_path) {
+                    self.status = NO_TOKEN_HINT.into();
+                }
+            }
         }
     }
 
@@ -1815,6 +2117,31 @@ impl App {
                 }
             }
         }
+    }
+}
+
+/// Filesystem-friendly slug of a note title for the download default:
+/// lowercased, alphanumerics kept, separator runs collapsed to one `-`.
+fn slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = false;
+    for c in s.chars() {
+        let c = c.to_ascii_lowercase();
+        if c.is_alphanumeric() {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        "note".to_string()
+    } else {
+        out
     }
 }
 

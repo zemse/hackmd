@@ -68,6 +68,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         return Ok(());
     }
+    // Modal prompt (new note / push / download / delete confirm) captures
+    // all keys while open.
+    if app.prompt.is_some() {
+        return handle_prompt_key(app, key);
+    }
     // Ctrl-G toggles the git lens overlay (works in both view and edit
     // modes — but `toggle_git_lens` itself refuses while editing).
     if key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -206,10 +211,33 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             View::Browser(_) | View::Cloud(_) => app.open_search(),
         },
         KeyCode::Char('T') => app.open_search(),
-        KeyCode::Char('n') => app.doc_search_step(true),
+        // `n` creates a note in the cloud browser; elsewhere it's the
+        // doc-search "next match" motion.
+        KeyCode::Char('n') => match &app.view {
+            View::Cloud(_) => app.prompt_new_note(),
+            _ => app.doc_search_step(true),
+        },
         KeyCode::Char('N') => app.doc_search_step(false),
         KeyCode::Char('m') => toggle_mouse(app),
         KeyCode::Char('e') => app.enter_edit(),
+
+        // HackMD note actions — active wherever a cloud note is targeted
+        // (cloud browser row or open cloud reader); no-ops elsewhere.
+        KeyCode::Char('D') if app.cloud_target().is_some() => app.prompt_delete(),
+        KeyCode::Char('P') if app.cloud_target().is_some() => app.publish_toggle(),
+        KeyCode::Char('S') if app.cloud_target().is_some() => app.prompt_download(),
+        // Copy the publish link of the open cloud note (reader only — the
+        // browser rows don't carry the link).
+        KeyCode::Char('y') if matches!(&app.view, View::Reader(r) if matches!(r.origin, crate::tui::app::ReaderOrigin::CloudNote { .. })) =>
+        {
+            copy_publish_link(app);
+        }
+        // Push a local file up as a new HackMD note.
+        KeyCode::Char('U') => {
+            if let Some(path) = local_push_target(app) {
+                app.prompt_push(path);
+            }
+        }
 
         // Vim-style scrolling. Ctrl-modified arms come *before* unguarded
         // letter arms so the modifier path can match.
@@ -500,6 +528,93 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+/// Keystrokes while a modal prompt is open. Text prompts mirror the
+/// doc-search input handling; the delete confirmation accepts only
+/// `y`/Enter and treats everything else as a cancel.
+fn handle_prompt_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.should_quit = true;
+        return Ok(());
+    }
+    let confirm = matches!(
+        app.prompt.as_ref().map(|p| &p.kind),
+        Some(crate::tui::app::PromptKind::ConfirmDelete { .. })
+    );
+    if confirm {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Some(p) = app.prompt.take() {
+                    app.commit_prompt(p);
+                }
+            }
+            _ => {
+                app.prompt = None;
+                app.status = "Delete cancelled".into();
+            }
+        }
+        return Ok(());
+    }
+    match key.code {
+        KeyCode::Esc => app.prompt = None,
+        KeyCode::Enter => {
+            if let Some(p) = app.prompt.take() {
+                app.commit_prompt(p);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(p) = &mut app.prompt {
+                p.input.pop();
+            }
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(p) = &mut app.prompt {
+                p.input.clear();
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(p) = &mut app.prompt {
+                p.input.push(c);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// `y` in a cloud reader: put the note's publish link on the clipboard.
+fn copy_publish_link(app: &mut App) {
+    let link = match &app.view {
+        View::Reader(r) => match &r.origin {
+            crate::tui::app::ReaderOrigin::CloudNote { publish_link, .. } => publish_link.clone(),
+            _ => return,
+        },
+        _ => return,
+    };
+    if link.is_empty() {
+        app.status = "No publish link yet".into();
+        return;
+    }
+    copy_to_clipboard(&link);
+    app.status = format!("Copied: {link}");
+}
+
+/// The local file `U` would push: the open file reader's path, or the
+/// selected markdown file in the local browser.
+fn local_push_target(app: &App) -> Option<std::path::PathBuf> {
+    match &app.view {
+        View::Reader(r) => match &r.origin {
+            crate::tui::app::ReaderOrigin::File(p) => Some(p.clone()),
+            _ => None,
+        },
+        View::Browser(b) => b
+            .entries
+            .get(b.selected)
+            .filter(|e| e.kind == BrowserEntryKind::Markdown)
+            .map(|e| e.path.clone()),
+        View::Cloud(_) => None,
+    }
+}
+
 /// Toggle mouse capture so the user can drag-select text natively. When
 /// capture is on we get scroll/click/hover; when off the terminal handles
 /// dragging.
@@ -628,6 +743,10 @@ fn open_search_result(app: &mut App, r: SearchResult) -> Result<()> {
 }
 
 fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
+    // A modal prompt owns the screen; ignore the mouse until it resolves.
+    if app.prompt.is_some() {
+        return Ok(());
+    }
     // Anything other than scroll/move counts as deliberate mouse interaction
     // and re-engages the mouse-cursor mode (hides the keyboard focus halo).
     match m.kind {
@@ -1565,6 +1684,17 @@ fn open_focused(app: &mut App) -> Result<()> {
                         app.status = format!("Opened {}", u);
                     }
                 }
+            }
+            return Ok(());
+        }
+        // No focused link in a cloud reader: `o` opens the note's publish
+        // link in the system browser instead.
+        if let crate::tui::app::ReaderOrigin::CloudNote { publish_link, .. } = &r.origin {
+            if publish_link.is_empty() {
+                app.status = "No publish link yet".into();
+            } else {
+                let _ = open::that_detached(publish_link);
+                app.status = format!("Opened {}", publish_link);
             }
         }
     }

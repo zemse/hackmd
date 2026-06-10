@@ -64,7 +64,7 @@ In `src/tui/app.rs`:
 - `toggle_checkbox` (app.rs:629): optimistic local mutate + same PATCH; on error, status + buffer intact.
 - Freshness: no per-tick poll for cloud; on cache-hit open, spawn ETag revalidate (`client.note(id, Some(etag))` → 304 short-circuit); if changed and not editing, swap content + "Note updated remotely" (mirrors local reload flow app.rs:590-601).
 
-### [ ] M5 — Publish, transfers, create/delete, prompts
+### [x] M5 — Publish, transfers, create/delete, prompts
 - New prompt overlay on `App` (`Prompt { title, input, kind }`; kinds: NewNoteTitle, PushTitle(PathBuf), DownloadFilename{id}, ConfirmDelete{id,title,team_path}) — input handling clones the doc-search prompt pattern.
 - Keybinds (all verified unbound in their contexts):
 

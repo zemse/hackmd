@@ -119,9 +119,60 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_search(f, app, area);
     }
 
-    if app.help_open {
-        draw_help(f, area);
+    if app.prompt.is_some() {
+        draw_prompt(f, app, area);
     }
+
+    if app.help_open {
+        draw_help(f, app, area);
+    }
+}
+
+/// Centered one-line modal prompt (new note title, push title, download
+/// filename) or delete confirmation.
+fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
+    let Some(p) = &app.prompt else {
+        return;
+    };
+    let theme = &app.opts.theme;
+    let w = 64.min(area.width.saturating_sub(4)).max(20);
+    let h = 3u16;
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(p.title.clone())
+        .border_style(Style::default().fg(theme.heading[0]));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+
+    let line = if matches!(p.kind, app::PromptKind::ConfirmDelete { .. }) {
+        Line::from(Span::styled(
+            "y / Enter to delete — any other key cancels",
+            Style::default()
+                .fg(theme.heading[3])
+                .add_modifier(Modifier::BOLD),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled(
+                "▸ ",
+                Style::default()
+                    .fg(theme.heading[0])
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(p.input.clone()),
+            Span::styled("█", Style::default().fg(theme.heading[0])),
+        ])
+    };
+    f.render_widget(Paragraph::new(line), inner);
 }
 
 /// Render `p` shortened against the launch root (or `~/`) when one is a prefix.
@@ -1346,9 +1397,9 @@ fn describe_target(t: &LinkTarget) -> String {
     }
 }
 
-fn draw_help(f: &mut Frame, area: Rect) {
-    let w = 60.min(area.width.saturating_sub(4));
-    let h = 30.min(area.height.saturating_sub(4));
+fn draw_help(f: &mut Frame, app: &App, area: Rect) {
+    let w = 66.min(area.width.saturating_sub(4));
+    let h = 42.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let popup = Rect {
@@ -1388,6 +1439,20 @@ fn draw_help(f: &mut Frame, area: Rect) {
         Line::from("  m                toggle mouse capture (drag-to-select)"),
         Line::from("  q / Ctrl-C       quit"),
         Line::from("  ?                toggle this help"),
+        Line::from(""),
+        Line::from(if app.cloud.is_connected() {
+            "  HackMD cloud"
+        } else {
+            "  HackMD cloud  (not logged in — run `hackmd login`)"
+        }),
+        Line::from("  H (browsers) / gh  toggle local ↔ hackmd.io"),
+        Line::from("  Enter            open note      R  refresh lists"),
+        Line::from("  e  + Ctrl-S      edit note, save back to the cloud"),
+        Line::from("  n                new note       D  delete (confirms)"),
+        Line::from("  P                publish/unpublish (readPermission)"),
+        Line::from("  y / o            copy / open the publish link"),
+        Line::from("  S                download note to a local file"),
+        Line::from("  U                push local file up as a new note"),
         Line::from(""),
         Line::from("  Mouse hides the keyboard focus halo. Any key restores it."),
     ];
