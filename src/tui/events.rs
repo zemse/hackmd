@@ -31,6 +31,8 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
         // Same idea for the browser: one stat of the listed directory per tick
         // picks up files added/removed/renamed in it without a watcher thread.
         app.poll_browser_change();
+        // Apply any cloud operations that finished since the last tick.
+        app.drain_cloud_msgs();
         term.draw(|f| ui::draw(f, app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;

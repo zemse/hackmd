@@ -8,7 +8,7 @@ use clap::Parser;
 use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 
-use hackmd::tui::{LaunchOpts, app};
+use hackmd::tui::{LaunchOpts, app, cloud::CloudContext};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -60,10 +60,18 @@ fn main() -> Result<()> {
     };
     let _ = (cli.pager, cli.tui);
 
-    hackmd::tui::run_blocking(LaunchOpts {
-        source,
-        width: cli.width,
-        line_numbers: cli.line_numbers,
-        style: cli.style,
-    })
+    // Explicit runtime, NOT #[tokio::main]: the sync TUI loop owns the main
+    // thread; the runtime's workers run cloud futures in the background.
+    let rt = tokio::runtime::Runtime::new()?;
+    let cloud = CloudContext::init(rt.handle().clone());
+
+    hackmd::tui::run_blocking(
+        LaunchOpts {
+            source,
+            width: cli.width,
+            line_numbers: cli.line_numbers,
+            style: cli.style,
+        },
+        cloud,
+    )
 }

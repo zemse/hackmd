@@ -15,7 +15,14 @@ pub async fn run(
     cli_endpoint: Option<&str>,
     cli_token: Option<&str>,
 ) -> Result<()> {
-    let _ = (config_dir, cli_endpoint, cli_token);
+    let eff = crate::cli::config::effective(config_dir, cli_endpoint, cli_token)?;
+    let handle = tokio::runtime::Handle::current();
+    let client = eff
+        .token
+        .as_deref()
+        .and_then(|t| crate::Client::with_endpoint(t, eff.endpoint.clone()).ok());
+    let cloud = crate::tui::cloud::CloudContext::new(handle, client);
+
     let opts = crate::tui::LaunchOpts {
         source: crate::tui::app::Source::Directory(
             std::env::current_dir().map_err(crate::error::Error::Io)?,
@@ -26,7 +33,7 @@ pub async fn run(
     };
     // The event loop is sync and blocks until quit; `block_in_place` keeps
     // the (multi-thread) runtime healthy while this worker is occupied.
-    tokio::task::block_in_place(|| crate::tui::run_blocking(opts))
+    tokio::task::block_in_place(|| crate::tui::run_blocking(opts, cloud))
         .map_err(|e| crate::error::Error::Config(e.to_string()))
 }
 

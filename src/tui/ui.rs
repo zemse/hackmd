@@ -1147,6 +1147,10 @@ fn compute_middle(app: &App) -> Mid {
     if !app.status.is_empty() {
         return Mid::Status(app.status.clone());
     }
+    // Cloud operations in flight — keep the user informed without blocking.
+    if app.cloud.pending > 0 {
+        return Mid::Status("⟳ syncing…".into());
+    }
     if app.git_lens.is_some() {
         return Mid::Hint("git lens (vs HEAD)  j/k scroll  Ctrl-G or Esc to dismiss".into());
     }

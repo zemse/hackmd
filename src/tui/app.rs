@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Result, anyhow};
 use ratatui::layout::Rect;
 
+use crate::tui::cloud::{CachedNote, CloudContext, CloudMsg, CloudState, FetchedNote};
 use crate::tui::jsonl::{self, JsonlOverlay};
 use crate::tui::links::LinkTarget;
 use crate::tui::markdown::{self, Rendered};
@@ -103,6 +104,8 @@ pub struct App {
     pub edit_preview_area: Rect,
     /// Machine-local read/unread tracking for the file browser.
     pub read_state: crate::tui::read_state::ReadState,
+    /// HackMD connection + caches. Disconnected (and inert) without a token.
+    pub cloud: CloudState,
 }
 
 pub enum View {
@@ -357,7 +360,15 @@ pub struct SearchResult {
 }
 
 impl App {
+    /// Build an app with no cloud connection (tests, plain local usage).
     pub fn new(source: Source, opts: Options) -> Result<Self> {
+        Self::with_cloud(source, opts, CloudContext::disconnected())
+    }
+
+    /// Build an app wired to a HackMD connection. Both binaries route
+    /// through this — `md` via `CloudContext::init`, `hackmd tui` via
+    /// `CloudContext::with_client`.
+    pub fn with_cloud(source: Source, opts: Options, cloud: CloudContext) -> Result<Self> {
         let root = derive_root(&source);
         let read_state = crate::tui::read_state::ReadState::load(&root);
         let view = match source {
@@ -397,7 +408,135 @@ impl App {
             edit_raw_area: Rect::default(),
             edit_preview_area: Rect::default(),
             read_state,
+            cloud: CloudState::new(cloud),
         })
+    }
+
+    /// Drain every finished cloud operation, applying each to app state.
+    /// Called once per event-loop tick beside the file watchers.
+    pub fn drain_cloud_msgs(&mut self) {
+        loop {
+            let Some(msg) = self.cloud.ctx.try_recv() else {
+                break;
+            };
+            self.apply_cloud_msg(msg);
+        }
+    }
+
+    /// Apply one finished cloud operation. Pure sync state transition —
+    /// no terminal, no network — so it unit-tests without a runtime.
+    pub fn apply_cloud_msg(&mut self, msg: CloudMsg) {
+        self.cloud.note_response_received();
+        match msg {
+            CloudMsg::Lists(Ok(lists)) => {
+                self.cloud.lists = Some(lists);
+            }
+            CloudMsg::Lists(Err(e)) => self.status = format!("HackMD lists: {e}"),
+            CloudMsg::Note { id, intent, result } => match result {
+                Ok(FetchedNote::Fresh { note, etag }) => {
+                    self.cloud
+                        .note_cache
+                        .insert(id, CachedNote { note: *note, etag });
+                    // Navigation / download / revalidation follow-ups land in
+                    // M3+; the cache insert alone already serves reopen-fast.
+                    let _ = intent;
+                }
+                Ok(FetchedNote::NotModified) => {}
+                Err(e) => {
+                    // A failed fetch abandons any navigation waiting on it —
+                    // history was never pushed, so the user simply stays put.
+                    if self
+                        .cloud
+                        .pending_nav
+                        .as_ref()
+                        .is_some_and(|(nid, _)| *nid == id)
+                    {
+                        self.cloud.pending_nav = None;
+                    }
+                    self.status = format!("HackMD note: {e}");
+                }
+            },
+            CloudMsg::Saved { id, result } => {
+                self.cloud.saving.remove(&id);
+                match result {
+                    Ok(note) => {
+                        // The PATCH response carries no ETag; cache without one
+                        // so the next open does a plain revalidating GET.
+                        self.cloud.note_cache.insert(
+                            id,
+                            CachedNote {
+                                note: *note,
+                                etag: None,
+                            },
+                        );
+                        self.status = "Saved to HackMD".into();
+                    }
+                    Err(e) => self.status = format!("HackMD save failed: {e}"),
+                }
+            }
+            CloudMsg::Created { intent, result } => match result {
+                Ok(note) => {
+                    self.status = format!("Created \"{}\"", note.title);
+                    self.cloud.note_cache.insert(
+                        note.id.clone(),
+                        CachedNote {
+                            note: *note,
+                            etag: None,
+                        },
+                    );
+                    let _ = intent;
+                }
+                Err(e) => self.status = format!("HackMD create failed: {e}"),
+            },
+            CloudMsg::Deleted { id, title, result } => match result {
+                Ok(()) => {
+                    self.cloud.note_cache.remove(&id);
+                    // Drop the entry from the cached lists so the browser
+                    // reflects the delete without a full refetch.
+                    if let Some(lists) = self.cloud.lists.as_mut() {
+                        lists.notes.retain(|n| n.id != id);
+                        for t in &mut lists.teams {
+                            t.notes.retain(|n| n.id != id);
+                        }
+                    }
+                    self.status = format!("Deleted \"{title}\"");
+                }
+                Err(e) => self.status = format!("HackMD delete failed: {e}"),
+            },
+            CloudMsg::PermissionSet { id, result } => match result {
+                Ok(note) => {
+                    if let Some(lists) = self.cloud.lists.as_mut() {
+                        for n in lists
+                            .notes
+                            .iter_mut()
+                            .chain(lists.teams.iter_mut().flat_map(|t| t.notes.iter_mut()))
+                        {
+                            if n.id == id {
+                                n.read_permission = note.read_permission;
+                                n.publish_link = note.publish_link.clone();
+                            }
+                        }
+                    }
+                    let published = matches!(
+                        note.read_permission,
+                        crate::types::NotePermissionRole::Guest
+                    );
+                    self.status = if published {
+                        format!("Published: {}", note.publish_link)
+                    } else {
+                        "Unpublished".into()
+                    };
+                    self.cloud.note_cache.insert(
+                        id,
+                        CachedNote {
+                            note: *note,
+                            etag: None,
+                        },
+                    );
+                }
+                Err(e) => self.status = format!("HackMD publish failed: {e}"),
+            },
+        }
     }
 
     /// Probe the terminal for graphics-protocol support. Must be called after

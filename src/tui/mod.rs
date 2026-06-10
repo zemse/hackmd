@@ -6,6 +6,7 @@
 //! support is layered on top via [`crate::Client`].
 
 pub mod app;
+pub mod cloud;
 pub mod events;
 mod jsonl;
 mod links;
@@ -32,7 +33,9 @@ pub struct LaunchOpts {
 /// Run the TUI event loop on the calling thread until the user quits.
 ///
 /// Sync and blocking — the caller owns the terminal for the duration.
-pub fn run_blocking(opts: LaunchOpts) -> Result<()> {
+/// Cloud futures run on the runtime behind `cloud`; their results are
+/// drained each tick.
+pub fn run_blocking(opts: LaunchOpts, cloud: cloud::CloudContext) -> Result<()> {
     let cfg = md_config::load();
     let theme = theme::resolve(&opts.style, &cfg);
 
@@ -42,7 +45,7 @@ pub fn run_blocking(opts: LaunchOpts) -> Result<()> {
         theme,
     };
 
-    let mut app = app::App::new(opts.source, app_opts)?;
+    let mut app = app::App::with_cloud(opts.source, app_opts, cloud)?;
     let mut term = ui::setup_terminal()?;
     // Probe for graphics support only after entering the alt screen, so any
     // unrecognized response bytes don't pollute the user's shell on exit.

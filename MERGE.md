@@ -44,7 +44,7 @@ Verify: `cargo run --features tui --bin md -- README.md`, dir browse, stdin; `ca
 
 Git history: plain copy (cross-repo history preservation not worth subtree gymnastics); commit message records `port md-tui v0.3.0 (zemse/md-tui @ <sha>)`.
 
-### [ ] M2 — Async bridge skeleton (`src/tui/cloud.rs`)
+### [x] M2 — Async bridge skeleton (`src/tui/cloud.rs`)
 Reuse the shipped 0.0.2 TUI pattern (spawn + `tokio::sync::mpsc::unbounded` + `try_recv` drained each 250 ms tick):
 - `CloudContext { handle: Handle, client: Option<Client>, tx, rx }`; `init(handle)` resolves token via `cli::config::effective` and **tolerates** missing token (`client: None`, no startup error); `with_client(client, handle)`.
 - `CloudMsg` enum (responses only; errors cross as `String`): `Lists`, `Note { id, intent, result }`, `Saved`, `Created`, `Deleted`, `PermissionSet`. `FetchIntent::{OpenReader{scroll}, DownloadTo(PathBuf), Revalidate{etag}}`; `CreateIntent::{Blank, PushedFrom(PathBuf)}`.
