@@ -113,9 +113,7 @@ async fn user_note_full_lifecycle_with_etag_cache() {
             "content": "# v2",
             "title": "Hello v2"
         })))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(note_json("n1", "Hello v2", "# v2", None)),
-        )
+        .respond_with(ResponseTemplate::new(202))
         .expect(1)
         .mount(&server)
         .await;
@@ -141,12 +139,10 @@ async fn user_note_full_lifecycle_with_etag_cache() {
         .mount(&server)
         .await;
 
-    // 5. DELETE → returns the deleted note
+    // 5. DELETE → 204 No Content (live API behavior)
     Mock::given(method("DELETE"))
         .and(path("/notes/n1"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(note_json("n1", "Hello v2", "# v2", None)),
-        )
+        .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
         .await;
@@ -174,7 +170,7 @@ async fn user_note_full_lifecycle_with_etag_cache() {
         )
         .await
         .expect("update");
-    assert_eq!(updated.title, "Hello v2");
+    assert!(updated.is_none(), "live PATCH answers 202 with no body");
 
     let first = client.note("n1", None).await.expect("get fresh");
     let captured_etag = match first {
@@ -192,8 +188,7 @@ async fn user_note_full_lifecycle_with_etag_cache() {
         .expect("get cached");
     assert!(matches!(second, CachedResponse::NotModified));
 
-    let deleted = client.delete_note("n1").await.expect("delete");
-    assert_eq!(deleted.id, "n1");
+    client.delete_note("n1").await.expect("delete");
 }
 
 /// Team-note lifecycle: create → update content → list shows it → delete.
@@ -215,16 +210,11 @@ async fn team_note_flow_create_update_list_delete() {
         .mount(&server)
         .await;
 
-    // UPDATE content
+    // UPDATE content → 202 No body (live API behavior)
     Mock::given(method("PATCH"))
         .and(path("/teams/demo/notes/tn1"))
         .and(body_json(serde_json::json!({ "content": "## body" })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(note_json(
-            "tn1",
-            "Spec",
-            "## body",
-            Some("demo"),
-        )))
+        .respond_with(ResponseTemplate::new(202))
         .expect(1)
         .mount(&server)
         .await;
@@ -239,15 +229,10 @@ async fn team_note_flow_create_update_list_delete() {
         .mount(&server)
         .await;
 
-    // DELETE
+    // DELETE → 204 No Content (live API behavior)
     Mock::given(method("DELETE"))
         .and(path("/teams/demo/notes/tn1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(note_json(
-            "tn1",
-            "Spec",
-            "## body",
-            Some("demo"),
-        )))
+        .respond_with(ResponseTemplate::new(204))
         .expect(1)
         .mount(&server)
         .await;
@@ -270,18 +255,17 @@ async fn team_note_flow_create_update_list_delete() {
         .update_team_note_content("demo", "tn1", Some("## body".into()))
         .await
         .expect("update team note");
-    assert_eq!(updated.content, "## body");
+    assert!(updated.is_none(), "live PATCH answers 202 with no body");
 
     let listed = client.team_notes("demo").await.expect("list");
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, "tn1");
     assert_eq!(listed[0].team_path.as_deref(), Some("demo"));
 
-    let deleted = client
+    client
         .delete_team_note("demo", "tn1")
         .await
         .expect("delete");
-    assert_eq!(deleted.id, "tn1");
 }
 
 /// Folder flow: create → update (null one field via double-option, set

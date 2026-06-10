@@ -86,12 +86,11 @@ fn team_json(path: &str, name: &str) -> serde_json::Value {
 #[tokio::test(flavor = "multi_thread")]
 async fn save_patches_content_and_delivers_saved() {
     let server = MockServer::start().await;
+    // Live API behavior: 202 Accepted, empty body.
     Mock::given(method("PATCH"))
         .and(path("/notes/n1"))
         .and(body_json(serde_json::json!({ "content": "new body" })))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(single_note_json("n1", "T", "new body")),
-        )
+        .respond_with(ResponseTemplate::new(202))
         .expect(1)
         .mount(&server)
         .await;
@@ -102,8 +101,8 @@ async fn save_patches_content_and_delivers_saved() {
     match recv(&mut ctx).await {
         CloudMsg::Saved { id, result } => {
             assert_eq!(id, "n1");
-            let note = result.expect("save ok");
-            assert_eq!(note.content, "new body");
+            let accepted = result.expect("save ok");
+            assert_eq!(accepted, "new body");
         }
         other => panic!("expected Saved, got {other:?}"),
     }
@@ -115,11 +114,7 @@ async fn team_save_uses_team_route() {
     Mock::given(method("PATCH"))
         .and(path("/teams/demo/notes/n2"))
         .and(body_json(serde_json::json!({ "content": "team body" })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(single_note_json(
-            "n2",
-            "T",
-            "team body",
-        )))
+        .respond_with(ResponseTemplate::new(202))
         .expect(1)
         .mount(&server)
         .await;
@@ -186,12 +181,10 @@ async fn fetch_lists_merges_own_and_team_notes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn publish_patch_sends_read_permission_guest() {
     let server = MockServer::start().await;
-    let mut published = single_note_json("n1", "T", "body");
-    published["readPermission"] = serde_json::json!("guest");
     Mock::given(method("PATCH"))
         .and(path("/notes/n1"))
         .and(body_json(serde_json::json!({ "readPermission": "guest" })))
-        .respond_with(ResponseTemplate::new(200).set_body_json(published))
+        .respond_with(ResponseTemplate::new(202))
         .expect(1)
         .mount(&server)
         .await;
@@ -202,8 +195,8 @@ async fn publish_patch_sends_read_permission_guest() {
     match recv(&mut ctx).await {
         CloudMsg::PermissionSet { id, result } => {
             assert_eq!(id, "n1");
-            let note = result.expect("publish ok");
-            assert_eq!(note.read_permission, NotePermissionRole::Guest);
+            let perm = result.expect("publish ok");
+            assert_eq!(perm, NotePermissionRole::Guest);
         }
         other => panic!("expected PermissionSet, got {other:?}"),
     }

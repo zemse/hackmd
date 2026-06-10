@@ -45,10 +45,12 @@ pub enum CloudMsg {
         intent: FetchIntent,
         result: Result<FetchedNote, String>,
     },
-    /// A content PATCH finished.
+    /// A content PATCH finished. The live API returns `202 Accepted` with
+    /// an empty body, so success carries the content the server accepted
+    /// (i.e. what we sent) for cache/dirty bookkeeping.
     Saved {
         id: String,
-        result: Result<Box<SingleNote>, String>,
+        result: Result<String, String>,
     },
     /// A `POST /notes` (or team variant) finished.
     Created {
@@ -61,10 +63,12 @@ pub enum CloudMsg {
         title: String,
         result: Result<(), String>,
     },
-    /// A read-permission PATCH (publish/unpublish) finished.
+    /// A read-permission PATCH (publish/unpublish) finished. Like `Saved`,
+    /// the response body is empty — success carries the permission now in
+    /// effect.
     PermissionSet {
         id: String,
-        result: Result<Box<SingleNote>, String>,
+        result: Result<NotePermissionRole, String>,
     },
 }
 
@@ -216,12 +220,12 @@ impl CloudContext {
             let res = match &team_path {
                 Some(tp) => {
                     client
-                        .update_team_note_content(tp, &id, Some(content))
+                        .update_team_note_content(tp, &id, Some(content.clone()))
                         .await
                 }
-                None => client.update_note_content(&id, Some(content)).await,
+                None => client.update_note_content(&id, Some(content.clone())).await,
             };
-            let result = res.map(Box::new).map_err(|e| e.to_string());
+            let result = res.map(|_| content).map_err(|e| e.to_string());
             let _ = tx.send(CloudMsg::Saved { id, result });
         })
     }
@@ -250,7 +254,7 @@ impl CloudContext {
                 Some(tp) => client.delete_team_note(tp, &id).await,
                 None => client.delete_note(&id).await,
             };
-            let result = res.map(|_| ()).map_err(|e| e.to_string());
+            let result = res.map_err(|e| e.to_string());
             let _ = tx.send(CloudMsg::Deleted { id, title, result });
         })
     }
@@ -272,7 +276,7 @@ impl CloudContext {
                 Some(tp) => client.update_team_note(tp, &id, opts).await,
                 None => client.update_note(&id, opts).await,
             };
-            let result = res.map(Box::new).map_err(|e| e.to_string());
+            let result = res.map(|_| perm).map_err(|e| e.to_string());
             let _ = tx.send(CloudMsg::PermissionSet { id, result });
         })
     }

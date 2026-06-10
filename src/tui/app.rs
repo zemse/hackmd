@@ -700,16 +700,14 @@ impl App {
             CloudMsg::Saved { id, result } => {
                 self.cloud.saving.remove(&id);
                 match result {
-                    Ok(note) => {
-                        // The PATCH response carries no ETag; cache without one
-                        // so the next open does a plain revalidating GET.
-                        self.cloud.note_cache.insert(
-                            id.clone(),
-                            CachedNote {
-                                note: *note.clone(),
-                                etag: None,
-                            },
-                        );
+                    Ok(content) => {
+                        // The PATCH answers 202 with an empty body; `content`
+                        // is what the server accepted. Update the cached copy
+                        // and drop its ETag so the next open revalidates.
+                        if let Some(cached) = self.cloud.note_cache.get_mut(&id) {
+                            cached.note.content = content.clone();
+                            cached.etag = None;
+                        }
                         // Pessimistic dirty: cleared only here, and only when
                         // the buffer still matches what the server accepted —
                         // keystrokes typed after Ctrl-S keep the marker.
@@ -723,7 +721,7 @@ impl App {
                         {
                             *cur_etag = None;
                             if let Some(e) = r.edit.as_mut()
-                                && r.raw == note.content
+                                && r.raw == content
                             {
                                 e.dirty = false;
                             }
@@ -792,7 +790,11 @@ impl App {
                 Err(e) => self.status = format!("HackMD delete failed: {e}"),
             },
             CloudMsg::PermissionSet { id, result } => match result {
-                Ok(note) => {
+                Ok(perm) => {
+                    // Empty PATCH response — `perm` is what's now in effect.
+                    // The publish link never changes (it always exists), so
+                    // pick it up from whichever state already knows it.
+                    let mut link = String::new();
                     if let Some(lists) = self.cloud.lists.as_mut() {
                         for n in lists
                             .notes
@@ -800,20 +802,11 @@ impl App {
                             .chain(lists.teams.iter_mut().flat_map(|t| t.notes.iter_mut()))
                         {
                             if n.id == id {
-                                n.read_permission = note.read_permission;
-                                n.publish_link = note.publish_link.clone();
+                                n.read_permission = perm;
+                                link = n.publish_link.clone();
                             }
                         }
                     }
-                    let published = matches!(
-                        note.read_permission,
-                        crate::types::NotePermissionRole::Guest
-                    );
-                    self.status = if published {
-                        format!("Published: {}", note.publish_link)
-                    } else {
-                        "Unpublished".into()
-                    };
                     // Keep an open reader's origin in sync so `P`/`y`/`o`
                     // immediately reflect the new state.
                     if let View::Reader(r) = &mut self.view
@@ -825,16 +818,28 @@ impl App {
                         } = &mut r.origin
                         && *cur_id == id
                     {
-                        *publish_link = note.publish_link.clone();
-                        *read_permission = note.read_permission;
+                        *read_permission = perm;
+                        if link.is_empty() {
+                            link = publish_link.clone();
+                        }
                     }
-                    self.cloud.note_cache.insert(
-                        id,
-                        CachedNote {
-                            note: *note,
-                            etag: None,
-                        },
-                    );
+                    if let Some(cached) = self.cloud.note_cache.get_mut(&id) {
+                        cached.note.read_permission = perm;
+                        cached.etag = None;
+                        if link.is_empty() {
+                            link = cached.note.publish_link.clone();
+                        }
+                    }
+                    let published = matches!(perm, crate::types::NotePermissionRole::Guest);
+                    self.status = if published {
+                        if link.is_empty() {
+                            "Published".into()
+                        } else {
+                            format!("Published: {link}")
+                        }
+                    } else {
+                        "Unpublished".into()
+                    };
                 }
                 Err(e) => self.status = format!("HackMD publish failed: {e}"),
             },
@@ -4257,7 +4262,7 @@ mod cloud_msg_tests {
 
         app.apply_cloud_msg(CloudMsg::Saved {
             id: "n1".into(),
-            result: Ok(Box::new(note("n1", "T", "body"))),
+            result: Ok("body".to_string()),
         });
         let View::Reader(r) = &app.view else {
             panic!("expected reader");
@@ -4273,7 +4278,7 @@ mod cloud_msg_tests {
         app.view = View::Reader(r);
         app.apply_cloud_msg(CloudMsg::Saved {
             id: "n1".into(),
-            result: Ok(Box::new(note("n1", "T", "body"))),
+            result: Ok("body".to_string()),
         });
         let View::Reader(r) = &app.view else {
             panic!("expected reader");

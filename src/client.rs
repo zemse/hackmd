@@ -130,6 +130,30 @@ impl Client {
         serde_json::from_str::<T>(&text).map_err(Error::Json)
     }
 
+    /// Send a request and decode the JSON body into `T` when one is present.
+    /// The live API answers mutating verbs with `202 Accepted`/`204 No
+    /// Content` and an empty body (despite the docs), so update/delete
+    /// surfaces return `Option<T>`: `None` for an empty body, `Some` when a
+    /// deployment does send the entity back.
+    pub(crate) async fn request_json_opt<B, T>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<Option<T>>
+    where
+        B: Serialize + ?Sized,
+        T: DeserializeOwned,
+    {
+        let (text, _headers, _status) = self.send_with_retry(method, path, body, None).await?;
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        serde_json::from_str::<T>(&text)
+            .map(Some)
+            .map_err(Error::Json)
+    }
+
     /// Send a request and discard the response body. Used for endpoints whose
     /// upstream contract is `Promise<void>` (the folder DELETE family, for
     /// example).

@@ -42,40 +42,44 @@ impl Client {
     }
 
     /// `PATCH /teams/{teamPath}/notes/{noteId}` with body `{ content }`.
-    // Diverges from upstream: returns parsed `SingleNote` (upstream returns raw response).
+    ///
+    /// The live API answers `202 Accepted` with an empty body, so this
+    /// returns `None` on success (matching the user-note variant).
     pub async fn update_team_note_content(
         &self,
         team_path: &str,
         note_id: &str,
         content: Option<String>,
-    ) -> Result<SingleNote> {
+    ) -> Result<Option<SingleNote>> {
         let path = format!("teams/{team_path}/notes/{note_id}");
         let body = UpdateContentBody {
             content: content.as_deref(),
         };
-        self.request_json::<UpdateContentBody<'_>, SingleNote>(Method::PATCH, &path, Some(&body))
-            .await
+        self.request_json_opt::<UpdateContentBody<'_>, SingleNote>(
+            Method::PATCH,
+            &path,
+            Some(&body),
+        )
+        .await
     }
 
     /// `PATCH /teams/{teamPath}/notes/{noteId}` — update arbitrary metadata.
-    // Diverges from upstream: returns parsed `SingleNote` (upstream returns raw response).
+    /// Same empty-body contract as the user-note variant.
     pub async fn update_team_note(
         &self,
         team_path: &str,
         note_id: &str,
         opts: UpdateNoteOptions,
-    ) -> Result<SingleNote> {
+    ) -> Result<Option<SingleNote>> {
         let path = format!("teams/{team_path}/notes/{note_id}");
-        self.request_json::<UpdateNoteOptions, SingleNote>(Method::PATCH, &path, Some(&opts))
+        self.request_json_opt::<UpdateNoteOptions, SingleNote>(Method::PATCH, &path, Some(&opts))
             .await
     }
 
-    /// `DELETE /teams/{teamPath}/notes/{noteId}` — returns the deleted note.
-    // Diverges from upstream: returns parsed `SingleNote` (upstream returns raw response).
-    pub async fn delete_team_note(&self, team_path: &str, note_id: &str) -> Result<SingleNote> {
+    /// `DELETE /teams/{teamPath}/notes/{noteId}` — `204 No Content` live.
+    pub async fn delete_team_note(&self, team_path: &str, note_id: &str) -> Result<()> {
         let path = format!("teams/{team_path}/notes/{note_id}");
-        self.request_json::<(), SingleNote>(Method::DELETE, &path, None)
-            .await
+        self.request_empty::<()>(Method::DELETE, &path, None).await
     }
 }
 
@@ -171,15 +175,14 @@ mod tests {
         assert_eq!(note.id, "tn1");
     }
 
+    // The live API answers PATCH with `202 Accepted` and an empty body.
     #[tokio::test]
-    async fn update_team_note_content_sends_content_body_and_returns_note() {
-        // Verifies our divergence from upstream: we DO parse the response body
-        // into a `SingleNote` instead of returning the raw response.
+    async fn update_team_note_content_202_empty_body() {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path("/teams/demo/notes/tn1"))
             .and(body_json(serde_json::json!({ "content": "new" })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(single_note_json("tn1", "new")))
+            .respond_with(ResponseTemplate::new(202))
             .expect(1)
             .mount(&server)
             .await;
@@ -189,11 +192,12 @@ mod tests {
             .update_team_note_content("demo", "tn1", Some("new".into()))
             .await
             .expect("update ok");
-        assert_eq!(note.content, "new");
+        assert!(note.is_none(), "202 empty body → None");
     }
 
+    // A deployment that echoes the entity back still parses (`Some`).
     #[tokio::test]
-    async fn update_team_note_sends_partial_body_and_returns_note() {
+    async fn update_team_note_parses_body_when_present() {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path("/teams/demo/notes/tn1"))
@@ -212,24 +216,24 @@ mod tests {
             .update_team_note("demo", "tn1", opts)
             .await
             .expect("update ok");
-        assert_eq!(note.id, "tn1");
+        assert_eq!(note.expect("body present").id, "tn1");
     }
 
+    // The live API answers DELETE with `204 No Content`.
     #[tokio::test]
-    async fn delete_team_note_returns_deleted_note() {
+    async fn delete_team_note_accepts_204_no_content() {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
             .and(path("/teams/demo/notes/tn1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(single_note_json("tn1", "gone")))
+            .respond_with(ResponseTemplate::new(204))
             .expect(1)
             .mount(&server)
             .await;
 
         let client = Client::with_config("t", server.uri(), fast_config()).expect("client");
-        let note = client
+        client
             .delete_team_note("demo", "tn1")
             .await
             .expect("delete ok");
-        assert_eq!(note.id, "tn1");
     }
 }

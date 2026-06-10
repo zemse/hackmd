@@ -45,31 +45,43 @@ impl Client {
 
     /// `PATCH /notes/{id}` with body `{ content }` — shorthand for updating
     /// only the body of a note.
+    ///
+    /// The live API answers `202 Accepted` with an empty body, so this
+    /// returns `None` on success; a deployment that echoes the updated note
+    /// back surfaces as `Some`.
     pub async fn update_note_content(
         &self,
         note_id: &str,
         content: Option<String>,
-    ) -> Result<SingleNote> {
+    ) -> Result<Option<SingleNote>> {
         let path = format!("notes/{note_id}");
         let body = UpdateContentBody {
             content: content.as_deref(),
         };
-        self.request_json::<UpdateContentBody<'_>, SingleNote>(Method::PATCH, &path, Some(&body))
-            .await
+        self.request_json_opt::<UpdateContentBody<'_>, SingleNote>(
+            Method::PATCH,
+            &path,
+            Some(&body),
+        )
+        .await
     }
 
     /// `PATCH /notes/{id}` — update arbitrary note metadata + content.
-    pub async fn update_note(&self, note_id: &str, opts: UpdateNoteOptions) -> Result<SingleNote> {
+    /// Same empty-body contract as [`Client::update_note_content`].
+    pub async fn update_note(
+        &self,
+        note_id: &str,
+        opts: UpdateNoteOptions,
+    ) -> Result<Option<SingleNote>> {
         let path = format!("notes/{note_id}");
-        self.request_json::<UpdateNoteOptions, SingleNote>(Method::PATCH, &path, Some(&opts))
+        self.request_json_opt::<UpdateNoteOptions, SingleNote>(Method::PATCH, &path, Some(&opts))
             .await
     }
 
-    /// `DELETE /notes/{id}` — upstream returns the deleted note in the body.
-    pub async fn delete_note(&self, note_id: &str) -> Result<SingleNote> {
+    /// `DELETE /notes/{id}` — the live API answers `204 No Content`.
+    pub async fn delete_note(&self, note_id: &str) -> Result<()> {
         let path = format!("notes/{note_id}");
-        self.request_json::<(), SingleNote>(Method::DELETE, &path, None)
-            .await
+        self.request_empty::<()>(Method::DELETE, &path, None).await
     }
 }
 
@@ -234,15 +246,14 @@ mod tests {
         assert_eq!(note.content, "# Hi");
     }
 
+    // The live API answers PATCH with `202 Accepted` and an empty body.
     #[tokio::test]
-    async fn update_note_content_sends_content_body() {
+    async fn update_note_content_sends_content_body_202_empty() {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path("/notes/n1"))
             .and(body_json(serde_json::json!({ "content": "new body" })))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(single_note_json("n1", "new body")),
-            )
+            .respond_with(ResponseTemplate::new(202))
             .expect(1)
             .mount(&server)
             .await;
@@ -252,11 +263,12 @@ mod tests {
             .update_note_content("n1", Some("new body".into()))
             .await
             .expect("update ok");
-        assert_eq!(note.content, "new body");
+        assert!(note.is_none(), "202 empty body → None");
     }
 
+    // A deployment that echoes the entity back still parses (`Some`).
     #[tokio::test]
-    async fn update_note_sends_partial_body() {
+    async fn update_note_parses_body_when_present() {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path("/notes/n1"))
@@ -276,21 +288,21 @@ mod tests {
             ..Default::default()
         };
         let note = client.update_note("n1", opts).await.expect("update ok");
-        assert_eq!(note.id, "n1");
+        assert_eq!(note.expect("body present").id, "n1");
     }
 
+    // The live API answers DELETE with `204 No Content`.
     #[tokio::test]
-    async fn delete_note_returns_deleted_note() {
+    async fn delete_note_accepts_204_no_content() {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
             .and(path("/notes/n1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(single_note_json("n1", "gone")))
+            .respond_with(ResponseTemplate::new(204))
             .expect(1)
             .mount(&server)
             .await;
 
         let client = Client::with_config("t", server.uri(), fast_config()).expect("client");
-        let note = client.delete_note("n1").await.expect("delete ok");
-        assert_eq!(note.id, "n1");
+        client.delete_note("n1").await.expect("delete ok");
     }
 }
