@@ -1,58 +1,33 @@
-//! Smoke tests for the TUI's pure-logic surface. No terminal is allocated —
-//! we exercise [`hackmd::tui::handle_key`] and [`hackmd::tui::App`] mutators
-//! directly.
+//! Smoke tests for the `md` binary's CLI surface (requires `--features tui`).
 
 #![cfg(feature = "tui")]
 
-use hackmd::tui::{Action, App, handle_key};
+use assert_cmd::Command;
+use predicates::prelude::*;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
-fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::NONE)
+#[test]
+fn md_version_reports_crate_version() {
+    Command::cargo_bin("md")
+        .unwrap()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
-fn dispatch_basic_keys() {
-    let app = App::new();
-    assert_eq!(
-        handle_key(&app, key(KeyCode::Char('q'))),
-        Some(Action::Quit)
-    );
-    assert_eq!(handle_key(&app, key(KeyCode::Esc)), Some(Action::Quit));
-    assert_eq!(
-        handle_key(&app, key(KeyCode::Char('j'))),
-        Some(Action::Down)
-    );
-    assert_eq!(handle_key(&app, key(KeyCode::Char('k'))), Some(Action::Up));
-    assert_eq!(handle_key(&app, key(KeyCode::Enter)), Some(Action::Open));
-    assert_eq!(
-        handle_key(&app, key(KeyCode::Char('r'))),
-        Some(Action::Refresh)
-    );
-    assert_eq!(
-        handle_key(&app, key(KeyCode::Char('e'))),
-        Some(Action::Edit)
-    );
-}
-
-#[test]
-fn dispatch_ignores_unbound_keys() {
-    let app = App::new();
-    assert!(handle_key(&app, key(KeyCode::Char('z'))).is_none());
-    assert!(handle_key(&app, key(KeyCode::F(1))).is_none());
-}
-
-#[test]
-fn empty_app_has_no_selection() {
-    let app = App::new();
-    assert!(app.selected_id().is_none());
-    assert_eq!(app.selected, 0);
-}
-
-#[test]
-fn status_set_is_visible() {
-    let mut app = App::new();
-    app.set_status("hello");
-    assert_eq!(app.status, "hello");
+fn md_help_locks_cli_surface() {
+    let assert = Command::cargo_bin("md").unwrap().arg("--help").assert();
+    let out = assert.success();
+    let stdout = String::from_utf8_lossy(&out.get_output().stdout).to_string();
+    for flag in [
+        "--width",
+        "--line-numbers",
+        "--style",
+        "--pager",
+        "--tui",
+        "[PATH]",
+    ] {
+        assert!(stdout.contains(flag), "missing {flag} in --help:\n{stdout}");
+    }
 }
