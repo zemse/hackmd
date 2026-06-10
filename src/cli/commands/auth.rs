@@ -43,14 +43,12 @@ pub async fn login(
         let _ = open::that_detached(TOKEN_SETTINGS_URL);
     }
 
-    let token = rpassword::prompt_password("Enter your HackMD access token: ")
-        .map_err(|e| Error::Config(format!("could not read token: {e}")))?;
+    let token = prompt_token_masked("Enter your HackMD access token: ")?;
     let token = token.trim().to_string();
     if token.is_empty() {
         return Err(Error::Config("empty token".into()));
     }
-    // The prompt doesn't echo, so a paste is invisible — confirm receipt
-    // with a masked preview before validating.
+    // Echoed stars confirm the paste landed; this confirms what exactly.
     println!(
         "Received {}-char token: {} — validating…",
         token.chars().count(),
@@ -69,6 +67,70 @@ pub async fn login(
             Err(e)
         }
     }
+}
+
+/// Read a secret from the terminal, echoing one `*` per character so
+/// typing AND pasting give visible feedback. Backspace works; Enter
+/// submits; Ctrl-C/Ctrl-D abort. Falls back to a plain (echo-less) line
+/// read when stdin isn't a TTY (e.g. `echo $TOKEN | hackmd login`).
+fn prompt_token_masked(prompt: &str) -> Result<String> {
+    use std::io::{IsTerminal, Write};
+
+    let mut stdout = std::io::stdout();
+    print!("{prompt}");
+    stdout.flush().map_err(Error::Io)?;
+
+    if !std::io::stdin().is_terminal() {
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line).map_err(Error::Io)?;
+        println!();
+        return Ok(line);
+    }
+
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, read};
+    use crossterm::terminal;
+
+    terminal::enable_raw_mode().map_err(|e| Error::Config(format!("raw mode: {e}")))?;
+    let mut buf = String::new();
+    let res = loop {
+        match read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => match k.code {
+                KeyCode::Enter => break Ok(()),
+                KeyCode::Char('c') | KeyCode::Char('d')
+                    if k.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    break Err(Error::Config("interrupted".into()));
+                }
+                KeyCode::Backspace => {
+                    if buf.pop().is_some() {
+                        let _ = write!(stdout, "\x08 \x08");
+                        let _ = stdout.flush();
+                    }
+                }
+                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    buf.push(c);
+                    let _ = write!(stdout, "*");
+                    let _ = stdout.flush();
+                }
+                _ => {}
+            },
+            // Terminals with bracketed paste active deliver the whole paste
+            // as one event — echo one star per character all the same.
+            Ok(Event::Paste(s)) => {
+                for c in s.chars().filter(|c| !c.is_control()) {
+                    buf.push(c);
+                    let _ = write!(stdout, "*");
+                }
+                let _ = stdout.flush();
+            }
+            Err(e) => break Err(Error::Config(format!("read key: {e}"))),
+            _ => {}
+        }
+    };
+    // Always restore the terminal before returning, error or not.
+    let _ = terminal::disable_raw_mode();
+    println!();
+    res.map(|()| buf)
 }
 
 /// Mask a token for display: all bullets except the last 4 chars, so the
