@@ -109,7 +109,7 @@ Every list-style command accepts shared output flags:
 
 | flag | meaning |
 |---|---|
-| `--output {table\|json\|csv\|yaml}` | output format (default `table`) |
+| `--output {table\|json\|csv\|tsv\|yaml}` | output format — defaults to `table` on a terminal and `tsv` when stdout is piped, so scripts and LLM agents get parseable rows without any flag |
 | `--columns id,title,...` | project a subset of columns |
 | `--sort <column>` | sort rows by a column (string compare) |
 | `--filter key=value` | keep rows where `row[key] == value` |

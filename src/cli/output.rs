@@ -12,17 +12,20 @@ use serde::Serialize;
 
 use crate::error::{Error, Result};
 
-/// Output format selected via `--output {table|json|csv|yaml}`.
+/// Output format selected via `--output {table|json|csv|tsv|yaml}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 #[clap(rename_all = "lower")]
 pub enum Format {
-    /// Pretty box-drawing table (default).
+    /// Pretty box-drawing table (default on a terminal).
     #[default]
     Table,
     /// JSON array, pretty-printed.
     Json,
     /// CSV with a header row.
     Csv,
+    /// Tab-separated values (default when stdout is piped) — the
+    /// machine/LLM-friendly plain form: no borders, no truncation.
+    Tsv,
     /// YAML sequence of mappings.
     Yaml,
 }
@@ -31,9 +34,9 @@ pub enum Format {
 /// `#[clap(flatten)]`.
 #[derive(Debug, Clone, Args, Default)]
 pub struct OutputOpts {
-    /// Output format. Defaults to `table`.
-    #[arg(long = "output", value_enum, default_value_t = Format::Table)]
-    pub format: Format,
+    /// Output format [default: table on a terminal, tsv when piped]
+    #[arg(long = "output", value_enum)]
+    pub format: Option<Format>,
     /// Comma-separated subset of columns to show (e.g. `id,title`).
     #[arg(long = "columns")]
     pub columns: Option<String>,
@@ -55,12 +58,25 @@ pub struct OutputOpts {
 ///
 /// `default_columns` is the ordered set of camelCase JSON keys to show
 /// when the caller doesn't pass `--columns`.
+///
+/// With no explicit `--output`, the format follows the destination: a
+/// pretty table on a terminal, plain TSV when stdout is piped — so
+/// scripts and LLM agents get parseable rows without remembering a flag.
 pub fn print_table<T: Serialize>(
     rows: &[T],
     default_columns: &[&str],
     opts: &OutputOpts,
 ) -> Result<()> {
-    print_table_to(&mut std::io::stdout().lock(), rows, default_columns, opts)
+    use std::io::IsTerminal;
+    let mut opts = opts.clone();
+    if opts.format.is_none() {
+        opts.format = Some(if std::io::stdout().is_terminal() {
+            Format::Table
+        } else {
+            Format::Tsv
+        });
+    }
+    print_table_to(&mut std::io::stdout().lock(), rows, default_columns, &opts)
 }
 
 /// Same as [`print_table`] but writes to an arbitrary sink (handy for tests).
@@ -102,7 +118,7 @@ pub fn print_table_to<W: Write, T: Serialize>(
         None => default_columns.iter().map(|s| s.to_string()).collect(),
     };
 
-    match opts.format {
+    match opts.format.unwrap_or_default() {
         Format::Json => {
             let projected = project(&array, &columns);
             let text = serde_json::to_string_pretty(&projected).map_err(Error::Json)?;
@@ -128,6 +144,23 @@ pub fn print_table_to<W: Write, T: Serialize>(
                     })
                     .collect::<Vec<_>>()
                     .join(",");
+                writeln!(out, "{line}").map_err(Error::Io)?;
+            }
+        }
+        Format::Tsv => {
+            if !opts.no_header {
+                writeln!(out, "{}", columns.join("\t")).map_err(Error::Io)?;
+            }
+            for row in &array {
+                let line = columns
+                    .iter()
+                    .map(|c| {
+                        tsv_sanitize(&json_field_to_string(
+                            row.get(c).unwrap_or(&serde_json::Value::Null),
+                        ))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t");
                 writeln!(out, "{line}").map_err(Error::Io)?;
             }
         }
@@ -183,6 +216,16 @@ fn json_field_to_string(v: &serde_json::Value) -> String {
     }
 }
 
+/// TSV has no quoting convention — flatten embedded tabs/newlines to a
+/// space so one row is always one line.
+fn tsv_sanitize(s: &str) -> String {
+    if s.contains(['\t', '\n', '\r']) {
+        s.replace(['\t', '\n', '\r'], " ")
+    } else {
+        s.to_string()
+    }
+}
+
 fn csv_escape(s: &str) -> String {
     if s.contains(',') || s.contains('"') || s.contains('\n') {
         let escaped = s.replace('"', "\"\"");
@@ -228,7 +271,7 @@ mod tests {
     fn csv_renders_default_columns() {
         let mut buf = Vec::new();
         let mut o = opts();
-        o.format = Format::Csv;
+        o.format = Some(Format::Csv);
         print_table_to(&mut buf, &rows(), &["id", "title", "teamPath"], &o).expect("ok");
         let text = String::from_utf8(buf).expect("utf8");
         assert!(text.contains("id,title,teamPath"));
@@ -240,7 +283,7 @@ mod tests {
     fn csv_filter_keeps_matching_rows() {
         let mut buf = Vec::new();
         let mut o = opts();
-        o.format = Format::Csv;
+        o.format = Some(Format::Csv);
         o.filter = Some("id=n2".into());
         print_table_to(&mut buf, &rows(), &["id", "title", "teamPath"], &o).expect("ok");
         let text = String::from_utf8(buf).expect("utf8");
@@ -252,7 +295,7 @@ mod tests {
     fn json_projects_subset_of_columns() {
         let mut buf = Vec::new();
         let mut o = opts();
-        o.format = Format::Json;
+        o.format = Some(Format::Json);
         o.columns = Some("id".into());
         print_table_to(&mut buf, &rows(), &["id", "title"], &o).expect("ok");
         let text = String::from_utf8(buf).expect("utf8");
@@ -264,7 +307,7 @@ mod tests {
     fn yaml_includes_team_path() {
         let mut buf = Vec::new();
         let mut o = opts();
-        o.format = Format::Yaml;
+        o.format = Some(Format::Yaml);
         print_table_to(&mut buf, &rows(), &["id", "teamPath"], &o).expect("ok");
         let text = String::from_utf8(buf).expect("utf8");
         assert!(text.contains("teamPath"));
@@ -276,7 +319,7 @@ mod tests {
     fn sort_orders_rows_by_column() {
         let mut buf = Vec::new();
         let mut o = opts();
-        o.format = Format::Csv;
+        o.format = Some(Format::Csv);
         o.sort = Some("title".into());
         print_table_to(&mut buf, &rows(), &["id", "title"], &o).expect("ok");
         let text = String::from_utf8(buf).expect("utf8");
@@ -299,6 +342,29 @@ mod tests {
     }
 
     #[test]
+    fn tsv_renders_plain_rows_and_sanitizes_tabs() {
+        #[derive(Serialize)]
+        struct R {
+            id: String,
+            title: String,
+        }
+        let rs = vec![R {
+            id: "n1".into(),
+            title: "has\ttab and\nnewline".into(),
+        }];
+        let mut buf = Vec::new();
+        let mut o = opts();
+        o.format = Some(Format::Tsv);
+        print_table_to(&mut buf, &rs, &["id", "title"], &o).expect("ok");
+        let text = String::from_utf8(buf).expect("utf8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "id\ttitle");
+        // Embedded tab/newline flattened: still exactly one row line.
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1], "n1\thas tab and newline");
+    }
+
+    #[test]
     fn csv_escapes_embedded_comma() {
         #[derive(Serialize)]
         struct R {
@@ -309,7 +375,7 @@ mod tests {
         }];
         let mut buf = Vec::new();
         let mut o = opts();
-        o.format = Format::Csv;
+        o.format = Some(Format::Csv);
         print_table_to(&mut buf, &rs, &["title"], &o).expect("ok");
         let text = String::from_utf8(buf).expect("utf8");
         assert!(text.contains("\"hello, world\""), "got: {text}");
