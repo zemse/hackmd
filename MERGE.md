@@ -87,15 +87,15 @@ In `src/tui/app.rs`:
 - Wiremock integration `tests/tui_cloud.rs` (pattern from existing `tests/sdk_integration.rs`): real runtime + MockServer, assert PATCH bodies and channel delivery.
 - Rewrite `tests/tui_smoke.rs`: `assert_cmd` `md --version/--help` snapshot (locks the CLI surface).
 
-### [ ] M7 — Docs, packaging, cleanup
+### [x] M7 — Docs, packaging, cleanup
 - README rewrite: what it is (SDK + CLI + reader/editor, two bins), install matrix, `md` usage (port md-tui README sections), cloud mode key table + token setup, SDK quick start, feature table, credit "md-tui v0.3.0 merged in".
 - CHANGELOG 0.1.0 entry. Update stale `src/lib.rs` tui doc blurb.
 - Sanity only: `cargo package --list --features tui`, `cargo publish --dry-run`. **No publish** (route through `/release` later).
 - md-tui repo: afterwards, README banner "merged into zemse/hackmd" + archive (out of scope for this change).
 
 ## Verification (end-to-end)
-- [ ] `cargo test` / `cargo test --features tui` / `cargo check --no-default-features` all green.
-- [ ] `cargo run --features tui --bin md -- README.md` — reader renders; `md dir/`, stdin pipe, split editor Ctrl-S on a local file.
+- [x] `cargo test` / `cargo test --features tui` / `cargo check --no-default-features` all green.
+- [ ] `cargo run --features tui --bin md -- README.md` — reader renders; `md dir/`, stdin pipe, split editor Ctrl-S on a local file. *(headless PTY smoke check passed — binary boots, enters alt screen, draws; full interactive pass needs a human terminal)*
 - [ ] With a real token: `H` → cloud list loads; open a note; edit + Ctrl-S; verify on hackmd.io. `P` publish → open publish_link. `S` download, `U` push, `n` create, `D` delete.
 - [ ] No token: `H` shows login instruction, app stays usable locally.
 - [ ] `cargo run --features tui -- tui` opens cloud view via the hackmd bin.

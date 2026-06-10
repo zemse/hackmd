@@ -4,24 +4,60 @@
 [![docs.rs](https://img.shields.io/docsrs/hackmd)](https://docs.rs/hackmd)
 [![license](https://img.shields.io/crates/l/hackmd.svg)](#license)
 
-Rust client library and CLI for [HackMD](https://hackmd.io).
+Rust SDK, CLI, and terminal markdown reader/editor for [HackMD](https://hackmd.io) — one crate, two binaries.
 
-Ports the official [`@hackmd/api`](https://github.com/hackmdio/api-client) SDK and [`@hackmd/hackmd-cli`](https://github.com/hackmdio/hackmd-cli) to Rust, plus an optional terminal UI behind the `tui` feature.
-
-- **SDK** — async `Client` with the full HackMD v1 surface: user, notes, teams, team-notes, folders, folder-order, ETag-aware GETs, retries with exponential backoff, and `429` rate-limit parsing.
-- **CLI** — `hackmd` binary with parity to `@hackmd/hackmd-cli`: `login`/`logout`/`whoami`, `history`, `export`, `teams`, `notes` and `team-notes` CRUD, shared `--output table|json|csv|yaml` formatting.
-- **TUI** *(opt-in)* — `hackmd tui` two-pane browser/editor built on `ratatui`.
+- **SDK** — async `Client` with the full HackMD v1 surface: user, notes, teams, team-notes, folders, folder-order, ETag-aware GETs, retries with exponential backoff, and `429` rate-limit parsing. Ports the official [`@hackmd/api`](https://github.com/hackmdio/api-client) SDK.
+- **CLI** — `hackmd` binary with parity to [`@hackmd/hackmd-cli`](https://github.com/hackmdio/hackmd-cli): `login`/`logout`/`whoami`, `history`, `export`, `teams`, `notes` and `team-notes` CRUD, shared `--output table|json|csv|yaml` formatting.
+- **TUI** *(opt-in)* — `md`, a full terminal markdown reader/browser/editor (mouse support, clickable links, images, split live-preview editing), with your HackMD notes one keypress away: browse, read, edit, publish, push and download — all without leaving the terminal. [md-tui](https://github.com/zemse/md-tui) v0.3.0 merged in.
 
 ## Install
 
 ```sh
-cargo install hackmd                  # SDK + CLI
-cargo install hackmd --features tui   # also enables `hackmd tui`
+cargo install hackmd                  # `hackmd` (SDK + CLI)
+cargo install hackmd --features tui   # also builds `md` and enables `hackmd tui`
 ```
 
 The `cli` feature is on by default; library-only consumers should opt out (see [Library](#library)).
 
-## CLI
+## `md` — terminal markdown reader/editor
+
+```sh
+md README.md          # read a file (markdown, code, JSON, …)
+md docs/              # browse a directory (gitignore-aware)
+md                    # browse the current directory
+cat notes.md | md     # read stdin
+md -w 100 -l -s dark  # wrap width, line numbers, theme (dark|light|auto)
+```
+
+Reader: vim-style scrolling (`j/k`, `d/u`, `gg/G`, counts), in-document search (`/`, `n/N`), fuzzy file search (`T`), Tab-cycle across links and checkboxes, click-to-follow links, click-to-toggle checkboxes, inline images (kitty/iTerm2/sixel terminals), tables with click-to-expand, JSON-line pretty-print, git lens (`Ctrl-G`, diff vs HEAD), read/unread badges in the browser.
+
+Editor (`e`): HackMD-style split view — raw markdown on one side, live preview on the other, scroll-synced both ways. `Ctrl-S` saves, `Ctrl-Z`/`Ctrl-Y` undo/redo, `Esc Esc` discards. Checkbox toggles persist straight to disk from read mode.
+
+Config lives at `~/.config/md/config.toml` (`theme`, `width`, `line_numbers`) — unchanged from md-tui, your existing file keeps working. `?` shows the full key map.
+
+### HackMD cloud mode
+
+Log in once (`hackmd login`, or set `HMD_API_ACCESS_TOKEN`), then press `H` in any browser view — or `gh` from anywhere — to flip between your local files and your hackmd.io notes. Without a token everything local keeps working; cloud mode just tells you how to log in.
+
+| key | context | action |
+|---|---|---|
+| `H` / `gh` | browsers / anywhere | toggle local ↔ hackmd.io |
+| `Enter` | cloud browser | open note |
+| `R` | cloud browser | refresh note lists |
+| `e` + `Ctrl-S` | cloud note | edit, save back to the cloud (PATCH) |
+| `n` | cloud browser | new note (title prompt) |
+| `D` | cloud browser / note | delete (asks for confirmation) |
+| `P` | cloud browser / note | publish / unpublish |
+| `y` | cloud note | copy the publish link |
+| `o` | cloud note | open the publish link in your browser |
+| `S` | cloud browser / note | download note to a local file |
+| `U` | local file / browser | push a local file up as a new note |
+
+The cloud list shows your notes plus each team's, with a `[pub]` badge on published ones. Fetched notes are cached and revalidated by ETag, so reopening is instant and remote edits show up on their own. Saves are pessimistic — the dirty marker only clears once the server confirms. All network traffic runs on background tasks; the UI never blocks.
+
+Publishing flips the note's `readPermission` between `guest` and `owner` — that's how the HackMD v1 API models it (there is no separate publish endpoint, and no comments API).
+
+## `hackmd` — CLI
 
 ### Authentication
 
@@ -65,7 +101,7 @@ hackmd team-notes --team-path <p> create  ...         # same flags as `notes cre
 hackmd team-notes --team-path <p> update --note-id <id> --content <c>
 hackmd team-notes --team-path <p> delete --note-id <id>
 
-hackmd tui                                            # interactive TUI (requires --features tui at install)
+hackmd tui                                            # the TUI, opened in cloud view (requires --features tui)
 ```
 
 Every list-style command accepts shared output flags:
@@ -97,7 +133,7 @@ Comment permission values: `disabled`, `forbidden`, `owners`, `signed_in_users`,
 | `HMD_API_ENDPOINT_URL` | the API base URL | defaults to `https://api.hackmd.io/v1` |
 | `HMD_CLI_CONFIG_DIR` | config directory | defaults to `~/.hackmd` |
 
-Each of these has a matching global CLI flag (`--token`, `--endpoint`, `--config-dir`) that takes priority over the env value when set.
+Each of these has a matching global CLI flag (`--token`, `--endpoint`, `--config-dir`) that takes priority over the env value when set. The TUI resolves its token through the same chain.
 
 ### Examples
 
@@ -115,33 +151,11 @@ cat draft.md | hackmd notes create --title "Draft"
 hackmd team-notes --team-path my-team create --editor --title "RFC"
 ```
 
-### TUI
-
-Install with the `tui` feature, then run `hackmd tui` to browse and edit your notes interactively:
-
-```sh
-cargo install hackmd --features tui
-hackmd tui
-```
-
-Two-pane layout: note list on the left, selected-note content on the right.
-
-| key             | action                                                  |
-|-----------------|---------------------------------------------------------|
-| `j` / `↓`       | move selection down                                     |
-| `k` / `↑`       | move selection up                                       |
-| `Enter` / `o`   | load the selected note into the right pane              |
-| `r`             | refresh the note list                                   |
-| `e`             | open the selected note in `$EDITOR` and save on exit    |
-| `q` / `Esc`     | quit                                                    |
-
-The TUI currently covers user notes only — team notes and folders are still CLI-only for this release.
-
 ## Library
 
 ```toml
 [dependencies]
-hackmd = { version = "0.0.2", default-features = false }
+hackmd = { version = "0.1", default-features = false }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -166,14 +180,14 @@ Every endpoint hangs off [`Client`](https://docs.rs/hackmd/latest/hackmd/client/
 
 | feature | default | what it pulls in |
 |---|---|---|
-| `cli` | yes | CLI binary and its dependencies |
-| `tui` | no  | TUI subcommand (implies `cli`) — install with `cargo install hackmd --features tui` |
+| `cli` | yes | the `hackmd` binary and its dependencies |
+| `tui` | no  | the `md` binary + `hackmd tui` (implies `cli`) — `ratatui`, `syntect`, image decoding, … |
 
-The `cli` feature gates compilation of `src/cli/` and the `hackmd` binary. The binary's `required-features = ["cli"]` means `cargo build --no-default-features` simply skips the binary build.
+`cargo build --no-default-features` skips both binaries (each is gated by `required-features`) and compiles the SDK alone.
 
-## Status
+## Credits
 
-v0.0.x — full SDK surface, CLI parity, and an opt-in TUI. The CLI's `--sort` / `--filter` use string comparison only; the TUI ships user notes only (team notes + folders remain CLI-only for this release).
+The TUI is [md-tui](https://github.com/zemse/md-tui) v0.3.0, merged into this crate and extended with HackMD cloud mode. The SDK and CLI port the official HackMD [`api-client`](https://github.com/hackmdio/api-client) and [`hackmd-cli`](https://github.com/hackmdio/hackmd-cli).
 
 ## License
 
