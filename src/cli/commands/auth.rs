@@ -40,9 +40,7 @@ pub async fn login(
         const TOKEN_SETTINGS_URL: &str = "https://hackmd.io/settings#api";
         println!("Create an access token at: {TOKEN_SETTINGS_URL}");
         // Best-effort: opens locally, silently does nothing over SSH.
-        if open::that_detached(TOKEN_SETTINGS_URL).is_ok() {
-            println!("(opened in your browser)");
-        }
+        let _ = open::that_detached(TOKEN_SETTINGS_URL);
     }
 
     let token = rpassword::prompt_password("Enter your HackMD access token: ")
@@ -51,6 +49,13 @@ pub async fn login(
     if token.is_empty() {
         return Err(Error::Config("empty token".into()));
     }
+    // The prompt doesn't echo, so a paste is invisible — confirm receipt
+    // with a masked preview before validating.
+    println!(
+        "Received {}-char token: {} — validating…",
+        token.chars().count(),
+        mask_token(&token)
+    );
 
     let client = Client::with_endpoint(token.clone(), eff.endpoint.clone())?;
     match client.me().await {
@@ -64,6 +69,17 @@ pub async fn login(
             Err(e)
         }
     }
+}
+
+/// Mask a token for display: all bullets except the last 4 chars, so the
+/// user can tell *which* token was pasted without exposing it.
+fn mask_token(token: &str) -> String {
+    let chars: Vec<char> = token.chars().collect();
+    if chars.len() <= 4 {
+        return "•".repeat(chars.len());
+    }
+    let tail: String = chars[chars.len() - 4..].iter().collect();
+    format!("{}{tail}", "•".repeat(chars.len() - 4))
 }
 
 /// `hackmd logout` — clear the stored token (file stays in place).

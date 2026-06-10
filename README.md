@@ -66,8 +66,8 @@ Run `hackmd login` — it opens <https://hackmd.io/settings#api> (where access t
 ```sh
 $ hackmd login
 Create an access token at: https://hackmd.io/settings#api
-(opened in your browser)
-Enter your HackMD access token: ********
+Enter your HackMD access token:
+Received 40-char token: ••••••••••••••••••••••••••••••••••••3kPq — validating…
 Login successfully
 ```
 
