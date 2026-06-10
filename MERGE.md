@@ -21,7 +21,7 @@ The user owns two crates: `hackmd` (v0.0.2 — async SDK + CLI + minimal TUI for
 
 ## Milestones (each compiles/tests green)
 
-### M0 — Cargo.toml alignment
+### [x] M0 — Cargo.toml alignment
 `hackmd-rs/Cargo.toml`: version → `0.1.0`; `dirs = "6"`; add md-tui's deps **all optional** (anyhow, pulldown-cmark 0.13 no-default, syntect 5 `default-fancy`, open 5, unicode-width 0.2, walkdir 2, ignore 0.4, ratatui-image 11 no-default +serde, image 0.25 no-default +png/jpeg/gif/webp, base64 0.22, toml 1); extend `tui` feature to enable all of them; add:
 ```toml
 [[bin]]
@@ -32,7 +32,7 @@ required-features = ["tui"]
 (`cargo install hackmd` → only `hackmd`; `--features tui` → both bins.)
 Verify: `cargo check`, `--no-default-features`, `--features tui`; `cargo tree --features tui` resolves a single ratatui 0.30.
 
-### M1 — Verbatim port (md bin works, zero cloud)
+### [x] M1 — Verbatim port (md bin works, zero cloud)
 - Delete old `src/tui/{app,ui}.rs` and the body of `src/tui/mod.rs` (the `$EDITOR` round-trip is superseded by the in-app split editor; keep its spawn+mpsc pattern as the seed for M2's `cloud.rs`).
 - Copy md-tui `src/{app,ui,events,markdown,config,jsonl,links,palette,read_state,syntax,theme}.rs` → `src/tui/`; rename ported `config.rs` → `md_config.rs`. Mechanical path rewrite `crate::X` → `crate::tui::X`. Keep `anyhow::Result` internally.
 - New `src/tui/mod.rs`: module tree + `LaunchOpts { source, width, line_numbers, style }` + `pub fn run_blocking(opts, cloud: CloudContext) -> anyhow::Result<()>` (md-tui `main.rs:50-92` body: md_config load, theme resolve, App::new, terminal setup, panic hook, `events::run`, read_state flush, restore).
@@ -44,7 +44,7 @@ Verify: `cargo run --features tui --bin md -- README.md`, dir browse, stdin; `ca
 
 Git history: plain copy (cross-repo history preservation not worth subtree gymnastics); commit message records `port md-tui v0.3.0 (zemse/md-tui @ <sha>)`.
 
-### M2 — Async bridge skeleton (`src/tui/cloud.rs`)
+### [ ] M2 — Async bridge skeleton (`src/tui/cloud.rs`)
 Reuse the shipped 0.0.2 TUI pattern (spawn + `tokio::sync::mpsc::unbounded` + `try_recv` drained each 250 ms tick):
 - `CloudContext { handle: Handle, client: Option<Client>, tx, rx }`; `init(handle)` resolves token via `cli::config::effective` and **tolerates** missing token (`client: None`, no startup error); `with_client(client, handle)`.
 - `CloudMsg` enum (responses only; errors cross as `String`): `Lists`, `Note { id, intent, result }`, `Saved`, `Created`, `Deleted`, `PermissionSet`. `FetchIntent::{OpenReader{scroll}, DownloadTo(PathBuf), Revalidate{etag}}`; `CreateIntent::{Blank, PushedFrom(PathBuf)}`.
@@ -52,19 +52,19 @@ Reuse the shipped 0.0.2 TUI pattern (spawn + `tokio::sync::mpsc::unbounded` + `t
 - `App` gains `cloud: CloudState { ctx, lists, note_cache: HashMap<id, CachedNote{note, etag}>, saving: HashSet<id>, pending: u32, ... }`; `App::new` takes the `CloudContext` arg (both bins pass it).
 - Hook in `events::run` (`events.rs:23`): `app.drain_cloud_msgs()` beside `poll_external_change()`. Statusline shows "⟳ syncing…" while `pending > 0`; errors go to the existing `app.status`.
 
-### M3 — Cloud state model + cloud browser + H toggle
+### [ ] M3 — Cloud state model + cloud browser + H toggle
 In `src/tui/app.rs`:
 - `EntryKind` (+`CloudList`, `CloudNote{id,title}`); `ReaderOrigin` (+`CloudNote{id, title, team_path, publish_link, read_permission, etag}`); `View` (+`Cloud(CloudBrowser)` — flat list grouped by "My notes"/team headers, `[pub]` badge; folders deferred).
 - `App::load`: `CloudList` builds from `cloud.lists` (spawns fetch if absent); `CloudNote` from `note_cache` synchronously, else `pending_nav = Some((id, scroll))` + spawn fetch and **stay put** — history is pushed only when `CloudMsg::Note` completes the navigation (failed fetch leaves history clean; stale responses dropped by id mismatch). `Reader::from_cloud(&SingleNote)` next to `from_file` (app.rs:1580).
 - `H` toggles local↔cloud **in browser views only** (preserves vim viewport-`H` in Reader, events.rs:271); add `gh` chord via the existing `pending_g` machinery (events.rs:130-138) to work anywhere. No token → status "No HackMD token — run `hackmd login` or set HMD_API_ACCESS_TOKEN".
 - Cloud browser keys: `j/k`, `Enter` open, `Esc/b` back, `R` refetch lists.
 
-### M4 — Cloud editing
+### [ ] M4 — Cloud editing
 - `save_edit` (app.rs:1185) dispatches on origin: `CloudNote` → guard `saving` set, spawn content PATCH, **keep `dirty` until `Saved{Ok}`** (pessimistic — failed PATCH never clears the dirty marker).
 - `toggle_checkbox` (app.rs:629): optimistic local mutate + same PATCH; on error, status + buffer intact.
 - Freshness: no per-tick poll for cloud; on cache-hit open, spawn ETag revalidate (`client.note(id, Some(etag))` → 304 short-circuit); if changed and not editing, swap content + "Note updated remotely" (mirrors local reload flow app.rs:590-601).
 
-### M5 — Publish, transfers, create/delete, prompts
+### [ ] M5 — Publish, transfers, create/delete, prompts
 - New prompt overlay on `App` (`Prompt { title, input, kind }`; kinds: NewNoteTitle, PushTitle(PathBuf), DownloadFilename{id}, ConfirmDelete{id,title,team_path}) — input handling clones the doc-search prompt pattern.
 - Keybinds (all verified unbound in their contexts):
 
@@ -81,24 +81,24 @@ In `src/tui/app.rs`:
 
 - Update `?` help overlay with a HackMD section (notes "not logged in" when applicable).
 
-### M6 — Tests
+### [ ] M6 — Tests
 - Ported in-file tests run via `cargo test --features tui`; add `CloudContext::disconnected()` test constructor (no runtime needed).
 - Unit tests for `apply_cloud_msg` (pure sync, no terminal): lists populate, pending nav completes + pushes history, `Saved{Err}` keeps dirty, stale-id responses dropped, pending counter zeroes.
 - Wiremock integration `tests/tui_cloud.rs` (pattern from existing `tests/sdk_integration.rs`): real runtime + MockServer, assert PATCH bodies and channel delivery.
 - Rewrite `tests/tui_smoke.rs`: `assert_cmd` `md --version/--help` snapshot (locks the CLI surface).
 
-### M7 — Docs, packaging, cleanup
+### [ ] M7 — Docs, packaging, cleanup
 - README rewrite: what it is (SDK + CLI + reader/editor, two bins), install matrix, `md` usage (port md-tui README sections), cloud mode key table + token setup, SDK quick start, feature table, credit "md-tui v0.3.0 merged in".
 - CHANGELOG 0.1.0 entry. Update stale `src/lib.rs` tui doc blurb.
 - Sanity only: `cargo package --list --features tui`, `cargo publish --dry-run`. **No publish** (route through `/release` later).
 - md-tui repo: afterwards, README banner "merged into zemse/hackmd" + archive (out of scope for this change).
 
 ## Verification (end-to-end)
-1. `cargo test` / `cargo test --features tui` / `cargo check --no-default-features` all green.
-2. `cargo run --features tui --bin md -- README.md` — reader renders; `md dir/`, stdin pipe, split editor Ctrl-S on a local file.
-3. With a real token: `H` → cloud list loads; open a note; edit + Ctrl-S; verify on hackmd.io. `P` publish → open publish_link. `S` download, `U` push, `n` create, `D` delete.
-4. No token: `H` shows login instruction, app stays usable locally.
-5. `cargo run --features tui -- tui` opens cloud view via the hackmd bin.
+- [ ] `cargo test` / `cargo test --features tui` / `cargo check --no-default-features` all green.
+- [ ] `cargo run --features tui --bin md -- README.md` — reader renders; `md dir/`, stdin pipe, split editor Ctrl-S on a local file.
+- [ ] With a real token: `H` → cloud list loads; open a note; edit + Ctrl-S; verify on hackmd.io. `P` publish → open publish_link. `S` download, `U` push, `n` create, `D` delete.
+- [ ] No token: `H` shows login instruction, app stays usable locally.
+- [ ] `cargo run --features tui -- tui` opens cloud view via the hackmd bin.
 
 ## Top risks
 1. Async bridge races (fetch completes after user navigated) — mitigated by id-matched `pending_nav`, history pushed on completion, deterministic sync unit tests.
