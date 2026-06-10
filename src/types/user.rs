@@ -22,8 +22,9 @@ pub struct Team {
     pub description: String,
     pub hard_breaks: bool,
     pub visibility: TeamVisibilityType,
-    // Upstream types this as `Date` but the wire value is a JSON string; the JS
-    // SDK never actually parses it, so we keep it as-is.
+    // Upstream types this as `Date`; the live wire value is an epoch-millis
+    // integer here (string elsewhere) — accept both.
+    #[serde(deserialize_with = "super::de_date")]
     pub created_at: String,
 }
 
@@ -47,6 +48,7 @@ pub struct SimpleUserProfile {
     pub user_path: String,
     pub photo: String,
     pub biography: Option<String>,
+    #[serde(deserialize_with = "super::de_date")]
     pub created_at: String,
 }
 
@@ -91,6 +93,25 @@ mod tests {
         assert_eq!(json["ownerId"], "user-1");
         assert_eq!(json["hardBreaks"], true);
         assert_eq!(json["visibility"], "public");
+    }
+
+    // Regression: the live `/me` endpoint returns teams whose `createdAt`
+    // is epoch milliseconds, not an ISO string.
+    #[test]
+    fn team_accepts_epoch_millis_created_at() {
+        let raw = r#"{
+            "id": "team-1",
+            "ownerId": "user-1",
+            "name": "Demo Team",
+            "logo": "logo.png",
+            "path": "demo-team",
+            "description": "",
+            "hardBreaks": false,
+            "visibility": "private",
+            "createdAt": 1633693316914
+        }"#;
+        let team: Team = serde_json::from_str(raw).expect("parse team with millis date");
+        assert_eq!(team.created_at, "2021-10-08T11:41:56.914Z");
     }
 
     #[test]

@@ -48,12 +48,6 @@ pub async fn login(
     if token.is_empty() {
         return Err(Error::Config("empty token".into()));
     }
-    // Echoed stars confirm the paste landed; this confirms what exactly.
-    println!(
-        "Received {}-char token: {} — validating…",
-        token.chars().count(),
-        mask_token(&token)
-    );
 
     let client = Client::with_endpoint(token.clone(), eff.endpoint.clone())?;
     match client.me().await {
@@ -131,17 +125,6 @@ fn prompt_token_masked(prompt: &str) -> Result<String> {
     let _ = terminal::disable_raw_mode();
     println!();
     res.map(|()| buf)
-}
-
-/// Mask a token for display: all bullets except the last 4 chars, so the
-/// user can tell *which* token was pasted without exposing it.
-fn mask_token(token: &str) -> String {
-    let chars: Vec<char> = token.chars().collect();
-    if chars.len() <= 4 {
-        return "•".repeat(chars.len());
-    }
-    let tail: String = chars[chars.len() - 4..].iter().collect();
-    format!("{}{tail}", "•".repeat(chars.len() - 4))
 }
 
 /// `hackmd logout` — clear the stored token (file stays in place).

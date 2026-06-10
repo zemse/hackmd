@@ -48,10 +48,15 @@ pub struct Note {
     pub id: String,
     pub title: String,
     pub tags: Vec<String>,
+    // Date fields accept both ISO strings and epoch millis — the live API
+    // mixes the two encodings across endpoints.
+    #[serde(deserialize_with = "super::de_date")]
     pub last_changed_at: String,
+    #[serde(deserialize_with = "super::de_date")]
     pub created_at: String,
     pub last_change_user: Option<SimpleUserProfile>,
     pub publish_type: NotePublishType,
+    #[serde(default, deserialize_with = "super::de_opt_date")]
     pub published_at: Option<String>,
     pub user_path: Option<String>,
     pub team_path: Option<String>,
@@ -72,10 +77,13 @@ pub struct SingleNote {
     pub id: String,
     pub title: String,
     pub tags: Vec<String>,
+    #[serde(deserialize_with = "super::de_date")]
     pub last_changed_at: String,
+    #[serde(deserialize_with = "super::de_date")]
     pub created_at: String,
     pub last_change_user: Option<SimpleUserProfile>,
     pub publish_type: NotePublishType,
+    #[serde(default, deserialize_with = "super::de_opt_date")]
     pub published_at: Option<String>,
     pub user_path: Option<String>,
     pub team_path: Option<String>,
@@ -221,6 +229,33 @@ mod tests {
         assert_eq!(json["writePermission"], "signed_in");
         // folder_paths absent because of skip_serializing_if.
         assert!(json.get("folderPaths").is_none());
+    }
+
+    // Regression: live API note endpoints can return epoch-millis numbers
+    // for date fields (encoding varies by endpoint).
+    #[test]
+    fn note_accepts_epoch_millis_dates() {
+        let raw = r#"{
+            "id": "n1",
+            "title": "Hello",
+            "tags": [],
+            "lastChangedAt": 1633693316914,
+            "createdAt": 1633693316914,
+            "lastChangeUser": null,
+            "publishType": "view",
+            "publishedAt": 1633693316914,
+            "userPath": null,
+            "teamPath": null,
+            "permalink": null,
+            "shortId": "abc",
+            "publishLink": "",
+            "readPermission": "owner",
+            "writePermission": "owner"
+        }"#;
+        let n: Note = serde_json::from_str(raw).expect("parse note with millis dates");
+        assert_eq!(n.last_changed_at, "2021-10-08T11:41:56.914Z");
+        assert_eq!(n.created_at, "2021-10-08T11:41:56.914Z");
+        assert_eq!(n.published_at.as_deref(), Some("2021-10-08T11:41:56.914Z"));
     }
 
     #[test]
