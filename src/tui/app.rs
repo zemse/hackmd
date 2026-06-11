@@ -48,6 +48,10 @@ pub struct App {
     /// Last column range occupied by the `[‹ Back]` button in the statusline,
     /// recorded by the renderer so click handling can hit-test it.
     pub back_button_hit: Option<(u16, u16)>,
+    /// Column ranges of the cloud browser's workspace tab labels
+    /// (`start_col, end_col, tab index`), recorded by the renderer so a
+    /// click on the tab bar can switch workspaces.
+    pub cloud_tab_hits: Vec<(u16, u16, usize)>,
     /// Column range and full target of the URL shown in the statusline middle,
     /// recorded by the renderer so a click on it can copy the (untruncated)
     /// URL to the clipboard.
@@ -378,15 +382,19 @@ pub enum ReaderOrigin {
 /// The cloud browser: a flat list of "My notes" + per-team sections.
 /// Folders are deliberately not modeled (v1 keeps the list flat).
 pub struct CloudBrowser {
-    pub rows: Vec<CloudRow>,
-    pub selected: usize,
-    pub scroll: u16,
+    /// One tab per workspace: "My notes" first, then each team.
+    pub tabs: Vec<CloudTab>,
+    /// Index into `tabs` of the workspace being shown.
+    pub active: usize,
 }
 
-pub enum CloudRow {
-    /// Section header ("My notes" / team name) — not selectable.
-    Header(String),
-    Note(CloudNoteRow),
+/// One workspace (personal or a team) shown as a tab in the cloud browser.
+pub struct CloudTab {
+    /// Tab label: "My notes" or the team name.
+    pub label: String,
+    pub notes: Vec<CloudNoteRow>,
+    pub selected: usize,
+    pub scroll: u16,
 }
 
 pub struct CloudNoteRow {
@@ -401,79 +409,86 @@ pub struct CloudNoteRow {
 }
 
 impl CloudBrowser {
-    /// Flatten the cached lists into display rows. With no lists yet (still
-    /// fetching, or not logged in) the browser comes up empty and the draw
-    /// layer shows an explanatory line instead.
+    /// Group the cached lists into workspace tabs. With no lists yet (still
+    /// fetching, or not logged in) the browser comes up with no tabs and the
+    /// draw layer shows an explanatory line instead.
     pub fn from_lists(lists: Option<&crate::tui::cloud::CloudLists>) -> Self {
-        let mut rows = Vec::new();
+        let mut tabs = Vec::new();
         if let Some(l) = lists {
-            rows.push(CloudRow::Header("My notes".to_string()));
-            for n in &l.notes {
-                rows.push(CloudRow::Note(CloudNoteRow {
-                    id: n.id.clone(),
-                    title: n.title.clone(),
-                    team_path: None,
-                    published: matches!(n.read_permission, crate::types::NotePermissionRole::Guest),
-                    visibility: n.visibility(),
-                }));
-            }
+            let note_row = |n: &crate::types::Note, team_path: Option<&str>| CloudNoteRow {
+                id: n.id.clone(),
+                title: n.title.clone(),
+                team_path: team_path.map(str::to_string),
+                published: matches!(n.read_permission, crate::types::NotePermissionRole::Guest),
+                visibility: n.visibility(),
+            };
+            tabs.push(CloudTab {
+                label: "My notes".to_string(),
+                notes: l.notes.iter().map(|n| note_row(n, None)).collect(),
+                selected: 0,
+                scroll: 0,
+            });
             for t in &l.teams {
-                rows.push(CloudRow::Header(format!("Team: {}", t.team.name)));
-                for n in &t.notes {
-                    rows.push(CloudRow::Note(CloudNoteRow {
-                        id: n.id.clone(),
-                        title: n.title.clone(),
-                        team_path: Some(t.team.path.clone()),
-                        published: matches!(
-                            n.read_permission,
-                            crate::types::NotePermissionRole::Guest
-                        ),
-                        visibility: n.visibility(),
-                    }));
-                }
+                tabs.push(CloudTab {
+                    label: t.team.name.clone(),
+                    notes: t
+                        .notes
+                        .iter()
+                        .map(|n| note_row(n, Some(&t.team.path)))
+                        .collect(),
+                    selected: 0,
+                    scroll: 0,
+                });
             }
         }
-        let selected = rows
-            .iter()
-            .position(|r| matches!(r, CloudRow::Note(_)))
-            .unwrap_or(0);
-        Self {
-            rows,
-            selected,
-            scroll: 0,
+        Self { tabs, active: 0 }
+    }
+
+    /// The active workspace tab. `None` only before the lists have loaded.
+    pub fn tab(&self) -> Option<&CloudTab> {
+        self.tabs.get(self.active)
+    }
+
+    pub fn tab_mut(&mut self) -> Option<&mut CloudTab> {
+        self.tabs.get_mut(self.active)
+    }
+
+    /// More than one workspace → the draw layer shows the tab bar.
+    pub fn show_tab_bar(&self) -> bool {
+        self.tabs.len() > 1
+    }
+
+    /// Cycle the active tab by `delta`, wrapping at either end.
+    pub fn switch_tab(&mut self, delta: i32) {
+        let n = self.tabs.len();
+        if n > 1 {
+            self.active = (self.active as i32 + delta).rem_euclid(n as i32) as usize;
         }
     }
 
-    /// The currently selected note row, if the cursor is on one.
+    /// The currently selected note row of the active tab.
     pub fn selected_note(&self) -> Option<&CloudNoteRow> {
-        match self.rows.get(self.selected) {
-            Some(CloudRow::Note(n)) => Some(n),
-            _ => None,
-        }
+        let t = self.tab()?;
+        t.notes.get(t.selected)
     }
 
-    /// Step the selection by `delta` across note rows only (headers are
-    /// skipped), wrapping at either end like the local browser. Keeps the
-    /// selection visible within `viewport_h` (minus the border rows).
+    /// Step the selection by `delta` within the active tab, wrapping at
+    /// either end like the local browser. Keeps the selection visible
+    /// within `viewport_h` (minus the border rows and the tab bar).
     pub fn move_selection(&mut self, delta: i32, viewport_h: u16) {
-        let notes: Vec<usize> = self
-            .rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| matches!(r, CloudRow::Note(_)))
-            .map(|(i, _)| i)
-            .collect();
-        if notes.is_empty() {
+        let chrome = 2 + self.show_tab_bar() as u16;
+        let Some(t) = self.tab_mut() else {
+            return;
+        };
+        if t.notes.is_empty() {
             return;
         }
-        let cur = notes.iter().position(|&i| i == self.selected).unwrap_or(0);
-        let new = (cur as i32 + delta).rem_euclid(notes.len() as i32) as usize;
-        self.selected = notes[new];
-        let h = viewport_h.saturating_sub(2) as usize;
-        if self.selected < self.scroll as usize {
-            self.scroll = self.selected.saturating_sub(1) as u16;
-        } else if self.selected >= self.scroll as usize + h.max(1) {
-            self.scroll = (self.selected + 1 - h.max(1)) as u16;
+        t.selected = (t.selected as i32 + delta).rem_euclid(t.notes.len() as i32) as usize;
+        let h = viewport_h.saturating_sub(chrome) as usize;
+        if t.selected < t.scroll as usize {
+            t.scroll = t.selected as u16;
+        } else if t.selected >= t.scroll as usize + h.max(1) {
+            t.scroll = (t.selected + 1 - h.max(1)) as u16;
         }
     }
 }
@@ -559,6 +574,7 @@ impl App {
             viewport: Rect::new(0, 0, 0, 0),
             statusline_area: Rect::new(0, 0, 0, 0),
             back_button_hit: None,
+            cloud_tab_hits: Vec::new(),
             statusline_url_hit: None,
             count_prefix: None,
             pending_g: None,
@@ -603,18 +619,24 @@ impl App {
             CloudMsg::Lists(Ok(lists)) => {
                 self.cloud.lists = Some(lists);
                 // If the user is looking at the cloud browser, rebuild it in
-                // place, keeping the cursor on the same note when it survives.
+                // place, keeping the active tab and the cursor on the same
+                // note when they survive.
                 if let View::Cloud(c) = &mut self.view {
+                    let active_label = c.tab().map(|t| t.label.clone());
                     let sel_id = c.selected_note().map(|n| n.id.clone());
+                    let old_scroll = c.tab().map(|t| t.scroll).unwrap_or(0);
                     let mut fresh = CloudBrowser::from_lists(self.cloud.lists.as_ref());
-                    if let Some(id) = sel_id
-                        && let Some(i) = fresh
-                            .rows
-                            .iter()
-                            .position(|r| matches!(r, CloudRow::Note(n) if n.id == id))
+                    if let Some(label) = active_label
+                        && let Some(i) = fresh.tabs.iter().position(|t| t.label == label)
                     {
-                        fresh.selected = i;
-                        fresh.scroll = c.scroll;
+                        fresh.active = i;
+                    }
+                    if let Some(id) = sel_id
+                        && let Some(t) = fresh.tab_mut()
+                        && let Some(i) = t.notes.iter().position(|n| n.id == id)
+                    {
+                        t.selected = i;
+                        t.scroll = old_scroll;
                     }
                     *c = fresh;
                 }
@@ -879,8 +901,8 @@ impl App {
             },
             View::Cloud(c) => HistoryEntry {
                 kind: EntryKind::CloudList,
-                scroll: c.scroll,
-                selected: Some(c.selected),
+                scroll: c.tab().map(|t| t.scroll).unwrap_or(0),
+                selected: c.tab().map(|t| t.selected),
             },
         }
     }
@@ -940,10 +962,11 @@ impl App {
             }
             EntryKind::CloudList => {
                 let mut c = CloudBrowser::from_lists(self.cloud.lists.as_ref());
-                c.scroll = scroll;
-                if let Some(sel) = selected {
-                    let max = c.rows.len().saturating_sub(1);
-                    c.selected = sel.min(max);
+                if let Some(t) = c.tab_mut() {
+                    t.scroll = scroll;
+                    if let Some(sel) = selected {
+                        t.selected = sel.min(t.notes.len().saturating_sub(1));
+                    }
                 }
                 if self.cloud.lists.is_none() {
                     self.cloud.request_lists();
@@ -4148,6 +4171,106 @@ mod cloud_msg_tests {
             mode: EditMode::Split,
             last_drawn_cursor: None,
         }
+    }
+
+    fn list_note(id: &str, title: &str) -> crate::types::Note {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "title": title,
+            "tags": [],
+            "lastChangedAt": "2024-01-01T00:00:00.000Z",
+            "createdAt": "2024-01-01T00:00:00.000Z",
+            "lastChangeUser": null,
+            "publishType": "view",
+            "publishedAt": null,
+            "userPath": null,
+            "teamPath": null,
+            "permalink": null,
+            "shortId": "s",
+            "publishLink": format!("https://hackmd.io/{id}"),
+            "readPermission": "owner",
+            "writePermission": "owner",
+        }))
+        .expect("note fixture")
+    }
+
+    fn team(path: &str, name: &str) -> crate::types::Team {
+        serde_json::from_value(serde_json::json!({
+            "id": "team-1",
+            "ownerId": "u1",
+            "name": name,
+            "logo": "logo.png",
+            "path": path,
+            "description": "",
+            "hardBreaks": false,
+            "visibility": "private",
+            "createdAt": "2024-01-01T00:00:00.000Z",
+        }))
+        .expect("team fixture")
+    }
+
+    fn two_workspace_lists() -> CloudLists {
+        CloudLists {
+            notes: vec![list_note("n1", "Mine"), list_note("n2", "Mine too")],
+            teams: vec![crate::tui::cloud::TeamNotes {
+                team: team("demo", "Demo Team"),
+                notes: vec![list_note("t1", "Team note")],
+            }],
+        }
+    }
+
+    #[test]
+    fn cloud_browser_builds_one_tab_per_workspace() {
+        let lists = two_workspace_lists();
+        let c = CloudBrowser::from_lists(Some(&lists));
+        assert_eq!(c.tabs.len(), 2);
+        assert!(c.show_tab_bar());
+        assert_eq!(c.tabs[0].label, "My notes");
+        assert_eq!(c.tabs[1].label, "Demo Team");
+        assert_eq!(c.tabs[0].notes.len(), 2);
+        assert!(c.tabs[0].notes[0].team_path.is_none());
+        assert_eq!(c.tabs[1].notes[0].team_path.as_deref(), Some("demo"));
+
+        // Personal-only account: single tab, no tab bar.
+        let solo = CloudBrowser::from_lists(Some(&CloudLists {
+            notes: vec![list_note("n1", "Mine")],
+            teams: Vec::new(),
+        }));
+        assert!(!solo.show_tab_bar());
+    }
+
+    #[test]
+    fn switch_tab_wraps_and_keeps_per_tab_selection() {
+        let lists = two_workspace_lists();
+        let mut c = CloudBrowser::from_lists(Some(&lists));
+        c.move_selection(1, 24);
+        assert_eq!(c.tab().unwrap().selected, 1);
+        c.switch_tab(1);
+        assert_eq!(c.active, 1);
+        assert_eq!(c.tab().unwrap().selected, 0, "fresh tab starts at 0");
+        c.switch_tab(1);
+        assert_eq!(c.active, 0, "wraps past the end");
+        assert_eq!(c.tab().unwrap().selected, 1, "selection survived the trip");
+        c.switch_tab(-1);
+        assert_eq!(c.active, 1, "wraps backwards");
+    }
+
+    #[test]
+    fn list_refresh_preserves_active_tab_and_selection() {
+        let mut app = test_app();
+        app.apply_cloud_msg(CloudMsg::Lists(Ok(two_workspace_lists())));
+        let _ = app.navigate_to(EntryKind::CloudList, 0);
+
+        if let View::Cloud(c) = &mut app.view {
+            c.switch_tab(1);
+            c.move_selection(0, 24); // no-op move, stays on t1
+        }
+        app.apply_cloud_msg(CloudMsg::Lists(Ok(two_workspace_lists())));
+        let View::Cloud(c) = &app.view else {
+            panic!("expected cloud view");
+        };
+        assert_eq!(c.active, 1, "active tab survives refresh");
+        assert_eq!(c.selected_note().map(|n| n.id.as_str()), Some("t1"));
     }
 
     #[test]

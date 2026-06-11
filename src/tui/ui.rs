@@ -15,7 +15,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
 use crate::tui::app::{
-    self, App, BrowserEntryKind, CloudRow, DiffRowKind, EditMode, Focus, ReaderOrigin, View,
+    self, App, BrowserEntryKind, DiffRowKind, EditMode, Focus, ReaderOrigin, View,
 };
 use crate::tui::links::LinkTarget;
 
@@ -842,11 +842,12 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, inner, &mut state);
 }
 
-/// Render the HackMD note browser: "My notes" + per-team sections in one
-/// flat list. Headers are bold/colored and not selectable; every note gets
-/// a visibility badge (published / anyone with link / signed in / only
-/// team / only me).
-fn draw_cloud_browser(f: &mut Frame, app: &App, area: Rect) {
+/// Render the HackMD note browser: one tab per workspace ("My notes" +
+/// each team), with the tab bar shown only when there's more than one.
+/// Every note gets a visibility badge (published / anyone with link /
+/// signed in / only team / only me).
+fn draw_cloud_browser(f: &mut Frame, app: &mut App, area: Rect) {
+    app.cloud_tab_hits.clear();
     let View::Cloud(c) = &app.view else {
         return;
     };
@@ -855,10 +856,10 @@ fn draw_cloud_browser(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .title(" hackmd.io ")
         .border_style(Style::default().fg(theme.muted));
-    let inner = block.inner(area);
+    let mut inner = block.inner(area);
     f.render_widget(block, area);
 
-    if c.rows.is_empty() {
+    if c.tabs.is_empty() {
         let msg = if app.cloud.is_connected() {
             "Loading notes from hackmd.io…"
         } else {
@@ -874,32 +875,58 @@ fn draw_cloud_browser(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let items: Vec<ListItem> = c
-        .rows
-        .iter()
-        .map(|row| match row {
-            CloudRow::Header(h) => ListItem::new(Span::styled(
-                h.clone(),
-                Style::default()
-                    .fg(theme.heading[0])
-                    .add_modifier(Modifier::BOLD),
-            )),
-            CloudRow::Note(n) => {
-                // Loudest exposure gets the loudest style: published is
-                // bold, link-shared uses the link color, private is muted.
-                let badge_style = match n.visibility {
-                    "published" => Style::default()
-                        .fg(theme.heading[3])
-                        .add_modifier(Modifier::BOLD),
-                    "only me" | "only team" => Style::default().fg(theme.muted),
-                    _ => Style::default().fg(theme.link),
-                };
-                ListItem::new(Line::from(vec![
-                    Span::raw("  "),
-                    Span::raw(n.title.clone()),
-                    Span::styled(format!(" [{}]", n.visibility), badge_style),
-                ]))
+    // Tab bar (only with multiple workspaces). Built by hand instead of the
+    // Tabs widget so each label's column range can be recorded for clicks.
+    let mut tab_hits = Vec::new();
+    if c.show_tab_bar() && inner.height > 0 {
+        let mut spans = Vec::new();
+        let mut x = inner.x;
+        for (i, t) in c.tabs.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" │ ", Style::default().fg(theme.muted)));
+                x += 3;
             }
+            let label = format!(" {} ", t.label);
+            let w = label.chars().count() as u16;
+            tab_hits.push((x, x + w.saturating_sub(1), i));
+            let style = if i == c.active {
+                Style::default()
+                    .bg(theme.status_bg)
+                    .fg(theme.status_fg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.muted)
+            };
+            spans.push(Span::styled(label, style));
+            x += w;
+        }
+        let bar = Rect::new(inner.x, inner.y, inner.width, 1);
+        f.render_widget(Paragraph::new(Line::from(spans)), bar);
+        inner.y += 1;
+        inner.height = inner.height.saturating_sub(1);
+    }
+
+    let Some(tab) = c.tab() else {
+        return;
+    };
+    let items: Vec<ListItem> = tab
+        .notes
+        .iter()
+        .map(|n| {
+            // Loudest exposure gets the loudest style: published is
+            // bold, link-shared uses the link color, private is muted.
+            let badge_style = match n.visibility {
+                "published" => Style::default()
+                    .fg(theme.heading[3])
+                    .add_modifier(Modifier::BOLD),
+                "only me" | "only team" => Style::default().fg(theme.muted),
+                _ => Style::default().fg(theme.link),
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw("  "),
+                Span::raw(n.title.clone()),
+                Span::styled(format!(" [{}]", n.visibility), badge_style),
+            ]))
         })
         .collect();
     let list = List::new(items)
@@ -911,9 +938,10 @@ fn draw_cloud_browser(f: &mut Frame, app: &App, area: Rect) {
         )
         .highlight_symbol("▶ ");
     let mut state = ListState::default()
-        .with_offset(c.scroll as usize)
-        .with_selected(Some(c.selected));
+        .with_offset(tab.scroll as usize)
+        .with_selected(Some(tab.selected));
     f.render_stateful_widget(list, inner, &mut state);
+    app.cloud_tab_hits = tab_hits;
 }
 
 fn browser_entry_style(kind: BrowserEntryKind, theme: &crate::tui::theme::Theme) -> Style {
@@ -1063,7 +1091,10 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
             }
         }
         View::Browser(b) => format!("{}/{}", b.selected + 1, b.entries.len().max(1)),
-        View::Cloud(c) => format!("{}/{}", c.selected + 1, c.rows.len().max(1)),
+        View::Cloud(c) => match c.tab() {
+            Some(t) => format!("{}/{}", t.selected + 1, t.notes.len().max(1)),
+            None => "0/0".to_string(),
+        },
     };
 
     // Resolve middle content + classify the mode (search / hover / hint).
@@ -1328,7 +1359,13 @@ fn default_hint(app: &App) -> String {
     match &app.view {
         View::Reader(_) => "j/k  d/u  /search  Tab:link  o:open  e:edit  ?:help  q:quit".into(),
         View::Browser(_) => "j/k  Enter:open  /search  T:fuzzy  H:hackmd  ?:help  q:quit".into(),
-        View::Cloud(_) => "j/k  Enter:open  R:refresh  H:local  ?:help  q:quit".into(),
+        View::Cloud(c) => {
+            if c.show_tab_bar() {
+                "j/k  Enter:open  Tab:workspace  R:refresh  H:local  ?:help  q:quit".into()
+            } else {
+                "j/k  Enter:open  R:refresh  H:local  ?:help  q:quit".into()
+            }
+        }
     }
 }
 
@@ -1454,6 +1491,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         }),
         Line::from("  H (browsers) / gh  toggle local ↔ hackmd.io"),
         Line::from("  Enter            open note      R  refresh lists"),
+        Line::from("  Tab / S-Tab      switch workspace tab (you / teams)"),
         Line::from("  e  + Ctrl-S      edit note, save back to the cloud"),
         Line::from("  n                new note       D  delete (confirms)"),
         Line::from("  P                publish/unpublish (readPermission)"),

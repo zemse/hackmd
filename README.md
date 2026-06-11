@@ -8,24 +8,27 @@ Rust SDK, CLI, and terminal markdown reader/editor for [HackMD](https://hackmd.i
 
 - **SDK** — async `Client` with the full HackMD v1 surface: user, notes, teams, team-notes, folders, folder-order, ETag-aware GETs, retries with exponential backoff, and `429` rate-limit parsing. Ports the official [`@hackmd/api`](https://github.com/hackmdio/api-client) SDK.
 - **CLI** — `hackmd` binary with parity to [`@hackmd/hackmd-cli`](https://github.com/hackmdio/hackmd-cli): `login`/`logout`/`whoami`, `history`, `export`, `teams`, `notes` and `team-notes` CRUD, shared `--output table|json|csv|yaml` formatting.
-- **TUI** *(opt-in)* — `hackmd tui`, a full terminal markdown reader/browser/editor (mouse support, clickable links, images, split live-preview editing), with your HackMD notes one keypress away: browse, read, edit, publish, push and download — all without leaving the terminal. [md-tui](https://github.com/zemse/md-tui) v0.3.0 merged in.
+- **TUI** — `hackmd`, a full terminal markdown reader/browser/editor (mouse support, clickable links, images, split live-preview editing), with your HackMD notes one keypress away: browse, read, edit, publish, push and download — all without leaving the terminal. [md-tui](https://github.com/zemse/md-tui) v0.3.0 merged in.
 
 ## Install
 
 ```sh
-cargo install hackmd                  # SDK + CLI
-cargo install hackmd --features tui   # also enables `hackmd tui`
+cargo install hackmd                            # SDK + CLI + TUI
+cargo install hackmd --no-default-features      # library-only (SDK)
 ```
 
-The `cli` feature is on by default; library-only consumers should opt out (see [Library](#library)).
+The `cli` and `tui` features are on by default; library-only consumers should opt out (see [Library](#library)).
 
-## `hackmd tui` — terminal markdown reader/editor
+## TUI — terminal markdown reader/editor
 
 ```sh
-hackmd tui            # cloud view when logged in, else browses the cwd
+hackmd                # cloud notes view when logged in, else browses the cwd
+hackmd .              # browse the current directory
+hackmd notes.md       # open a file (or any dir/file path) in the reader
+hackmd tui            # same as bare `hackmd`
 ```
 
-Logged in, it opens straight onto your hackmd.io notes; the local file browser is one `H` (or `Esc`) away — and without a token it simply starts there.
+Logged in, bare `hackmd` opens straight onto your hackmd.io notes; the local file browser is one `H` (or `Esc`) away — and without a token it simply starts there. With a path argument it stays local: a directory opens the file browser, a markdown file opens the reader.
 
 Reader: vim-style scrolling (`j/k`, `d/u`, `gg/G`, counts), in-document search (`/`, `n/N`), fuzzy file search (`T`), Tab-cycle across links and checkboxes, click-to-follow links, click-to-toggle checkboxes, inline images (kitty/iTerm2/sixel terminals), tables with click-to-expand, JSON-line pretty-print, git lens (`Ctrl-G`, diff vs HEAD), read/unread badges in the browser.
 
@@ -43,6 +46,7 @@ Log in once (`hackmd login`, or set `HMD_API_ACCESS_TOKEN`), then press `H` in a
 |---|---|---|
 | `H` / `gh` | browsers / anywhere | toggle local ↔ hackmd.io |
 | `Enter` | cloud browser | open note |
+| `Tab` / `S-Tab` | cloud browser | switch workspace tab (you / teams) |
 | `R` | cloud browser | refresh note lists |
 | `e` + `Ctrl-S` | cloud note | edit, save back to the cloud (PATCH) |
 | `n` | cloud browser | new note (title prompt) |
@@ -53,7 +57,7 @@ Log in once (`hackmd login`, or set `HMD_API_ACCESS_TOKEN`), then press `H` in a
 | `S` | cloud browser / note | download note to a local file |
 | `U` | local file / browser | push a local file up as a new note |
 
-The cloud list shows your notes plus each team's, with a `[pub]` badge on published ones. Fetched notes are cached and revalidated by ETag, so reopening is instant and remote edits show up on their own. Saves are pessimistic — the dirty marker only clears once the server confirms. All network traffic runs on background tasks; the UI never blocks.
+The cloud browser shows one workspace tab per owner — your notes first, then each team (the tab bar only appears when there's more than one). Every note carries a visibility badge: `[published]` (on the owner's public profile, indexable), `[anyone with link]`, `[signed in]`, `[only team]`, or `[only me]`. Fetched notes are cached and revalidated by ETag, so reopening is instant and remote edits show up on their own. Saves are pessimistic — the dirty marker only clears once the server confirms. All network traffic runs on background tasks; the UI never blocks.
 
 Publishing flips the note's `readPermission` between `guest` and `owner` — that's how the HackMD v1 API models it (there is no separate publish endpoint, and no comments API).
 
@@ -102,7 +106,7 @@ hackmd team-notes --team-path <p> create  ...         # same flags as `notes cre
 hackmd team-notes --team-path <p> update --note-id <id> --content <c>
 hackmd team-notes --team-path <p> delete --note-id <id>
 
-hackmd tui                                            # the TUI, opened in cloud view (requires --features tui)
+hackmd [PATH]                                         # the TUI: cloud view bare, local browser/reader with a path
 ```
 
 Every list-style command accepts shared output flags:
@@ -182,7 +186,7 @@ Every endpoint hangs off [`Client`](https://docs.rs/hackmd/latest/hackmd/client/
 | feature | default | what it pulls in |
 |---|---|---|
 | `cli` | yes | the `hackmd` binary and its dependencies |
-| `tui` | no  | the `hackmd tui` terminal UI (implies `cli`) — `ratatui`, `syntect`, image decoding, … |
+| `tui` | yes | the terminal UI (implies `cli`) — `ratatui`, `syntect`, image decoding, … |
 
 `cargo build --no-default-features` skips the binary (gated by `required-features = ["cli"]`) and compiles the SDK alone.
 

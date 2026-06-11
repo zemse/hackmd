@@ -318,9 +318,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('M') => scroll_viewport_relative(app, ViewportTarget::Middle),
         KeyCode::Char('L') => scroll_viewport_relative(app, ViewportTarget::Bottom),
 
-        // Focus walks links AND checkboxes.
-        KeyCode::Tab => focus_next(app),
-        KeyCode::BackTab => focus_prev(app),
+        // Cloud browser: Tab cycles workspace tabs. Elsewhere focus walks
+        // links AND checkboxes.
+        KeyCode::Tab => match &mut app.view {
+            View::Cloud(c) => c.switch_tab(1),
+            _ => focus_next(app),
+        },
+        KeyCode::BackTab => match &mut app.view {
+            View::Cloud(c) => c.switch_tab(-1),
+            _ => focus_prev(app),
+        },
         KeyCode::Enter => activate(app)?,
         KeyCode::Char('o') => open_focused(app)?,
 
@@ -1080,7 +1087,7 @@ fn body_pos(app: &App, col: u16, row: u16) -> Option<(usize, u16)> {
     let scroll = match &app.view {
         View::Reader(r) => r.scroll as usize,
         View::Browser(b) => b.scroll as usize,
-        View::Cloud(c) => c.scroll as usize,
+        View::Cloud(c) => c.tab().map(|t| t.scroll).unwrap_or(0) as usize,
     };
     let local_row = (row - body.y) as usize;
     let local_col = col - body.x - line_num_w;
@@ -1733,17 +1740,37 @@ fn update_hover(app: &mut App, col: u16, row: u16) {
 
 fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
     let area = app.viewport;
-    // Cloud browser: click selects + opens a note row; headers are inert.
-    if let View::Cloud(c) = &mut app.view {
-        // Row 0 is the bordered title; list rows start at 1.
-        let visual = ((row - area.y) as usize).saturating_sub(1);
-        let idx = visual + c.scroll as usize;
-        let target = match c.rows.get(idx) {
-            Some(crate::tui::app::CloudRow::Note(n)) => Some((n.id.clone(), n.title.clone())),
-            _ => None,
+    // Cloud browser: a click on the tab bar switches workspaces; a click
+    // on a note row selects + opens it.
+    if let View::Cloud(_) = &app.view {
+        let tab_bar = matches!(&app.view, View::Cloud(c) if c.show_tab_bar());
+        // Row 0 is the bordered title; with multiple workspaces the next
+        // row is the tab bar, then the list rows.
+        let visual = (row - area.y) as usize;
+        if tab_bar && visual == 1 {
+            let hit = app
+                .cloud_tab_hits
+                .iter()
+                .find(|&&(start, end, _)| col >= start && col <= end)
+                .map(|&(_, _, i)| i);
+            if let (Some(i), View::Cloud(c)) = (hit, &mut app.view) {
+                c.active = i;
+            }
+            return Ok(());
+        }
+        let View::Cloud(c) = &mut app.view else {
+            return Ok(());
         };
+        let idx = visual.saturating_sub(1 + tab_bar as usize)
+            + c.tab().map(|t| t.scroll).unwrap_or(0) as usize;
+        let target = c
+            .tab()
+            .and_then(|t| t.notes.get(idx))
+            .map(|n| (n.id.clone(), n.title.clone()));
         if let Some((id, title)) = target {
-            c.selected = idx;
+            if let Some(t) = c.tab_mut() {
+                t.selected = idx;
+            }
             app.open_cloud_note(id, title);
         }
         return Ok(());
