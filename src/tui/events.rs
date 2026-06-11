@@ -55,6 +55,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // Any key press hides the mouse-driven cursor suppression so the keyboard
     // focus highlight reappears.
     app.mouse_recent = false;
+    // Transient feedback ("Copied …", "Saved …", "File reloaded") lives until
+    // the next input: any key returns the statusline to the contextual hints.
+    // Handlers that produce a new message set it after this clear.
+    app.status.clear();
 
     // Ctrl+C is a hard exit no matter what overlay is on screen.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -578,7 +582,6 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
             };
             if !dirty {
                 app.exit_edit();
-                app.status.clear();
             } else if armed {
                 app.exit_edit_discard();
             } else if let View::Reader(r) = &mut app.view {
@@ -860,6 +863,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
             app.last_mouse_row = m.row;
         }
         _ => {}
+    }
+    // Like key presses, deliberate gestures (click / wheel) dismiss any
+    // transient status message; a hover alone keeps it visible.
+    if matches!(
+        m.kind,
+        MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) {
+        app.status.clear();
     }
 
     // Statusline: clickable back button. (Was in the dedicated header row;
@@ -1682,6 +1693,67 @@ mod keybind_tests {
         // as plain `o` (open focused link) or crash.
         assert!(!app.should_quit);
     }
+
+    #[test]
+    fn any_key_clears_transient_status() {
+        let mut app = app_with_headings("status-reset");
+        app.status = "Saved /tmp/x.md".into();
+        press(&mut app, KeyCode::Char('j'));
+        assert!(
+            app.status.is_empty(),
+            "a scroll key must dismiss the sticky status message"
+        );
+    }
+
+    /// A doc with two markdown links for focus-cycling tests.
+    fn app_with_links(tag: &str) -> App {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "md-tui-events-test-{}-{}.md",
+            tag,
+            std::process::id()
+        ));
+        let mut src = String::from("[one](https://one.example)\n\n");
+        for i in 0..30 {
+            src.push_str(&format!("filler {i}\n\n"));
+        }
+        src.push_str("[two](https://two.example)\n");
+        std::fs::write(&p, src).unwrap();
+        let opts = Options {
+            width: 80,
+            line_numbers: false,
+            theme: Theme::dark(),
+        };
+        let mut app = App::new(Source::File(p), opts).unwrap();
+        app.ensure_rendered(80);
+        app.viewport = ratatui::layout::Rect::new(0, 0, 80, 10);
+        app
+    }
+
+    fn reader_focus(app: &App) -> Option<crate::tui::app::Focus> {
+        match &app.view {
+            View::Reader(r) => r.focus,
+            _ => panic!("expected reader"),
+        }
+    }
+
+    #[test]
+    fn scrolling_drops_tab_focus() {
+        let mut app = app_with_links("focus-scroll");
+        press(&mut app, KeyCode::Tab);
+        assert!(reader_focus(&app).is_some(), "Tab focuses the first link");
+        press(&mut app, KeyCode::Down);
+        assert!(
+            reader_focus(&app).is_none(),
+            "scrolling must end the Tab-cycling session"
+        );
+        // Tab again still works and `gg` (scroll_to) also clears it.
+        press(&mut app, KeyCode::Tab);
+        assert!(reader_focus(&app).is_some());
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        assert!(reader_focus(&app).is_none());
+    }
 }
 
 /// Mouse-wheel scroll with rate-aware dampening: deliberate single ticks
@@ -1786,7 +1858,9 @@ fn scroll_by(app: &mut App, delta: i32) {
             let max = (total - h).max(0);
             let new = (r.scroll as i32 + delta).clamp(0, max) as u16;
             r.scroll = new;
-            app.status.clear();
+            // Scrolling away ends a Tab-cycling session: drop the focused
+            // link so the statusline returns to the contextual hints.
+            r.focus = None;
         }
         View::Browser(b) => {
             let n = b.entries.len() as i32;
@@ -1826,6 +1900,7 @@ fn scroll_to(app: &mut App, line: u16) {
         let h = app.viewport.height as i32;
         let max = (total - h).max(0) as u16;
         r.scroll = line.min(max);
+        r.focus = None;
     }
 }
 
@@ -2066,6 +2141,9 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
                 }
                 return Ok(());
             }
+            // A click anywhere in the body ends a Tab-cycling session; the
+            // link branch below re-focuses when the click lands on a link.
+            r.focus = None;
             // JSON-line expand button beats every other hit-test on its row:
             // it sits in the left gutter so it never overlaps real content.
             if let Some(bi) = r
