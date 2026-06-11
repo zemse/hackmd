@@ -17,9 +17,9 @@ future work toward that.
 - [x] Tab — accept the grey inline completion (e.g. `:pre` → `:preview`)
 - [x] Esc on the command line — discard changes and exit (non-vim escape)
 - [x] Backspace on empty command — back to insert mode
-- [ ] `:N` — jump to line N
+- [x] `:N` — jump to line N (clamped like vim)
 - [ ] `:s/old/new/` and `:%s/old/new/g` — substitute
-- [ ] `:e!` — reload buffer from disk, discarding edits (stay editing)
+- [x] `:e!` — reload buffer from disk, discarding edits (stay editing)
 - [ ] command history (↑/↓ on the command line)
 
 ## Entering / leaving edit

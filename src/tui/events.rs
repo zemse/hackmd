@@ -634,7 +634,7 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
 /// Editor commands the command line accepts, in suggestion order. `:` is
 /// implicit — the stored input never includes it.
-const EDIT_COMMANDS: &[&str] = &["w", "wq", "x", "q", "q!", "preview"];
+const EDIT_COMMANDS: &[&str] = &["w", "wq", "x", "q", "q!", "preview", "e!"];
 
 /// The grey inline completion for a partial command: the first command the
 /// input is a strict prefix of. `None` for empty input, exact matches, and
@@ -730,9 +730,86 @@ fn exec_edit_command(app: &mut App, cmd: &str) -> Result<()> {
             }
         }
         "preview" => open_edit_preview(app),
-        other => app.status = format!("Not an editor command: :{other}"),
+        // `:e!` — reload the buffer from disk / cloud cache, dropping
+        // unsaved edits but staying in the editor.
+        "e!" => edit_reload(app),
+        other => {
+            // `:N` — move the cursor to the start of line N (1-based,
+            // clamped to the buffer like vim).
+            if let Ok(n) = other.parse::<usize>() {
+                edit_goto_line(app, n);
+            } else {
+                app.status = format!("Not an editor command: :{other}");
+            }
+        }
     }
     Ok(())
+}
+
+/// `:N` — place the edit cursor at the start of source line `n` (1-based).
+/// Out-of-range lands on the last line, `:0` on the first — vim's clamping.
+fn edit_goto_line(app: &mut App, n: usize) {
+    if let View::Reader(r) = &mut app.view {
+        let Some(e) = r.edit.as_mut() else { return };
+        let target = n.saturating_sub(1);
+        let mut offset = 0usize;
+        for (i, line) in r.raw.split_inclusive('\n').enumerate() {
+            if i == target {
+                break;
+            }
+            offset += line.len();
+        }
+        e.cursor = offset.min(r.raw.len());
+        e.last_drawn_cursor = None;
+        r.rendered = None;
+    }
+}
+
+/// `:e!` — reload from the origin, discarding unsaved edits, but stay in
+/// the editor. The undo history is dropped with the buffer it described.
+fn edit_reload(app: &mut App) {
+    let cached_raw = match &app.view {
+        View::Reader(r) => match &r.origin {
+            crate::tui::app::ReaderOrigin::CloudNote { id, .. } => {
+                app.cloud.note_cache.get(id).map(|c| c.note.content.clone())
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let reloaded = {
+        let View::Reader(r) = &mut app.view else {
+            return;
+        };
+        if r.edit.is_none() {
+            return;
+        }
+        let fresh = match r.origin.clone() {
+            crate::tui::app::ReaderOrigin::File(path) => std::fs::read_to_string(&path).ok(),
+            crate::tui::app::ReaderOrigin::CloudNote { .. } => cached_raw,
+            crate::tui::app::ReaderOrigin::Stdin => None,
+        };
+        match fresh {
+            Some(fresh) => {
+                r.raw = fresh;
+                let e = r.edit.as_mut().unwrap();
+                e.cursor = 0;
+                e.dirty = false;
+                e.undo.clear();
+                e.redo.clear();
+                e.last_drawn_cursor = None;
+                r.rendered = None;
+                true
+            }
+            None => false,
+        }
+    };
+    app.status = if reloaded {
+        "Buffer reloaded"
+    } else {
+        "Nothing to reload"
+    }
+    .into();
 }
 
 /// `:preview` — render the unsaved buffer full-screen like the reader.
@@ -2007,6 +2084,39 @@ mod keybind_tests {
         press(&mut app, KeyCode::Enter);
         assert!(edit_state_of(&app).is_some(), "still editing");
         assert_eq!(app.status, "Not an editor command: :nope");
+    }
+
+    #[test]
+    fn colon_number_jumps_cursor_to_line() {
+        let mut app = app_with_headings("goto-line");
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Esc);
+        type_str(&mut app, "5");
+        press(&mut app, KeyCode::Enter);
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        let expected: usize = r.raw.split_inclusive('\n').take(4).map(|l| l.len()).sum();
+        let e = r.edit.as_ref().expect(":5 stays in the editor");
+        assert_eq!(e.cursor, expected, "cursor lands at the start of line 5");
+        assert!(e.command.is_none());
+    }
+
+    #[test]
+    fn e_bang_reloads_from_disk_and_stays_editing() {
+        let mut app = app_with_headings("e-bang");
+        press(&mut app, KeyCode::Char('e'));
+        type_str(&mut app, "XYZ");
+        press(&mut app, KeyCode::Esc);
+        type_str(&mut app, "e!");
+        press(&mut app, KeyCode::Enter);
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        let e = r.edit.as_ref().expect(":e! stays in the editor");
+        assert!(!e.dirty, "reloaded buffer is clean");
+        assert!(!r.raw.starts_with("XYZ"), "unsaved edit was dropped");
+        assert_eq!(app.status, "Buffer reloaded");
     }
 
     #[test]
