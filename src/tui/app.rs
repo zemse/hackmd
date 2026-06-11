@@ -394,8 +394,10 @@ pub struct CloudNoteRow {
     pub title: String,
     /// `Some` when the note belongs to a team (drives the team API variants).
     pub team_path: Option<String>,
-    /// True when `readPermission == guest` — shown as a `[pub]` badge.
+    /// True when `readPermission == guest` — drives the `P` publish toggle.
     pub published: bool,
+    /// Access summary badge — see [`crate::types::Note::visibility`].
+    pub visibility: &'static str,
 }
 
 impl CloudBrowser {
@@ -412,6 +414,7 @@ impl CloudBrowser {
                     title: n.title.clone(),
                     team_path: None,
                     published: matches!(n.read_permission, crate::types::NotePermissionRole::Guest),
+                    visibility: n.visibility(),
                 }));
             }
             for t in &l.teams {
@@ -425,6 +428,7 @@ impl CloudBrowser {
                             n.read_permission,
                             crate::types::NotePermissionRole::Guest
                         ),
+                        visibility: n.visibility(),
                     }));
                 }
             }

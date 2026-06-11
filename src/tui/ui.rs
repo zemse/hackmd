@@ -843,8 +843,9 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Render the HackMD note browser: "My notes" + per-team sections in one
-/// flat list. Headers are bold/colored and not selectable; published notes
-/// get a `[pub]` badge.
+/// flat list. Headers are bold/colored and not selectable; every note gets
+/// a visibility badge (published / anyone with link / signed in / only
+/// team / only me).
 fn draw_cloud_browser(f: &mut Frame, app: &App, area: Rect) {
     let View::Cloud(c) = &app.view else {
         return;
@@ -873,9 +874,6 @@ fn draw_cloud_browser(f: &mut Frame, app: &App, area: Rect) {
         return;
     }
 
-    let badge_style = Style::default()
-        .fg(theme.heading[3])
-        .add_modifier(Modifier::BOLD);
     let items: Vec<ListItem> = c
         .rows
         .iter()
@@ -887,11 +885,20 @@ fn draw_cloud_browser(f: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             )),
             CloudRow::Note(n) => {
-                let mut spans = vec![Span::raw("  "), Span::raw(n.title.clone())];
-                if n.published {
-                    spans.push(Span::styled(" [pub]", badge_style));
-                }
-                ListItem::new(Line::from(spans))
+                // Loudest exposure gets the loudest style: published is
+                // bold, link-shared uses the link color, private is muted.
+                let badge_style = match n.visibility {
+                    "published" => Style::default()
+                        .fg(theme.heading[3])
+                        .add_modifier(Modifier::BOLD),
+                    "only me" | "only team" => Style::default().fg(theme.muted),
+                    _ => Style::default().fg(theme.link),
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(n.title.clone()),
+                    Span::styled(format!(" [{}]", n.visibility), badge_style),
+                ]))
             }
         })
         .collect();

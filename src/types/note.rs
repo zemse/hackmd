@@ -69,6 +69,29 @@ pub struct Note {
     pub folder_paths: Option<Vec<FolderPath>>,
 }
 
+impl Note {
+    /// Human-readable access summary: `published` when the note has a
+    /// public page (listed on the owner's profile, search-indexable),
+    /// otherwise who can read it — `anyone with link` (guest, unlisted),
+    /// `signed in`, or `only team` / `only me` (owner).
+    pub fn visibility(&self) -> &'static str {
+        if self.published_at.is_some() {
+            return "published";
+        }
+        match self.read_permission {
+            NotePermissionRole::Guest => "anyone with link",
+            NotePermissionRole::SignedIn => "signed in",
+            NotePermissionRole::Owner => {
+                if self.team_path.is_some() {
+                    "only team"
+                } else {
+                    "only me"
+                }
+            }
+        }
+    }
+}
+
 /// A note fetched individually — same as [`Note`] but includes the raw
 /// markdown body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
