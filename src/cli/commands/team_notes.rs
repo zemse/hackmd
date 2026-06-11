@@ -8,14 +8,7 @@ use crate::cli::output::{OutputOpts, print_table};
 use crate::error::{Error, Result};
 use crate::types::{CommentPermissionType, CreateNoteOptions, NotePermissionRole};
 
-const TEAM_NOTES_LIST_COLUMNS: &[&str] = &[
-    "id",
-    "title",
-    "userPath",
-    "teamPath",
-    "visibility",
-    "lastChangedAt",
-];
+const TEAM_NOTES_LIST_COLUMNS: &[&str] = &["id", "title", "owner", "visibility", "lastChangedAt"];
 const TEAM_NOTES_CREATE_COLUMNS: &[&str] = &["id", "title", "userPath", "teamPath"];
 
 pub async fn list(

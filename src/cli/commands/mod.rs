@@ -35,7 +35,11 @@ fn visibility(note: &Note) -> &'static str {
     }
 }
 
-/// Serialize notes for list output, adding the derived `visibility` column.
+/// Serialize notes for list output, adding derived columns:
+/// - `visibility` — see [`visibility`]
+/// - `owner` — the workspace path (`@<path>` URL segment). `userPath` and
+///   `teamPath` are mutually exclusive on the live API, so this is whichever
+///   one is set.
 pub(crate) fn note_rows(notes: &[Note]) -> Result<Vec<serde_json::Value>> {
     notes
         .iter()
@@ -43,6 +47,8 @@ pub(crate) fn note_rows(notes: &[Note]) -> Result<Vec<serde_json::Value>> {
             let mut v = serde_json::to_value(n).map_err(Error::Json)?;
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("visibility".into(), visibility(n).into());
+                let owner = n.user_path.as_deref().or(n.team_path.as_deref());
+                obj.insert("owner".into(), owner.into());
             }
             Ok(v)
         })
@@ -111,5 +117,16 @@ mod tests {
         let rows = note_rows(&[note(None, "guest", None)]).expect("rows");
         assert_eq!(rows[0]["visibility"], "anyone with link");
         assert_eq!(rows[0]["id"], "n1");
+    }
+
+    #[test]
+    fn note_rows_owner_prefers_user_path_then_team_path() {
+        let rows = note_rows(&[note(None, "owner", None)]).expect("rows");
+        assert_eq!(rows[0]["owner"], "zemse");
+
+        let mut team = note(None, "owner", Some("demo"));
+        team.user_path = None;
+        let rows = note_rows(&[team]).expect("rows");
+        assert_eq!(rows[0]["owner"], "demo");
     }
 }
