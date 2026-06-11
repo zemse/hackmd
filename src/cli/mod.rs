@@ -39,8 +39,13 @@ pub struct Cli {
     #[arg(long = "token", env = config::ENV_ACCESS_TOKEN, global = true, hide_env_values = true)]
     pub token: Option<String>,
 
+    /// File or directory to open in the TUI (e.g. `hackmd .`). With no
+    /// path and no subcommand, opens the TUI on the HackMD cloud notes.
+    #[arg(value_name = "PATH")]
+    pub path: Option<PathBuf>,
+
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 /// Top-level subcommands.
@@ -285,7 +290,13 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
     let endpoint = cli.endpoint.as_deref();
     let token = cli.token.as_deref();
 
-    match cli.command {
+    let Some(command) = cli.command else {
+        // Bare `hackmd` → TUI on cloud notes; `hackmd <path>` → TUI on the
+        // local file/dir.
+        return commands::tui::run(config_dir, endpoint, token, cli.path).await;
+    };
+
+    match command {
         Command::Login => commands::auth::login(config_dir, endpoint, token).await,
         Command::Logout => commands::auth::logout(config_dir),
         Command::Whoami(args) => {
@@ -370,6 +381,6 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Tui => commands::tui::run(config_dir, endpoint, token).await,
+        Command::Tui => commands::tui::run(config_dir, endpoint, token, cli.path).await,
     }
 }
