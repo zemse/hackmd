@@ -30,7 +30,7 @@ hackmd tui            # same as bare `hackmd`
 
 Logged in, bare `hackmd` opens straight onto your hackmd.io notes; the local file browser is one `H` (or `Esc`) away — and without a token it simply starts there. With a path argument it stays local: a directory opens the file browser, a markdown file opens the reader.
 
-Reader: vim-style scrolling (`j/k`, `d/u`, `gg/G`, counts), in-document search (`/`, `n/N`), fuzzy file search (`T`), Tab-cycle across links and checkboxes, click-to-follow links, click-to-toggle checkboxes, inline images (kitty/iTerm2/sixel terminals), tables with click-to-expand, JSON-line pretty-print, git lens (`Ctrl-G`, diff vs HEAD), read/unread badges in the browser.
+Reader: vim/less-style scrolling (`j/k`, `d/u`, `f/b`, `gg/G`, counts), heading jumps (`]]` / `[[`), table of contents (`t`), in-document search (`/`, `n/N`), fuzzy file search (`T`), history (`h/l`, `Ctrl-O`), Tab-cycle across links and checkboxes, click-to-follow links, click-to-toggle checkboxes, inline images (kitty/iTerm2/sixel terminals), tables with click-to-expand, JSON-line pretty-print, git lens (`Ctrl-G`, diff vs HEAD), read/unread badges in the browser.
 
 Editor (`e`): HackMD-style split view — raw markdown on one side, live preview on the other, scroll-synced both ways. `Ctrl-S` saves, `Ctrl-Z`/`Ctrl-Y` undo/redo, `Esc Esc` discards. Checkbox toggles persist straight to disk from read mode.
 

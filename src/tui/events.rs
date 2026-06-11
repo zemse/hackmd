@@ -109,6 +109,48 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             _ => {}
         }
     }
+    // TOC overlay: j/k move the selection, Enter jumps, Esc/q/t dismiss.
+    if app.toc.is_some() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('t') => {
+                app.toc = None;
+                return Ok(());
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                app.toc_move(1);
+                return Ok(());
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.toc_move(-1);
+                return Ok(());
+            }
+            KeyCode::PageDown => {
+                app.toc_move(10);
+                return Ok(());
+            }
+            KeyCode::PageUp => {
+                app.toc_move(-10);
+                return Ok(());
+            }
+            KeyCode::Enter => {
+                let line = match (&app.view, app.toc) {
+                    (View::Reader(r), Some(t)) => r
+                        .rendered
+                        .as_ref()
+                        .and_then(|rd| rd.headings.get(t.selected))
+                        .map(|h| h.line),
+                    _ => None,
+                };
+                app.toc = None;
+                if let Some(line) = line {
+                    scroll_to(app, line.min(u16::MAX as usize) as u16);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
     if app.search.is_some() {
         return handle_search_key(app, key);
     }
@@ -132,6 +174,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if let Some(t) = app.pending_z {
         if now.duration_since(t).as_millis() > CHORD_TIMEOUT_MS {
             app.pending_z = None;
+        }
+    }
+    if let Some((_, t)) = app.pending_bracket {
+        if now.duration_since(t).as_millis() > CHORD_TIMEOUT_MS {
+            app.pending_bracket = None;
         }
     }
 
@@ -161,6 +208,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             return Ok(());
         }
     }
+    // `]]` / `[[` — jump to the next / previous heading (vim section motion,
+    // count-aware: `3]]` skips three headings forward).
+    if let Some((bracket, _)) = app.pending_bracket {
+        app.pending_bracket = None;
+        if key.code == KeyCode::Char(bracket) {
+            let n = consume_count(&mut app.count_prefix);
+            app.jump_heading(if bracket == ']' { n } else { -n });
+            return Ok(());
+        }
+    }
 
     // Numeric prefix: digits are buffered into `count_prefix` until a motion
     // key consumes them. Plain `0` resets the count *only* if no count is
@@ -184,10 +241,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('q') => app.should_quit = true,
         KeyCode::Esc => {
             // Cancel any in-progress count or chord first.
-            if app.count_prefix.is_some() || app.pending_g.is_some() || app.pending_z.is_some() {
+            if app.count_prefix.is_some()
+                || app.pending_g.is_some()
+                || app.pending_z.is_some()
+                || app.pending_bracket.is_some()
+            {
                 app.count_prefix = None;
                 app.pending_g = None;
                 app.pending_z = None;
+                app.pending_bracket = None;
                 return Ok(());
             }
             // Dismiss any committed in-doc search overlay.
@@ -258,9 +320,21 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             scroll_by_page(app, -n, false);
         }
 
-        // History (plain `b`/`f`). These don't consume the count.
-        KeyCode::Char('b') | KeyCode::Backspace => app.go_back()?,
-        KeyCode::Char('f') => app.go_forward()?,
+        // History back, vim-jumplist style. (Ctrl-I, vim's forward, is
+        // indistinguishable from Tab in most terminals, so forward stays
+        // on `l` only.)
+        KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => app.go_back()?,
+        KeyCode::Backspace => app.go_back()?,
+
+        // Plain `f`/`b` page like less/more (mirrors Ctrl-F/Ctrl-B).
+        KeyCode::Char('f') => {
+            let n = consume_count(&mut app.count_prefix);
+            scroll_by_page(app, n, false);
+        }
+        KeyCode::Char('b') => {
+            let n = consume_count(&mut app.count_prefix);
+            scroll_by_page(app, -n, false);
+        }
 
         KeyCode::Char('j') | KeyCode::Down => {
             let n = consume_count(&mut app.count_prefix);
@@ -308,6 +382,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('z') => {
             app.pending_z = Some(std::time::Instant::now());
         }
+
+        // `]` / `[` arm the `]]` / `[[` heading-jump chords. The count is
+        // preserved for the chord completion to consume.
+        KeyCode::Char(c @ (']' | '[')) => {
+            app.pending_bracket = Some((c, std::time::Instant::now()));
+        }
+
+        // Table of contents (Reader only; no-op elsewhere).
+        KeyCode::Char('t') => app.open_toc(),
 
         // `H` in browser views toggles local ↔ HackMD; in the Reader it keeps
         // its vim viewport-relative meaning (use `gh` there instead).
@@ -752,6 +835,15 @@ fn open_search_result(app: &mut App, r: SearchResult) -> Result<()> {
 fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
     // A modal prompt owns the screen; ignore the mouse until it resolves.
     if app.prompt.is_some() {
+        return Ok(());
+    }
+    // TOC overlay: the wheel moves the selection; everything else is inert.
+    if app.toc.is_some() {
+        match m.kind {
+            MouseEventKind::ScrollUp => app.toc_move(-1),
+            MouseEventKind::ScrollDown => app.toc_move(1),
+            _ => {}
+        }
         return Ok(());
     }
     // Anything other than scroll/move counts as deliberate mouse interaction
@@ -1443,6 +1535,153 @@ fn word_at_col(line: &str, target_col: usize) -> Option<String> {
 
 fn point_in(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
+}
+
+#[cfg(test)]
+mod keybind_tests {
+    use super::handle_key;
+    use crate::tui::app::{App, Options, Source, View};
+    use crate::tui::theme::Theme;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    /// A document with three headings separated by enough filler that every
+    /// heading lands on a distinct scroll position in a 10-row viewport.
+    fn app_with_headings(tag: &str) -> App {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "md-tui-events-test-{}-{}.md",
+            tag,
+            std::process::id()
+        ));
+        let mut src = String::from("# One\n\n");
+        for i in 0..30 {
+            src.push_str(&format!("filler {i}\n\n"));
+        }
+        src.push_str("## Two\n\n");
+        for i in 0..30 {
+            src.push_str(&format!("more {i}\n\n"));
+        }
+        src.push_str("## Three\n\n");
+        for i in 0..30 {
+            src.push_str(&format!("tail {i}\n\n"));
+        }
+        std::fs::write(&p, src).unwrap();
+        let opts = Options {
+            width: 80,
+            line_numbers: false,
+            theme: Theme::dark(),
+        };
+        let mut app = App::new(Source::File(p), opts).unwrap();
+        app.ensure_rendered(80);
+        app.viewport = ratatui::layout::Rect::new(0, 0, 80, 10);
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_key(app, KeyEvent::new(code, KeyModifiers::NONE)).unwrap();
+    }
+
+    fn reader_scroll(app: &App) -> u16 {
+        match &app.view {
+            View::Reader(r) => r.scroll,
+            _ => panic!("expected reader"),
+        }
+    }
+
+    fn heading_lines(app: &App) -> Vec<usize> {
+        match &app.view {
+            View::Reader(r) => r
+                .rendered
+                .as_ref()
+                .unwrap()
+                .headings
+                .iter()
+                .map(|h| h.line)
+                .collect(),
+            _ => panic!("expected reader"),
+        }
+    }
+
+    #[test]
+    fn bracket_chords_jump_between_headings() {
+        let mut app = app_with_headings("brackets");
+        let lines = heading_lines(&app);
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0] > 0, "first heading sits below the very top");
+        // From the top, each `]]` lands on the next heading down.
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(reader_scroll(&app), lines[0] as u16);
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(reader_scroll(&app), lines[1] as u16);
+        // `[[` goes back to the previous heading.
+        press(&mut app, KeyCode::Char('['));
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(reader_scroll(&app), lines[0] as u16);
+    }
+
+    #[test]
+    fn bracket_chord_honors_count_prefix() {
+        let mut app = app_with_headings("count");
+        let lines = heading_lines(&app);
+        // `2]]` skips to the second heading strictly below the top.
+        press(&mut app, KeyCode::Char('2'));
+        press(&mut app, KeyCode::Char(']'));
+        press(&mut app, KeyCode::Char(']'));
+        let after: Vec<usize> = lines.iter().copied().filter(|&l| l > 0).collect();
+        assert_eq!(reader_scroll(&app), after[1] as u16);
+    }
+
+    #[test]
+    fn toc_opens_moves_and_jumps() {
+        let mut app = app_with_headings("toc");
+        let lines = heading_lines(&app);
+        press(&mut app, KeyCode::Char('t'));
+        let toc = app.toc.expect("t should open the TOC");
+        assert_eq!(toc.selected, 0, "viewport at top selects the first heading");
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.toc.unwrap().selected, 2);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.toc.is_none(), "Enter closes the TOC");
+        assert_eq!(reader_scroll(&app), lines[2] as u16);
+    }
+
+    #[test]
+    fn toc_dismisses_on_esc_without_jumping() {
+        let mut app = app_with_headings("toc-esc");
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Esc);
+        assert!(app.toc.is_none());
+        assert_eq!(reader_scroll(&app), 0, "Esc must not move the viewport");
+    }
+
+    #[test]
+    fn plain_f_and_b_page_instead_of_history() {
+        let mut app = app_with_headings("page");
+        press(&mut app, KeyCode::Char('f'));
+        // Full page = viewport height - 1 = 9 rows.
+        assert_eq!(reader_scroll(&app), 9);
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(reader_scroll(&app), 0);
+        assert!(
+            app.history.is_empty() && app.forward.is_empty(),
+            "f/b must not touch history"
+        );
+    }
+
+    #[test]
+    fn ctrl_o_walks_history_back() {
+        let mut app = app_with_headings("ctrl-o");
+        press(&mut app, KeyCode::Char('f'));
+        let key = KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL);
+        handle_key(&mut app, key).unwrap();
+        // With no history the call is a no-op — but it must not be treated
+        // as plain `o` (open focused link) or crash.
+        assert!(!app.should_quit);
+    }
 }
 
 /// Mouse-wheel scroll with rate-aware dampening: deliberate single ticks

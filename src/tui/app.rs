@@ -65,6 +65,11 @@ pub struct App {
     pub pending_g: Option<std::time::Instant>,
     /// `Some(instant)` waiting for the second key of a `zz` chord.
     pub pending_z: Option<std::time::Instant>,
+    /// `Some((bracket, instant))` waiting for the second key of a `]]` or
+    /// `[[` heading-jump chord. `bracket` is `']'` or `'['`.
+    pub pending_bracket: Option<(char, std::time::Instant)>,
+    /// Table-of-contents overlay (`t` in the Reader). `Some` while open.
+    pub toc: Option<TocState>,
     /// True when the most recent input was a mouse event. While set we hide
     /// the keyboard focus highlight so the user isn't tracking two cursors.
     pub mouse_recent: bool,
@@ -324,6 +329,15 @@ pub struct DiffRow {
     pub text: String,
 }
 
+/// Table-of-contents overlay (`t` in the Reader): a jump list over
+/// `Rendered::headings`. Selection moves with j/k; Enter scrolls the
+/// reader to the selected heading.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TocState {
+    /// Index into `Rendered::headings`.
+    pub selected: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiffRowKind {
     /// Context line (unchanged) — rendered plain.
@@ -579,6 +593,8 @@ impl App {
             count_prefix: None,
             pending_g: None,
             pending_z: None,
+            pending_bracket: None,
+            toc: None,
             mouse_recent: false,
             last_mouse_col: 0,
             last_mouse_row: 0,
@@ -1618,6 +1634,86 @@ impl App {
                 self.status = format!("git diff: {}", e);
             }
         }
+    }
+
+    /// Open the table-of-contents overlay (`t` in the Reader). Pre-selects
+    /// the heading the viewport currently sits in so Enter is a no-op-ish
+    /// "stay here" and j/k move relative to the reading position.
+    pub fn open_toc(&mut self) {
+        let View::Reader(r) = &self.view else {
+            return;
+        };
+        if r.edit.is_some() {
+            return;
+        }
+        let Some(rendered) = r.rendered.as_ref() else {
+            return;
+        };
+        if rendered.headings.is_empty() {
+            self.status = "No headings in this document".into();
+            return;
+        }
+        let cur = r.scroll as usize;
+        // Last heading at or above the current scroll position; the first
+        // heading when the viewport is above all of them.
+        let selected = rendered
+            .headings
+            .iter()
+            .rposition(|h| h.line <= cur)
+            .unwrap_or(0);
+        self.toc = Some(TocState { selected });
+    }
+
+    /// Move the TOC selection by `delta` (clamped to the heading list).
+    pub fn toc_move(&mut self, delta: i32) {
+        let total = match &self.view {
+            View::Reader(r) => r.rendered.as_ref().map(|rd| rd.headings.len()).unwrap_or(0),
+            _ => 0,
+        };
+        if total == 0 {
+            return;
+        }
+        if let Some(t) = self.toc.as_mut() {
+            t.selected = (t.selected as i32 + delta).clamp(0, total as i32 - 1) as usize;
+        }
+    }
+
+    /// Jump `n` headings forward (positive) or back (negative) from the
+    /// current scroll position — the `]]` / `[[` motions. Clamps at the
+    /// first/last heading; no-op when the document has none.
+    pub fn jump_heading(&mut self, n: i32) {
+        let h = self.viewport.height as usize;
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        let Some(rendered) = r.rendered.as_ref() else {
+            return;
+        };
+        if rendered.headings.is_empty() || n == 0 {
+            return;
+        }
+        let cur = r.scroll as usize;
+        let lines: Vec<usize> = rendered.headings.iter().map(|x| x.line).collect();
+        let target = if n > 0 {
+            let after: Vec<usize> = lines.iter().copied().filter(|&l| l > cur).collect();
+            match after.get(n as usize - 1) {
+                Some(&l) => l,
+                None => match after.last() {
+                    Some(&l) => l,
+                    None => return,
+                },
+            }
+        } else {
+            let before: Vec<usize> = lines.iter().copied().filter(|&l| l < cur).collect();
+            let k = (-n) as usize;
+            if before.is_empty() {
+                return;
+            }
+            before[before.len().saturating_sub(k)]
+        };
+        let total = rendered.lines.len();
+        let max_scroll = total.saturating_sub(h);
+        r.scroll = target.min(max_scroll) as u16;
     }
 
     /// Scroll the git lens overlay by `delta` rows (clamped). No-op if the

@@ -30,6 +30,9 @@ pub struct Rendered {
     /// One entry per block in document order. Lets edit mode locate the
     /// block containing a given source byte offset.
     pub blocks: Vec<BlockInfo>,
+    /// Document outline: every heading in order, with its display line.
+    /// Drives the TOC popup (`t`) and `]]` / `[[` heading jumps.
+    pub headings: Vec<HeadingInfo>,
     /// Cursor display position when rendered in edit mode. `None` outside
     /// edit mode.
     pub cursor_xy: Option<(u16, u16)>,
@@ -45,6 +48,17 @@ pub struct Rendered {
 /// `display_end` are line indices into `Rendered::lines` (half-open). Edit
 /// mode uses these to map (cursor_offset → block) and to scroll a freshly
 /// raw-substituted block back into view.
+/// One heading in the document outline.
+#[derive(Clone, Debug)]
+pub struct HeadingInfo {
+    /// 1–6 (`#` … `######`).
+    pub level: u8,
+    /// Plain heading text with inline markup stripped.
+    pub text: String,
+    /// Display line index into `Rendered::lines`.
+    pub line: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct BlockInfo {
     pub source_range: std::ops::Range<usize>,
@@ -142,8 +156,15 @@ enum Block {
         prefix: Vec<Run>,
         hanging: Vec<Run>,
     },
-    /// Heading — word-wrapped, anchor recorded.
-    Heading { runs: Vec<Run>, anchor: String },
+    /// Heading — word-wrapped, anchor recorded. `level` is 1–6 and `text`
+    /// the plain (markup-stripped) heading text; both feed the document
+    /// outline (`Rendered::headings`).
+    Heading {
+        runs: Vec<Run>,
+        anchor: String,
+        level: u8,
+        text: String,
+    },
     /// Pre-formatted block — rendered line-by-line, not wrapped. `flat` is
     /// true for the synthetic raw block produced by edit-mode substitution:
     /// it skips the 2-col left pad and code background so the on-screen
@@ -636,13 +657,22 @@ impl Builder {
                 self.finish_paragraph(range);
                 self.push_blank();
             }
-            TagEnd::Heading(_) => {
+            TagEnd::Heading(level) => {
                 self.in_heading = None;
                 let anchor = links::slugify(&self.heading_buf);
+                let text = self.heading_buf.trim().to_string();
                 self.style_stack.pop();
                 let runs = std::mem::take(&mut self.cur_runs);
                 self.push_blank();
-                self.push_block(Block::Heading { runs, anchor }, range);
+                self.push_block(
+                    Block::Heading {
+                        runs,
+                        anchor,
+                        level: heading_idx(level) as u8 + 1,
+                        text,
+                    },
+                    range,
+                );
                 self.push_blank();
                 self.cur_prefix.clear();
                 self.cur_hanging.clear();
@@ -1037,6 +1067,7 @@ fn layout(
     let mut image_lines: Vec<Option<usize>> = (0..images.len()).map(|_| None).collect();
     let mut anchors = std::collections::HashMap::new();
     let mut block_infos: Vec<BlockInfo> = Vec::new();
+    let mut headings: Vec<HeadingInfo> = Vec::new();
     let mut cursor_xy: Option<(u16, u16)> = None;
 
     // For each link index, track the open span being built across runs.
@@ -1064,9 +1095,19 @@ fn layout(
                     Style::default().fg(theme.rule),
                 )));
             }
-            Block::Heading { runs, anchor, .. } => {
+            Block::Heading {
+                runs,
+                anchor,
+                level,
+                text,
+            } => {
                 let start_line = out_lines.len();
                 anchors.insert(anchor, start_line);
+                headings.push(HeadingInfo {
+                    level,
+                    text,
+                    line: start_line,
+                });
                 let prefix = Vec::new();
                 wrap_runs(
                     &runs,
@@ -1228,6 +1269,7 @@ fn layout(
         images: images_out,
         width: width as u16,
         blocks: block_infos,
+        headings,
         cursor_xy,
         row_source,
     }
@@ -2210,6 +2252,21 @@ mod tests {
         let src = "# Hello World\n\nbody";
         let r = render(src, None, 80, &Theme::dark());
         assert_eq!(r.link_map.anchors.get("hello-world"), Some(&1));
+    }
+
+    #[test]
+    fn records_document_outline() {
+        let src = "# Top\n\nbody\n\n## Sub\n\nmore\n\n### Deep *em*\n";
+        let r = render(src, None, 80, &Theme::dark());
+        let got: Vec<(u8, &str)> = r
+            .headings
+            .iter()
+            .map(|h| (h.level, h.text.as_str()))
+            .collect();
+        assert_eq!(got, vec![(1, "Top"), (2, "Sub"), (3, "Deep em")]);
+        // Display lines are strictly increasing and agree with the anchors.
+        assert!(r.headings.windows(2).all(|w| w[0].line < w[1].line));
+        assert_eq!(r.link_map.anchors.get("top"), Some(&r.headings[0].line));
     }
 
     #[test]

@@ -123,9 +123,69 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_prompt(f, app, area);
     }
 
+    if app.toc.is_some() {
+        draw_toc(f, app, area);
+    }
+
     if app.help_open {
         draw_help(f, app, area);
     }
+}
+
+/// Centered table-of-contents popup (`t` in the Reader). One row per
+/// heading, indented by level; the selection is windowed into view.
+fn draw_toc(f: &mut Frame, app: &App, area: Rect) {
+    let Some(toc) = &app.toc else {
+        return;
+    };
+    let View::Reader(r) = &app.view else {
+        return;
+    };
+    let Some(rendered) = r.rendered.as_ref() else {
+        return;
+    };
+    let headings = &rendered.headings;
+    if headings.is_empty() {
+        return;
+    }
+    let theme = &app.opts.theme;
+    let w = 60.min(area.width.saturating_sub(4)).max(20);
+    let h = (headings.len() as u16 + 2)
+        .min(area.height.saturating_sub(4))
+        .max(3);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    // Window the list around the selection so it stays visible.
+    let visible = h.saturating_sub(2) as usize;
+    let start = toc
+        .selected
+        .saturating_sub(visible.saturating_sub(1) / 2)
+        .min(headings.len().saturating_sub(visible.max(1)));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, hd) in headings.iter().enumerate().skip(start).take(visible.max(1)) {
+        let indent = "  ".repeat(hd.level.saturating_sub(1) as usize);
+        let text = format!(" {}{}", indent, hd.text);
+        let style = if i == toc.selected {
+            Style::default()
+                .fg(theme.heading[0])
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(text, style)));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Contents ")
+        .border_style(Style::default().fg(theme.heading[0]));
+    f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
 /// Centered one-line modal prompt (new note title, push title, download
@@ -1345,6 +1405,9 @@ fn compute_middle(app: &App) -> Mid {
     if app.git_lens.is_some() {
         return Mid::Hint("git lens (vs HEAD)  j/k scroll  Ctrl-G or Esc to dismiss".into());
     }
+    if app.toc.is_some() {
+        return Mid::Hint("contents  j/k move  Enter jump  Esc close".into());
+    }
     if let View::Reader(r) = &app.view {
         // Edit-mode hint replaces the normal viewer hint when active.
         if r.edit.is_some() {
@@ -1388,7 +1451,13 @@ fn compute_middle(app: &App) -> Mid {
 
 fn default_hint(app: &App) -> String {
     match &app.view {
-        View::Reader(_) => "j/k  d/u  /search  Tab:link  o:open  e:edit  ?:help  q:quit".into(),
+        // Most important keys first; the full reference lives behind `?`.
+        View::Reader(r) => match &r.origin {
+            ReaderOrigin::CloudNote { .. } => {
+                "j/k:scroll  /:find  t:toc  e:edit  y:link  ?:help  q:quit".into()
+            }
+            _ => "j/k:scroll  /:find  t:toc  e:edit  Tab:links  ?:help  q:quit".into(),
+        },
         View::Browser(_) => "j/k  Enter:open  /search  T:fuzzy  H:hackmd  ?:help  q:quit".into(),
         View::Cloud(c) => {
             if c.show_tab_bar() {
@@ -1484,53 +1553,60 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         height: h,
     };
     f.render_widget(Clear, popup);
+    let theme = &app.opts.theme;
+    let section = |t: &str| {
+        Line::from(Span::styled(
+            t.to_string(),
+            Style::default()
+                .fg(theme.heading[1])
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
     let body = vec![
-        Line::from("md keybindings"),
+        section(" Reading"),
+        Line::from("  j / k / ↓ ↑      scroll line          d / u   half page"),
+        Line::from("  f / b / Space    page  (also Ctrl-F/B, Ctrl-D/U, PgDn/PgUp)"),
+        Line::from("  gg / G           top / bottom         NG      go to line N"),
+        Line::from("  ]] / [[          next / previous heading"),
+        Line::from("  t                table of contents (Enter jumps)"),
+        Line::from("  zz               center focus   H/M/L  focus top/mid/bot"),
+        Line::from("  5j 10G 3]]       counts work on any motion"),
         Line::from(""),
-        Line::from("  j / k / ↓ ↑      scroll one line"),
-        Line::from("  d / u            half page down / up"),
-        Line::from("  Ctrl-d / Ctrl-u  half page (vim)"),
-        Line::from("  Ctrl-f / Ctrl-b  full page (vim)"),
-        Line::from("  PgDn / Space     page down"),
-        Line::from("  gg               top of buffer"),
-        Line::from("  G                bottom of buffer (NG → line N)"),
-        Line::from("  H / M / L        focus visible top / middle / bottom"),
-        Line::from("  zz               center current focus"),
-        Line::from("  <count><motion>  e.g. 5j, 10G, 3Ctrl-d"),
+        section(" Find"),
+        Line::from("  /                search in doc (Reader) / files (Browser)"),
+        Line::from("  n / N            next / prev match    T  fuzzy file search"),
         Line::from(""),
+        section(" Links & checkboxes"),
         Line::from("  Tab / S-Tab      cycle focus across links + checkboxes"),
         Line::from("  Enter / →        follow link or toggle checkbox"),
-        Line::from("  Esc / ←          back  (Esc at root quits)"),
-        Line::from("  /                in-doc text search (Reader) / file search (Browser)"),
-        Line::from("  n / N            next / prev match"),
-        Line::from("  T                fuzzy file search"),
-        Line::from("  h / b            history back"),
-        Line::from("  l / f            history forward"),
-        Line::from("  e                edit mode (split: raw + preview, scroll-synced)"),
-        Line::from("                   Ctrl-S save  Ctrl-Z undo  Esc Esc discard"),
-        Line::from("                   Alt-←/→ word jump  Alt-Bksp/Del word delete"),
-        Line::from("  Ctrl-G            git lens (diff vs HEAD; staged + unstaged)"),
-        Line::from("  o                open focused link in browser"),
-        Line::from("  m                toggle mouse capture (drag-to-select)"),
-        Line::from("  q / Ctrl-C       quit"),
-        Line::from("  ?                toggle this help"),
+        Line::from("  o                open focused link in system browser"),
         Line::from(""),
-        Line::from(if app.cloud.is_connected() {
-            "  HackMD cloud"
+        section(" History"),
+        Line::from("  h / l            back / forward       Ctrl-O  back (vim)"),
+        Line::from("  Backspace / Esc  back  (Esc at root quits)"),
+        Line::from(""),
+        section(" Edit  (e — split raw + preview, scroll-synced)"),
+        Line::from("  Ctrl-S           save  (Ctrl-W fallback for XOFF terminals)"),
+        Line::from("  Ctrl-Z / Ctrl-Y  undo / redo          Esc Esc  discard"),
+        Line::from("  Alt-←/→          word jump    Alt-Bksp/Del  word delete"),
+        Line::from(""),
+        section(" Local files"),
+        Line::from("  U                push file up as a new HackMD note"),
+        Line::from("  Ctrl-G           git lens (diff vs HEAD; staged + unstaged)"),
+        Line::from("  r                mark read (browser; dirs recurse)"),
+        Line::from(""),
+        section(if app.cloud.is_connected() {
+            " HackMD cloud"
         } else {
-            "  HackMD cloud  (not logged in — run `hackmd login`)"
+            " HackMD cloud  (not logged in — run `hackmd login`)"
         }),
-        Line::from("  H (browsers) / gh  toggle local ↔ hackmd.io"),
-        Line::from("  Enter            open note      R  refresh lists"),
-        Line::from("  Tab / S-Tab      switch workspace tab (you / teams)"),
-        Line::from("  e  + Ctrl-S      edit note, save back to the cloud"),
-        Line::from("  n                new note       D  delete (confirms)"),
-        Line::from("  P                publish/unpublish (readPermission)"),
+        Line::from("  H (browsers) / gh   toggle local ↔ hackmd.io"),
+        Line::from("  Enter  open      R  refresh       Tab  workspace tab"),
+        Line::from("  n  new note      D  delete        P  publish/unpublish"),
         Line::from("  y / o            copy / open the publish link"),
         Line::from("  S                download note to a local file"),
-        Line::from("  U                push local file up as a new note"),
         Line::from(""),
-        Line::from("  Mouse hides the keyboard focus halo. Any key restores it."),
+        Line::from("  m  toggle mouse capture    q / Ctrl-C  quit    ?  help"),
     ];
     let block = Block::default().borders(Borders::ALL).title(" Help ");
     let para = Paragraph::new(body).block(block);
