@@ -808,38 +808,60 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     let badge_style = Style::default()
         .fg(theme.heading[3])
         .add_modifier(Modifier::BOLD);
+    // Selection is styled by hand (no `ListState` selection): the wheel
+    // scrolls the viewport independently of the cursor, and ratatui's List
+    // would otherwise snap the offset back to keep the selection visible.
+    let hl = Style::default()
+        .bg(theme.status_bg)
+        .fg(theme.status_fg)
+        .add_modifier(Modifier::BOLD);
     let items: Vec<ListItem> = b
         .entries
         .iter()
-        .map(|e| {
-            let name = Span::styled(e.display.clone(), browser_entry_style(e.kind, theme));
+        .enumerate()
+        .map(|(i, e)| {
+            let selected = i == b.selected;
+            let prefix = if selected { "▶ " } else { "  " };
+            let mut spans = vec![
+                Span::raw(prefix),
+                Span::styled(e.display.clone(), browser_entry_style(e.kind, theme)),
+            ];
             let unread = match e.kind {
                 BrowserEntryKind::Markdown => app.read_state.is_unread(&e.path),
                 BrowserEntryKind::Dir => app.read_state.dir_has_unread(&e.path),
                 BrowserEntryKind::ParentDir => false,
             };
             if unread {
-                ListItem::new(Line::from(vec![
-                    name,
-                    Span::styled(" [unread]", badge_style),
-                ]))
-            } else {
-                ListItem::new(name)
+                spans.push(Span::styled(" [unread]", badge_style));
             }
+            let item = ListItem::new(Line::from(spans));
+            if selected { item.style(hl) } else { item }
         })
         .collect();
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(theme.status_bg)
-                .fg(theme.status_fg)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
-    let mut state = ListState::default()
-        .with_offset(b.scroll as usize)
-        .with_selected(Some(b.selected));
-    f.render_stateful_widget(list, inner, &mut state);
+    let mut state = ListState::default().with_offset(b.scroll as usize);
+    f.render_stateful_widget(List::new(items), inner, &mut state);
+    if b.entries.len() > inner.height as usize {
+        draw_scrollbar(
+            f,
+            scrollbar_track(area, inner),
+            b.scroll as usize,
+            b.entries.len(),
+            inner.height as usize,
+            theme,
+        );
+    }
+}
+
+/// The right-border column of a bordered block, aligned with the list
+/// rows (`inner` — already past the tab bar, if any) — where the list
+/// scrollbar lives.
+fn scrollbar_track(area: Rect, inner: Rect) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(1),
+        y: inner.y,
+        width: 1.min(area.width),
+        height: inner.height,
+    }
 }
 
 /// Render the HackMD note browser: one tab per workspace ("My notes" +
@@ -909,10 +931,18 @@ fn draw_cloud_browser(f: &mut Frame, app: &mut App, area: Rect) {
     let Some(tab) = c.tab() else {
         return;
     };
+    // Selection styled by hand for the same reason as the file browser:
+    // wheel scrolling moves the viewport without dragging the cursor along.
+    let hl = Style::default()
+        .bg(theme.status_bg)
+        .fg(theme.status_fg)
+        .add_modifier(Modifier::BOLD);
     let items: Vec<ListItem> = tab
         .notes
         .iter()
-        .map(|n| {
+        .enumerate()
+        .map(|(i, n)| {
+            let selected = i == tab.selected;
             // Loudest exposure gets the loudest style: published is
             // bold, link-shared uses the link color, private is muted.
             let badge_style = match n.visibility {
@@ -922,25 +952,26 @@ fn draw_cloud_browser(f: &mut Frame, app: &mut App, area: Rect) {
                 "only me" | "only team" => Style::default().fg(theme.muted),
                 _ => Style::default().fg(theme.link),
             };
-            ListItem::new(Line::from(vec![
-                Span::raw("  "),
+            let item = ListItem::new(Line::from(vec![
+                Span::raw(if selected { "▶ " } else { "  " }),
                 Span::raw(n.title.clone()),
                 Span::styled(format!(" [{}]", n.visibility), badge_style),
-            ]))
+            ]));
+            if selected { item.style(hl) } else { item }
         })
         .collect();
-    let list = List::new(items)
-        .highlight_style(
-            Style::default()
-                .bg(theme.status_bg)
-                .fg(theme.status_fg)
-                .add_modifier(Modifier::BOLD),
-        )
-        .highlight_symbol("▶ ");
-    let mut state = ListState::default()
-        .with_offset(tab.scroll as usize)
-        .with_selected(Some(tab.selected));
-    f.render_stateful_widget(list, inner, &mut state);
+    let mut state = ListState::default().with_offset(tab.scroll as usize);
+    f.render_stateful_widget(List::new(items), inner, &mut state);
+    if tab.notes.len() > inner.height as usize {
+        draw_scrollbar(
+            f,
+            scrollbar_track(area, inner),
+            tab.scroll as usize,
+            tab.notes.len(),
+            inner.height as usize,
+            theme,
+        );
+    }
     app.cloud_tab_hits = tab_hits;
 }
 

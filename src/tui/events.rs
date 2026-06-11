@@ -1459,7 +1459,29 @@ fn wheel_scroll(app: &mut App, raw_delta: i32) {
         now,
     );
     if dampened != 0 {
-        scroll_by(app, dampened);
+        scroll_viewport(app, dampened);
+    }
+}
+
+/// Mouse-wheel scrolling moves the viewport like a page — in list views it
+/// shifts the visible window without touching the selection (keyboard j/k
+/// still steps the cursor). Mirrors how the reader scrolls.
+fn scroll_viewport(app: &mut App, delta: i32) {
+    match &mut app.view {
+        View::Reader(_) => scroll_by(app, delta),
+        View::Browser(b) => {
+            let h = app.viewport.height.saturating_sub(2) as i32;
+            let max = (b.entries.len() as i32 - h.max(1)).max(0);
+            b.scroll = (b.scroll as i32 + delta).clamp(0, max) as u16;
+        }
+        View::Cloud(c) => {
+            let chrome = 2 + c.show_tab_bar() as u16;
+            let h = app.viewport.height.saturating_sub(chrome) as i32;
+            if let Some(t) = c.tab_mut() {
+                let max = (t.notes.len() as i32 - h.max(1)).max(0);
+                t.scroll = (t.scroll as i32 + delta).clamp(0, max) as u16;
+            }
+        }
     }
 }
 
