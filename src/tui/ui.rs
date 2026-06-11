@@ -14,9 +14,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::tui::app::{
-    self, App, BrowserEntryKind, DiffRowKind, EditMode, Focus, ReaderOrigin, View,
-};
+use crate::tui::app::{self, App, BrowserEntryKind, DiffRowKind, Focus, ReaderOrigin, View};
 use crate::tui::links::LinkTarget;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -70,7 +68,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // re-target the wrap width to whichever pane will actually display the
     // rendered lines — otherwise the preview overflows on the right.
     let render_width = match &app.view {
-        View::Reader(r) if matches!(r.edit.as_ref().map(|e| e.mode), Some(EditMode::Split)) => {
+        View::Reader(r) if r.in_split_edit() => {
             if body.width >= 100 {
                 // Horizontal split: preview is the right half minus separator.
                 body.width.saturating_sub(body.width / 2 + 1)
@@ -88,12 +86,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         match &app.view {
             View::Reader(r) => {
-                let split_edit = r
-                    .edit
-                    .as_ref()
-                    .map(|e| e.mode == EditMode::Split)
-                    .unwrap_or(false);
-                if split_edit {
+                if r.in_split_edit() {
                     draw_edit_split(f, app, body);
                 } else {
                     draw_reader(f, app, body);
@@ -106,7 +99,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             // Image rendering is read-only; in split-edit mode we still
             // show images in the preview pane area but the layout below
             // wires its own rect, so the global overlay is suppressed.
-            let in_split = matches!(&app.view, View::Reader(r) if r.edit.as_ref().map(|e| e.mode == EditMode::Split).unwrap_or(false));
+            let in_split = matches!(&app.view, View::Reader(r) if r.in_split_edit());
             if !in_split {
                 draw_images_overlay(f, app, body);
             }
@@ -1169,6 +1162,17 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
     }
     let theme = &app.opts.theme;
 
+    // Vim-style command line: after the first Esc in edit mode the whole
+    // statusline becomes the command place — typed text after a ':', the
+    // best completion continuing in grey, and the non-vim escape hatches
+    // spelled out for users who don't know :wq.
+    if let View::Reader(r) = &app.view {
+        if let Some(input) = r.edit.as_ref().and_then(|e| e.command.as_deref()) {
+            draw_edit_command_line(f, theme, area, input);
+            return;
+        }
+    }
+
     let bg = Style::default().bg(theme.status_bg).fg(theme.status_fg);
     let path_style = Style::default().add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(theme.muted);
@@ -1367,6 +1371,45 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
+/// The editor command line, drawn over the whole statusline row. Layout:
+/// ` :typed▏completion-ghost   hints…` with the right edge carrying the
+/// run/complete keys while the user is typing.
+fn draw_edit_command_line(
+    f: &mut Frame,
+    theme: &crate::tui::theme::Theme,
+    area: Rect,
+    input: &str,
+) {
+    use unicode_width::UnicodeWidthStr;
+    let bg = Style::default().bg(theme.status_bg).fg(theme.status_fg);
+    let bold = bg.add_modifier(Modifier::BOLD);
+    let grey = Style::default().bg(theme.status_bg).fg(theme.muted);
+
+    let mut spans: Vec<Span<'static>> = vec![
+        Span::styled(" :", bold),
+        Span::styled(input.to_string(), bold),
+        // The "cursor" — the command place owns the input now.
+        Span::styled("▏", bg),
+    ];
+    if let Some(full) = crate::tui::events::complete_edit_command(input) {
+        spans.push(Span::styled(full[input.len()..].to_string(), grey));
+        spans.push(Span::styled("  (Tab to complete)", grey));
+    }
+    let right = if input.is_empty() {
+        "type a vim command — :wq save+quit · :q discard · :preview · Esc again discards "
+    } else {
+        "Enter:run  Esc:discard+exit "
+    };
+    let right_w = UnicodeWidthStr::width(right);
+    let used = span_width(&spans);
+    let pad = (area.width as usize)
+        .saturating_sub(used)
+        .saturating_sub(right_w);
+    spans.push(Span::styled(" ".repeat(pad), bg));
+    spans.push(Span::styled(right.to_string(), grey));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 #[derive(Clone, Debug)]
 enum Mid {
     Hint(String),
@@ -1410,13 +1453,13 @@ impl Mid {
 }
 
 fn compute_middle(app: &App) -> Mid {
-    // Edit mode confirm-discard prompt overrides everything (including the
-    // status line — we want the user to act on the prompt before being
-    // distracted by anything else).
+    // `:preview` overlay: a dedicated hint so the user knows the buffer is
+    // unsaved and how to get back. (The command line itself never reaches
+    // this function — draw_statusline renders it as a full row.)
     if let View::Reader(r) = &app.view {
         if let Some(e) = r.edit.as_ref() {
-            if e.discard_pending {
-                return Mid::Status("Press Esc again to discard, any other key to cancel".into());
+            if e.preview_full {
+                return Mid::Hint("preview of unsaved edit  j/k scroll  Esc back to editor".into());
             }
         }
     }
@@ -1460,7 +1503,7 @@ fn compute_middle(app: &App) -> Mid {
         // Edit-mode hint replaces the normal viewer hint when active.
         if r.edit.is_some() {
             return Mid::Hint(
-                "type to edit  Ctrl-S save  Alt-←/→ word  Ctrl-Z undo  Esc Esc discard".into(),
+                "type to edit  Ctrl-S save  Alt-←/→ word  Ctrl-Z undo  Esc command".into(),
             );
         }
         if let Some(s) = r.doc_search.as_ref() {
@@ -1638,10 +1681,11 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from("  h / l            back / forward       Ctrl-O  back (vim)"),
         Line::from("  Backspace / Esc  back  (Esc at root quits)"),
         Line::from(""),
-        section(" Edit  (e — split raw + preview, scroll-synced)"),
+        section(" Edit  (e or i — split raw + preview, scroll-synced)"),
         Line::from("  Ctrl-S           save  (Ctrl-W fallback for XOFF terminals)"),
         Line::from("  Ctrl-Z / Ctrl-Y  undo / redo          Esc Esc  discard"),
         Line::from("  Alt-←/→          word jump    Alt-Bksp/Del  word delete"),
+        Line::from("  Esc              command line — :w :wq :q :preview (Tab completes)"),
         Line::from(""),
         section(" Local files"),
         Line::from("  U                push file up as a new HackMD note"),

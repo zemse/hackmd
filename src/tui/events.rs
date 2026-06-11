@@ -285,7 +285,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         },
         KeyCode::Char('N') => app.doc_search_step(false),
         KeyCode::Char('m') => toggle_mouse(app),
-        KeyCode::Char('e') => app.enter_edit(),
+        // `e` and vim's `i` both open the editor (which starts in insert
+        // mode, so `i` lands exactly where a vim user expects).
+        KeyCode::Char('e') | KeyCode::Char('i') => app.enter_edit(),
 
         // HackMD note actions — active wherever a cloud note is targeted
         // (cloud browser row or open cloud reader); no-ops elsewhere.
@@ -506,10 +508,12 @@ fn center_focus_or_top(app: &mut App) {
 }
 
 /// Edit-mode key handler. Active while `Reader::edit.is_some()`. Plain text
-/// goes into the buffer; arrows/home/end/etc. move the source cursor; Ctrl-S
-/// (or Ctrl-W backup) saves; Esc arms a discard prompt that the second Esc
-/// confirms. Mouse handling stays in `handle_mouse` and updates the cursor
-/// from click position there.
+/// goes into the buffer (insert mode is the default); arrows/home/end/etc.
+/// move the source cursor; Ctrl-S (or Ctrl-W backup) saves. The first Esc
+/// opens the vim-style command line on the statusline (`:w`, `:wq`, `:q`,
+/// `:preview`, …); a second Esc there discards changes and exits. Mouse
+/// handling stays in `handle_mouse` and updates the cursor from click
+/// position there.
 fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -519,6 +523,35 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if ctrl && matches!(key.code, KeyCode::Char('c')) {
         app.should_quit = true;
         return Ok(());
+    }
+
+    // `:preview` overlay — the unsaved buffer rendered like the reader.
+    // A single Esc drops back to the editor; scroll keys page the preview.
+    if matches!(&app.view, View::Reader(r) if r.edit.as_ref().map(|e| e.preview_full).unwrap_or(false))
+    {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => close_edit_preview(app),
+            KeyCode::Char('j') | KeyCode::Down => scroll_by(app, 1),
+            KeyCode::Char('k') | KeyCode::Up => scroll_by(app, -1),
+            KeyCode::PageDown | KeyCode::Char(' ') | KeyCode::Char('f') => {
+                scroll_by_page(app, 1, false)
+            }
+            KeyCode::PageUp | KeyCode::Char('b') => scroll_by_page(app, -1, false),
+            KeyCode::Char('d') => scroll_by_page(app, 1, true),
+            KeyCode::Char('u') => scroll_by_page(app, -1, true),
+            KeyCode::Char('g') => scroll_to(app, 0),
+            KeyCode::Char('G') | KeyCode::End => scroll_to(app, u16::MAX),
+            _ => {}
+        }
+        return Ok(());
+    }
+
+    // Command line open ("first Esc"): keys edit the command, Tab accepts
+    // the grey suggestion, Enter executes, Esc is the non-vim escape hatch
+    // (discard changes + exit the editor).
+    if matches!(&app.view, View::Reader(r) if r.edit.as_ref().map(|e| e.command.is_some()).unwrap_or(false))
+    {
+        return handle_edit_command_key(app, key);
     }
 
     // Word-level movement and deletion (Alt-arrow / Alt-Backspace / Alt-
@@ -566,27 +599,13 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
     match key.code {
         KeyCode::Esc => {
-            // Esc semantics depend on whether there are unsaved changes:
-            //   - Clean buffer: single Esc exits edit mode (no arming, no
-            //     "discarded" status — there was nothing to discard).
-            //   - Dirty buffer: first Esc arms, second Esc discards. The
-            //     arm prompt lives in the statusline; any other key clears
-            //     it via `discard_pending = false` in mutation helpers.
-            let (dirty, armed) = match &app.view {
-                View::Reader(r) => r
-                    .edit
-                    .as_ref()
-                    .map(|e| (e.dirty, e.discard_pending))
-                    .unwrap_or((false, false)),
-                _ => (false, false),
-            };
-            if !dirty {
-                app.exit_edit();
-            } else if armed {
-                app.exit_edit_discard();
-            } else if let View::Reader(r) = &mut app.view {
+            // First Esc moves the cursor to the statusline command place
+            // (vim-style). From there the user types a command (`:wq`,
+            // `:q`, `:preview`, …) or presses Esc again to discard changes
+            // and leave the editor.
+            if let View::Reader(r) = &mut app.view {
                 if let Some(e) = r.edit.as_mut() {
-                    e.discard_pending = true;
+                    e.command = Some(String::new());
                 }
             }
             return Ok(());
@@ -608,17 +627,137 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
             let s = c.encode_utf8(&mut buf);
             app.edit_insert(s);
         }
-        _ => {
-            // Anything else clears the discard arm so a stray modifier press
-            // doesn't leave the prompt up.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Editor commands the command line accepts, in suggestion order. `:` is
+/// implicit — the stored input never includes it.
+const EDIT_COMMANDS: &[&str] = &["w", "wq", "x", "q", "q!", "preview"];
+
+/// The grey inline completion for a partial command: the first command the
+/// input is a strict prefix of. `None` for empty input, exact matches, and
+/// no-match input.
+pub(crate) fn complete_edit_command(input: &str) -> Option<&'static str> {
+    if input.is_empty() {
+        return None;
+    }
+    EDIT_COMMANDS
+        .iter()
+        .find(|c| c.starts_with(input) && c.len() > input.len())
+        .copied()
+}
+
+/// Keystrokes while the editor command line is open.
+fn handle_edit_command_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let dirty =
+        matches!(&app.view, View::Reader(r) if r.edit.as_ref().map(|e| e.dirty).unwrap_or(false));
+    match key.code {
+        // Second Esc: the non-vim exit — discard changes, back to preview.
+        KeyCode::Esc => {
+            if dirty {
+                app.exit_edit_discard();
+            } else {
+                app.exit_edit();
+            }
+        }
+        KeyCode::Enter => {
+            let input = match &mut app.view {
+                View::Reader(r) => r.edit.as_mut().and_then(|e| e.command.take()),
+                _ => None,
+            };
+            if let Some(input) = input {
+                exec_edit_command(app, input.trim().trim_start_matches(':').trim())?;
+            }
+        }
+        KeyCode::Tab => {
             if let View::Reader(r) = &mut app.view {
-                if let Some(e) = r.edit.as_mut() {
-                    e.discard_pending = false;
+                if let Some(cmd) = r.edit.as_mut().and_then(|e| e.command.as_mut()) {
+                    if let Some(full) = complete_edit_command(cmd) {
+                        *cmd = full.to_string();
+                    }
                 }
             }
         }
+        KeyCode::Backspace => {
+            if let View::Reader(r) = &mut app.view {
+                if let Some(e) = r.edit.as_mut() {
+                    match e.command.as_mut().and_then(|c| c.pop()) {
+                        Some(_) => {}
+                        // Backspace on an empty command line aborts it,
+                        // returning the cursor to the buffer.
+                        None => e.command = None,
+                    }
+                }
+            }
+        }
+        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // A leading ':' is implicit (the UI already shows it); typing
+            // one anyway is tolerated and folded away.
+            if let View::Reader(r) = &mut app.view {
+                if let Some(cmd) = r.edit.as_mut().and_then(|e| e.command.as_mut()) {
+                    if !(c == ':' && cmd.is_empty()) {
+                        cmd.push(c);
+                    }
+                }
+            }
+        }
+        _ => {}
     }
     Ok(())
+}
+
+/// Execute a (already `:`-stripped) editor command.
+fn exec_edit_command(app: &mut App, cmd: &str) -> Result<()> {
+    let dirty =
+        matches!(&app.view, View::Reader(r) if r.edit.as_ref().map(|e| e.dirty).unwrap_or(false));
+    match cmd {
+        // Empty Enter: back to insert mode.
+        "" => {}
+        "w" => app.save_edit()?,
+        "wq" | "x" => {
+            app.save_edit()?;
+            app.exit_edit();
+        }
+        // Per the project's UX (a viewer-first app), `:q` leaves the editor
+        // and drops unsaved changes — the statusline hint says so.
+        "q" | "q!" => {
+            if dirty {
+                app.exit_edit_discard();
+            } else {
+                app.exit_edit();
+            }
+        }
+        "preview" => open_edit_preview(app),
+        other => app.status = format!("Not an editor command: :{other}"),
+    }
+    Ok(())
+}
+
+/// `:preview` — render the unsaved buffer full-screen like the reader.
+fn open_edit_preview(app: &mut App) {
+    if let View::Reader(r) = &mut app.view {
+        if let Some(e) = r.edit.as_mut() {
+            e.preview_full = true;
+            e.command = None;
+            r.scroll = 0;
+            r.rendered = None;
+        }
+    }
+}
+
+/// Esc from the `:preview` overlay: back to the two-pane editor, with the
+/// raw pane re-following the cursor (the overlay reused `scroll`).
+fn close_edit_preview(app: &mut App) {
+    if let View::Reader(r) = &mut app.view {
+        if let Some(e) = r.edit.as_mut() {
+            e.preview_full = false;
+            e.last_drawn_cursor = None;
+            r.scroll = 0;
+            r.rendered = None;
+        }
+    }
 }
 
 /// Keystrokes while a modal prompt is open. Text prompts mirror the
@@ -1048,7 +1187,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
 
 /// True when the active reader is in split-screen edit mode.
 fn in_split_edit(app: &App) -> bool {
-    matches!(&app.view, View::Reader(r) if r.edit.as_ref().map(|e| e.mode == crate::tui::app::EditMode::Split).unwrap_or(false))
+    matches!(&app.view, View::Reader(r) if r.in_split_edit())
 }
 
 /// Mouse routing for split-screen edit. Wheel in either pane scrolls that
@@ -1162,7 +1301,7 @@ fn split_click_raw(app: &mut App, col: u16, row: u16) {
     let new_cursor = crate::tui::app::raw_click_to_source(&rows, &r.raw, local_row, local_col);
     if let Some(e) = r.edit.as_mut() {
         e.cursor = new_cursor;
-        e.discard_pending = false;
+        e.command = None;
         r.rendered = None;
     }
 }
@@ -1185,7 +1324,7 @@ fn split_click_preview(app: &mut App, col: u16, row: u16) {
     let new_cursor = crate::tui::app::source_for_preview_row(rendered, local_row);
     if let Some(e) = r.edit.as_mut() {
         e.cursor = new_cursor;
-        e.discard_pending = false;
+        e.command = None;
         r.rendered = None;
     }
 }
@@ -1765,6 +1904,121 @@ mod keybind_tests {
         assert!(!app.should_quit);
     }
 
+    fn edit_state_of(app: &App) -> Option<&crate::tui::app::EditState> {
+        match &app.view {
+            View::Reader(r) => r.edit.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn type_str(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, KeyCode::Char(c));
+        }
+    }
+
+    #[test]
+    fn i_enters_edit_mode_like_e() {
+        let mut app = app_with_headings("i-edit");
+        press(&mut app, KeyCode::Char('i'));
+        assert!(edit_state_of(&app).is_some(), "i opens the editor");
+    }
+
+    #[test]
+    fn esc_opens_command_line_and_esc_again_exits() {
+        let mut app = app_with_headings("esc-cmd");
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Esc);
+        let e = edit_state_of(&app).expect("still editing");
+        assert_eq!(
+            e.command.as_deref(),
+            Some(""),
+            "first Esc opens the command line"
+        );
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            edit_state_of(&app).is_none(),
+            "second Esc leaves the editor"
+        );
+    }
+
+    #[test]
+    fn wq_saves_and_exits() {
+        let mut app = app_with_headings("wq");
+        let path = match &app.view {
+            View::Reader(r) => match &r.origin {
+                crate::tui::app::ReaderOrigin::File(p) => p.clone(),
+                _ => panic!("expected file origin"),
+            },
+            _ => panic!("expected reader"),
+        };
+        press(&mut app, KeyCode::Char('e'));
+        type_str(&mut app, "XYZ");
+        press(&mut app, KeyCode::Esc);
+        type_str(&mut app, ":wq");
+        press(&mut app, KeyCode::Enter);
+        assert!(edit_state_of(&app).is_none(), ":wq exits the editor");
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(disk.starts_with("XYZ"), ":wq wrote the buffer to disk");
+    }
+
+    #[test]
+    fn q_discards_changes_and_exits() {
+        let mut app = app_with_headings("q-discard");
+        press(&mut app, KeyCode::Char('e'));
+        type_str(&mut app, "XYZ");
+        press(&mut app, KeyCode::Esc);
+        type_str(&mut app, "q");
+        press(&mut app, KeyCode::Enter);
+        assert!(edit_state_of(&app).is_none(), ":q exits the editor");
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        assert!(!r.raw.starts_with("XYZ"), ":q dropped the unsaved edit");
+    }
+
+    #[test]
+    fn preview_completes_with_tab_and_esc_returns() {
+        let mut app = app_with_headings("preview-cmd");
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Esc);
+        type_str(&mut app, "pre");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(
+            edit_state_of(&app).unwrap().command.as_deref(),
+            Some("preview"),
+            "Tab accepts the grey completion"
+        );
+        press(&mut app, KeyCode::Enter);
+        let e = edit_state_of(&app).expect("still editing under the overlay");
+        assert!(e.preview_full, ":preview opens the overlay");
+        assert!(e.command.is_none());
+        press(&mut app, KeyCode::Esc);
+        let e = edit_state_of(&app).expect("Esc returns to the editor");
+        assert!(!e.preview_full);
+    }
+
+    #[test]
+    fn unknown_command_reports_and_stays_editing() {
+        let mut app = app_with_headings("bad-cmd");
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Esc);
+        type_str(&mut app, "nope");
+        press(&mut app, KeyCode::Enter);
+        assert!(edit_state_of(&app).is_some(), "still editing");
+        assert_eq!(app.status, "Not an editor command: :nope");
+    }
+
+    #[test]
+    fn complete_edit_command_prefixes() {
+        use super::complete_edit_command;
+        assert_eq!(complete_edit_command("pre"), Some("preview"));
+        assert_eq!(complete_edit_command("w"), Some("wq"));
+        assert_eq!(complete_edit_command(""), None);
+        assert_eq!(complete_edit_command("preview"), None);
+        assert_eq!(complete_edit_command("zz"), None);
+    }
+
     #[test]
     fn col_slice_maps_display_columns_to_chars() {
         use super::col_slice;
@@ -2218,7 +2472,7 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
                 if let Some(offset) = xy_to_source_offset(rendered, &r.raw, line_idx, local_col) {
                     if let Some(e) = r.edit.as_mut() {
                         e.cursor = offset;
-                        e.discard_pending = false;
+                        e.command = None;
                     }
                     r.rendered = None;
                 }

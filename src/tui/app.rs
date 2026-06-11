@@ -261,10 +261,15 @@ pub struct EditState {
     pub cursor: usize,
     /// True after any insert/delete since the last save or load.
     pub dirty: bool,
-    /// First Esc arms this; second Esc discards changes and exits edit mode.
-    /// Any other key clears it. Stored as a flag (not a timestamp) so the
-    /// statusline confirm prompt persists until the user makes a choice.
-    pub discard_pending: bool,
+    /// Vim-style command line. `Some(input)` after the first Esc moves the
+    /// cursor to the statusline; the user types a command (`:wq`, `:q`,
+    /// `:preview`, …) there, Enter executes it, and a second Esc discards
+    /// changes and exits the editor. Any buffer interaction (click, typing
+    /// after it's dismissed) clears it back to insert mode.
+    pub command: Option<String>,
+    /// `:preview` overlay — render the unsaved buffer full-screen like the
+    /// reader; a single Esc drops back to the editor.
+    pub preview_full: bool,
     /// Undo stack: prior (raw, cursor) snapshots. Pushed before each
     /// mutating op; Ctrl-Z pops to revert.
     pub undo: Vec<EditSnapshot>,
@@ -1739,8 +1744,9 @@ impl App {
         }
     }
 
-    /// Enter in-house edit mode. Cursor starts at byte 0; nothing dirty;
-    /// no discard pending. No-op for stdin (we'd have nothing to write to).
+    /// Enter in-house edit mode (insert by default). Cursor starts at byte 0;
+    /// nothing dirty; command line closed. No-op for stdin (we'd have nothing
+    /// to write to).
     pub fn enter_edit(&mut self) {
         if let View::Reader(r) = &mut self.view {
             if matches!(r.origin, ReaderOrigin::Stdin) {
@@ -1750,7 +1756,8 @@ impl App {
             r.edit = Some(EditState {
                 cursor: 0,
                 dirty: false,
-                discard_pending: false,
+                command: None,
+                preview_full: false,
                 undo: Vec::new(),
                 redo: Vec::new(),
                 mode: EditMode::Split,
@@ -1829,7 +1836,7 @@ impl App {
         let e = r.edit.as_mut().unwrap();
         e.cursor = pos + text.len();
         e.dirty = true;
-        e.discard_pending = false;
+        e.command = None;
         r.rendered = None;
     }
 
@@ -1851,7 +1858,7 @@ impl App {
         let e = r.edit.as_mut().unwrap();
         e.cursor = prev;
         e.dirty = true;
-        e.discard_pending = false;
+        e.command = None;
         r.rendered = None;
     }
 
@@ -1873,7 +1880,7 @@ impl App {
         r.raw.replace_range(pos..next, "");
         let e = r.edit.as_mut().unwrap();
         e.dirty = true;
-        e.discard_pending = false;
+        e.command = None;
         r.rendered = None;
     }
 
@@ -1900,7 +1907,7 @@ impl App {
         });
         e.cursor = snap.cursor.min(r.raw.len());
         e.dirty = true; // Even after undo, the buffer differs from disk usually.
-        e.discard_pending = false;
+        e.command = None;
         r.rendered = None;
     }
 
@@ -1927,7 +1934,7 @@ impl App {
         }
         e.cursor = snap.cursor.min(r.raw.len());
         e.dirty = true;
-        e.discard_pending = false;
+        e.command = None;
         r.rendered = None;
     }
 
@@ -1940,7 +1947,7 @@ impl App {
             return;
         };
         let Some(e) = r.edit.as_mut() else { return };
-        e.discard_pending = false;
+        e.command = None;
         let pos = floor_char_boundary(&r.raw, e.cursor);
         let new = if delta < 0 {
             prev_word_boundary(&r.raw, pos)
@@ -1980,7 +1987,7 @@ impl App {
         let e = r.edit.as_mut().unwrap();
         e.cursor = from;
         e.dirty = true;
-        e.discard_pending = false;
+        e.command = None;
         r.rendered = None;
     }
 
@@ -1991,7 +1998,7 @@ impl App {
             return;
         };
         let Some(e) = r.edit.as_mut() else { return };
-        e.discard_pending = false;
+        e.command = None;
         let pos = floor_char_boundary(&r.raw, e.cursor);
         let new = if delta < 0 {
             prev_char_boundary(&r.raw, pos)
@@ -2020,7 +2027,7 @@ impl App {
                 return;
             };
             let Some(e) = r.edit.as_mut() else { return };
-            e.discard_pending = false;
+            e.command = None;
             let cursor = e.cursor;
             let rows = render_raw_pane(&r.raw, raw_w);
             let cur_idx = raw_row_for_cursor(&rows, cursor);
@@ -2044,7 +2051,7 @@ impl App {
             return;
         };
         let Some(e) = r.edit.as_mut() else { return };
-        e.discard_pending = false;
+        e.command = None;
         if let Some(rendered) = r.rendered.as_ref() {
             if let Some((cur_col, cur_row)) = rendered.cursor_xy {
                 let target_row = (cur_row as i32 + delta).max(0) as usize;
@@ -2081,7 +2088,7 @@ impl App {
                 return;
             };
             let Some(e) = r.edit.as_mut() else { return };
-            e.discard_pending = false;
+            e.command = None;
             let rows = render_raw_pane(&r.raw, raw_w);
             let cur_idx = raw_row_for_cursor(&rows, e.cursor);
             let new = if let Some(row) = rows.get(cur_idx) {
@@ -2104,7 +2111,7 @@ impl App {
             return;
         };
         let Some(e) = r.edit.as_mut() else { return };
-        e.discard_pending = false;
+        e.command = None;
         let (line_idx, _col) = source_line_col(&r.raw, e.cursor);
         let new = if eol {
             source_line_end(&r.raw, line_idx)
@@ -2134,7 +2141,7 @@ impl App {
                 r.last_meta = file_meta(&path);
                 if let Some(e) = r.edit.as_mut() {
                     e.dirty = false;
-                    e.discard_pending = false;
+                    e.command = None;
                 }
                 self.status = format!("Saved {}", path.display());
             }
@@ -2147,7 +2154,7 @@ impl App {
                 }
                 if self.cloud.request_save(id, team_path, r.raw.clone()) {
                     if let Some(e) = r.edit.as_mut() {
-                        e.discard_pending = false;
+                        e.command = None;
                     }
                     self.status = "⟳ saving to HackMD…".into();
                 } else {
@@ -2559,6 +2566,16 @@ fn vault_lookup(root: &Path, target: &Path) -> Option<PathBuf> {
 }
 
 impl Reader {
+    /// True while the two-pane editor owns the body: edit mode in `Split`
+    /// flavor and not hidden behind the `:preview` overlay (which renders
+    /// the unsaved buffer like the plain reader).
+    pub fn in_split_edit(&self) -> bool {
+        self.edit
+            .as_ref()
+            .map(|e| e.mode == EditMode::Split && !e.preview_full)
+            .unwrap_or(false)
+    }
+
     pub fn from_file(path: &Path) -> Result<Self> {
         // Capture metadata BEFORE reading content: if a writer races us between
         // these two syscalls, our recorded mtime is older than the file's
@@ -4272,7 +4289,8 @@ mod cloud_msg_tests {
         EditState {
             cursor: 0,
             dirty,
-            discard_pending: false,
+            command: None,
+            preview_full: false,
             undo: Vec::new(),
             redo: Vec::new(),
             mode: EditMode::Split,
