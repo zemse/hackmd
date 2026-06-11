@@ -756,6 +756,11 @@ fn draw_scrollbar(
     if track_h == 0 || area.width == 0 {
         return;
     }
+    // Nothing to scroll → no bar at all. A full-height thumb only adds noise
+    // on pages that already fit.
+    if total <= visible_h {
+        return;
+    }
 
     // Paint the cell BACKGROUND instead of relying on a `█`/`│` glyph: many
     // terminals add line-spacing padding between rows that no character can
@@ -765,9 +770,7 @@ fn draw_scrollbar(
     let track_style = Style::default().bg(theme.muted);
     let thumb_style = Style::default().bg(theme.heading[0]);
 
-    let (thumb_top, thumb_h) = if total <= visible_h || total == 0 {
-        (0, track_h)
-    } else {
+    let (thumb_top, thumb_h) = {
         let h = ((track_h * visible_h) / total).max(1).min(track_h);
         let max_scroll = total - visible_h;
         let span = track_h - h;
@@ -913,16 +916,14 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
         .collect();
     let mut state = ListState::default().with_offset(b.scroll as usize);
     f.render_stateful_widget(List::new(items), inner, &mut state);
-    if b.entries.len() > inner.height as usize {
-        draw_scrollbar(
-            f,
-            scrollbar_track(area, inner),
-            b.scroll as usize,
-            b.entries.len(),
-            inner.height as usize,
-            theme,
-        );
-    }
+    draw_scrollbar(
+        f,
+        scrollbar_track(area, inner),
+        b.scroll as usize,
+        b.entries.len(),
+        inner.height as usize,
+        theme,
+    );
 }
 
 /// The right-border column of a bordered block, aligned with the list
@@ -1038,16 +1039,14 @@ fn draw_cloud_browser(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let mut state = ListState::default().with_offset(tab.scroll as usize);
     f.render_stateful_widget(List::new(items), inner, &mut state);
-    if tab.notes.len() > inner.height as usize {
-        draw_scrollbar(
-            f,
-            scrollbar_track(area, inner),
-            tab.scroll as usize,
-            tab.notes.len(),
-            inner.height as usize,
-            theme,
-        );
-    }
+    draw_scrollbar(
+        f,
+        scrollbar_track(area, inner),
+        tab.scroll as usize,
+        tab.notes.len(),
+        inner.height as usize,
+        theme,
+    );
     app.cloud_tab_hits = tab_hits;
 }
 
@@ -1674,6 +1673,33 @@ mod tests {
             Mid::Url { text, .. } => assert_eq!(text, "https://example.com/x"),
             other => panic!("expected Url preview while hovering, got {:?}", other),
         }
+    }
+
+    // A page that fits the viewport draws no scrollbar at all; a longer one
+    // paints a track with a proportional thumb.
+    #[test]
+    fn scrollbar_hidden_when_content_fits() {
+        use ratatui::backend::TestBackend;
+        let theme = Theme::dark();
+        let area = Rect::new(0, 0, 1, 10);
+        let mut term = ratatui::Terminal::new(TestBackend::new(1, 10)).unwrap();
+
+        let painted = |term: &ratatui::Terminal<TestBackend>| {
+            let buf = term.backend().buffer();
+            (0..10)
+                .filter(|&y| buf[(0, y)].bg != ratatui::style::Color::Reset)
+                .count()
+        };
+
+        // Content fits (8 lines in a 10-row viewport) → nothing painted.
+        term.draw(|f| draw_scrollbar(f, area, 0, 8, 10, &theme))
+            .unwrap();
+        assert_eq!(painted(&term), 0, "no bar when the page fits");
+
+        // Content overflows → the whole track is painted.
+        term.draw(|f| draw_scrollbar(f, area, 0, 40, 10, &theme))
+            .unwrap();
+        assert_eq!(painted(&term), 10, "track + thumb fill the column");
     }
 
     // With nothing hovered, the sticky status still shows (hover doesn't
