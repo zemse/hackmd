@@ -852,6 +852,20 @@ fn highlight_checkbox_hover(line: &mut Line<'_>, col_start: usize, col_end: usiz
     }
 }
 
+/// One row of a hand-highlighted list. Reproduces what ratatui's
+/// `highlight_style` does to the selected row: `hl` overrides every span's
+/// own color (a span-level style would otherwise sit on top of the row
+/// style), and the row style paints the bar across the full width.
+fn list_row(mut spans: Vec<Span<'static>>, selected: bool, hl: Style) -> ListItem<'static> {
+    if selected {
+        for s in &mut spans {
+            s.style = hl;
+        }
+    }
+    let item = ListItem::new(Line::from(spans));
+    if selected { item.style(hl) } else { item }
+}
+
 fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     let View::Browser(b) = &app.view else {
         return;
@@ -894,8 +908,7 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
             if unread {
                 spans.push(Span::styled(" [unread]", badge_style));
             }
-            let item = ListItem::new(Line::from(spans));
-            if selected { item.style(hl) } else { item }
+            list_row(spans, selected, hl)
         })
         .collect();
     let mut state = ListState::default().with_offset(b.scroll as usize);
@@ -1012,12 +1025,15 @@ fn draw_cloud_browser(f: &mut Frame, app: &mut App, area: Rect) {
                 "only me" | "only team" => Style::default().fg(theme.muted),
                 _ => Style::default().fg(theme.link),
             };
-            let item = ListItem::new(Line::from(vec![
-                Span::raw(if selected { "▶ " } else { "  " }),
-                Span::raw(n.title.clone()),
-                Span::styled(format!(" [{}]", n.visibility), badge_style),
-            ]));
-            if selected { item.style(hl) } else { item }
+            list_row(
+                vec![
+                    Span::raw(if selected { "▶ " } else { "  " }),
+                    Span::raw(n.title.clone()),
+                    Span::styled(format!(" [{}]", n.visibility), badge_style),
+                ],
+                selected,
+                hl,
+            )
         })
         .collect();
     let mut state = ListState::default().with_offset(tab.scroll as usize);
