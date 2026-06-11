@@ -56,6 +56,15 @@ pub struct App {
     /// recorded by the renderer so a click on it can copy the (untruncated)
     /// URL to the clipboard.
     pub statusline_url_hit: Option<(u16, u16, String)>,
+    /// The file path on the statusline left, recorded by the renderer:
+    /// `(start_col, end_col, displayed text, full path to copy)`. A click on
+    /// it copies the full path; a drag selects part of the displayed text.
+    /// `None` when the current view has no copyable path (cloud note, stdin).
+    pub statusline_path_hit: Option<(u16, u16, String, String)>,
+    /// In-progress drag over the statusline path: `(anchor_col, focus_col)`.
+    /// Armed on mouse-down over the path, resolved on mouse-up (click →
+    /// full path, drag → the column-selected slice).
+    pub statusline_path_drag: Option<(u16, u16)>,
     /// Pending vim count prefix (e.g. user typed `5` waiting for `j`). Reset
     /// after the motion key consumes it, or on Esc.
     pub count_prefix: Option<u32>,
@@ -590,6 +599,8 @@ impl App {
             back_button_hit: None,
             cloud_tab_hits: Vec::new(),
             statusline_url_hit: None,
+            statusline_path_hit: None,
+            statusline_path_drag: None,
             count_prefix: None,
             pending_g: None,
             pending_z: None,

@@ -1183,6 +1183,16 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
         View::Browser(b) => format!("{}/", display_path(&b.dir, &app.root)),
         View::Cloud(_) => "☁ hackmd.io".to_string(),
     };
+    // The untruncated path a click on the statusline path should copy.
+    // Cloud notes and stdin have no filesystem path to offer.
+    let full_path: Option<String> = match &app.view {
+        View::Reader(r) => match &r.origin {
+            crate::tui::app::ReaderOrigin::File(p) => Some(p.display().to_string()),
+            _ => None,
+        },
+        View::Browser(b) => Some(b.dir.display().to_string()),
+        View::Cloud(_) => None,
+    };
 
     let scroll_pos = match &app.view {
         View::Reader(r) => {
@@ -1216,6 +1226,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
     let mut back_span: Option<Span> = None;
     app.back_button_hit = None;
     app.statusline_url_hit = None;
+    app.statusline_path_hit = None;
     let edit_badge: Option<Span> = if let View::Reader(r) = &app.view {
         r.edit.as_ref().map(|e| {
             let label = if e.dirty { " EDIT* " } else { " EDIT " };
@@ -1282,10 +1293,11 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
         }
     };
     let mut url_hit_region: Option<(u16, u16, String)> = None;
+    let mut path_cols: Option<(usize, usize)> = None;
     match edge_swap {
         EdgeSwap::Right => {
             // URL pinned to the right of the row (just before scroll%).
-            push_left(&mut line_spans, &left_badge, &path, path_style);
+            path_cols = Some(push_left(&mut line_spans, &left_badge, &path, path_style));
             let mid_styled = Span::styled(format!(" {} ", mid_text), middle.style(theme));
             let mid_w = UnicodeWidthStr::width(mid_styled.content.as_ref());
             let used = span_width(&line_spans) + mid_w + right_w;
@@ -1310,7 +1322,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
         }
         EdgeSwap::None => {
             // Default layout: [back] [path]   <middle>   <right>
-            push_left(&mut line_spans, &left_badge, &path, path_style);
+            path_cols = Some(push_left(&mut line_spans, &left_badge, &path, path_style));
             if !mid_text.is_empty() {
                 let pad_left = 2usize;
                 let used_left = span_width(&line_spans) + pad_left;
@@ -1329,9 +1341,30 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
     app.statusline_url_hit = url_hit_region;
+    if let (Some((ps, pe)), Some(full)) = (path_cols, full_path) {
+        let start = area.x + ps as u16;
+        let end = (area.x + pe as u16).min(area.x + area.width);
+        if start < end {
+            app.statusline_path_hit = Some((start, end, path.clone(), full));
+        }
+    }
 
     let _ = muted;
     f.render_widget(Paragraph::new(Line::from(line_spans)), area);
+
+    // In-progress drag over the path: reverse-video the selected columns so
+    // the user can see what mouse-up will copy.
+    if let (Some((s, e, _, _)), Some((a, b))) =
+        (app.statusline_path_hit.as_ref(), app.statusline_path_drag)
+    {
+        let lo = a.min(b).max(*s);
+        let hi = a.max(b).min(e.saturating_sub(1));
+        let buf = f.buffer_mut();
+        for x in lo..=hi {
+            let cell = &mut buf[(x, area.y)];
+            cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1502,19 +1535,24 @@ fn compute_edge_swap(app: &App, middle: &Mid) -> EdgeSwap {
     }
 }
 
+/// Push the left side of the statusline (badge/back + path) and return the
+/// width range `[start, end)` the path span occupies within the line, so the
+/// caller can record a click/drag hit region for it.
 fn push_left(
     out: &mut Vec<Span<'static>>,
     back: &Option<Span<'static>>,
     path: &str,
     path_style: Style,
-) {
+) -> (usize, usize) {
     if let Some(b) = back.clone() {
         out.push(b);
         out.push(Span::raw(" "));
     } else {
         out.push(Span::raw(" "));
     }
+    let start = span_width(out);
     out.push(Span::styled(path.to_string(), path_style));
+    (start, start + unicode_width::UnicodeWidthStr::width(path))
 }
 
 fn span_width(spans: &[Span<'_>]) -> usize {
@@ -1673,6 +1711,26 @@ mod tests {
             Mid::Url { text, .. } => assert_eq!(text, "https://example.com/x"),
             other => panic!("expected Url preview while hovering, got {:?}", other),
         }
+    }
+
+    // Rendering a file reader records a clickable hit region for the path on
+    // the statusline, carrying the full path a click should copy.
+    #[test]
+    fn statusline_records_path_hit() {
+        use ratatui::backend::TestBackend;
+        let mut app = app_with_link();
+        let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let (start, end, display, full) = app
+            .statusline_path_hit
+            .clone()
+            .expect("file reader must expose a path hit");
+        assert!(start < end);
+        assert!(full.ends_with(".md"), "full path is the on-disk path");
+        assert!(
+            full.ends_with(&display) || display.ends_with(".md"),
+            "display is derived from the same file"
+        );
     }
 
     // A page that fits the viewport draws no scrollbar at all; a longer one

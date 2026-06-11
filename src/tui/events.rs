@@ -873,6 +873,27 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
         app.status.clear();
     }
 
+    // An armed statusline-path drag owns the gesture until mouse-up, even if
+    // the pointer wanders off the row mid-drag.
+    if app.statusline_path_drag.is_some() {
+        match m.kind {
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let (Some((s, e, _, _)), Some(d)) = (
+                    app.statusline_path_hit.as_ref(),
+                    app.statusline_path_drag.as_mut(),
+                ) {
+                    d.1 = m.column.clamp(*s, e.saturating_sub(1));
+                }
+                return Ok(());
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                finish_path_drag(app);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     // Statusline: clickable back button. (Was in the dedicated header row;
     // since we collapsed the layout it now sits on the statusline.)
     if m.row == app.statusline_area.y && matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -889,6 +910,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
             if m.column >= sx && m.column < ex {
                 copy_to_clipboard(&url);
                 app.status = format!("Copied: {}", url);
+                return Ok(());
+            }
+        }
+        // Mouse-down on the path arms a drag; mouse-up decides whether it was
+        // a click (copy the full path) or a drag (copy the selected slice).
+        if let Some((sx, ex)) = app.statusline_path_hit.as_ref().map(|h| (h.0, h.1)) {
+            if m.column >= sx && m.column < ex {
+                app.statusline_path_drag = Some((m.column, m.column));
                 return Ok(());
             }
         }
@@ -1286,6 +1315,48 @@ fn select_word_at(app: &mut App, col: u16, row: u16) {
 /// Best-effort copy: native helper on macOS, OSC 52 otherwise (with tmux
 /// passthrough wrapping when applicable). Both paths are silent on failure —
 /// the status line already reports what we attempted to copy.
+/// Resolve a finished statusline-path gesture: a plain click copies the full
+/// (untruncated) path, a drag copies the column-selected slice of the
+/// displayed text.
+fn finish_path_drag(app: &mut App) {
+    let Some((a, b)) = app.statusline_path_drag.take() else {
+        return;
+    };
+    let Some((start, _, display, full)) = app.statusline_path_hit.clone() else {
+        return;
+    };
+    let text = if a == b {
+        full
+    } else {
+        let (lo, hi) = (a.min(b), a.max(b));
+        col_slice(&display, (lo - start) as usize, (hi - start) as usize + 1)
+    };
+    if text.is_empty() {
+        return;
+    }
+    copy_to_clipboard(&text);
+    app.status = format!("Copied: {}", text);
+}
+
+/// The substring of `s` covering display columns `[from, to)`. A character is
+/// included when any part of its width falls inside the range.
+fn col_slice(s: &str, from: usize, to: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut out = String::new();
+    let mut col = 0usize;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if col + w > from && col < to {
+            out.push(ch);
+        }
+        col += w;
+        if col >= to {
+            break;
+        }
+    }
+    out
+}
+
 fn copy_to_clipboard(text: &str) {
     #[cfg(target_os = "macos")]
     {
@@ -1692,6 +1763,18 @@ mod keybind_tests {
         // With no history the call is a no-op — but it must not be treated
         // as plain `o` (open focused link) or crash.
         assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn col_slice_maps_display_columns_to_chars() {
+        use super::col_slice;
+        assert_eq!(col_slice("notes/file.md", 0, 5), "notes");
+        assert_eq!(col_slice("notes/file.md", 6, 13), "file.md");
+        // Wide chars: each kanji occupies two columns; a range touching any
+        // part of the glyph includes it.
+        assert_eq!(col_slice("漢字.md", 0, 2), "漢");
+        assert_eq!(col_slice("漢字.md", 1, 3), "漢字");
+        assert_eq!(col_slice("abc", 2, 10), "c");
     }
 
     #[test]
