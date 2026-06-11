@@ -9,7 +9,14 @@ use crate::cli::output::{OutputOpts, print_table};
 use crate::error::{Error, Result};
 use crate::types::{CommentPermissionType, CreateNoteOptions, NotePermissionRole};
 
-const NOTES_LIST_COLUMNS: &[&str] = &["id", "title", "userPath", "teamPath", "lastChangedAt"];
+const NOTES_LIST_COLUMNS: &[&str] = &[
+    "id",
+    "title",
+    "userPath",
+    "teamPath",
+    "visibility",
+    "lastChangedAt",
+];
 const NOTES_GET_COLUMNS: &[&str] = &[
     "id",
     "title",
@@ -28,7 +35,8 @@ pub async fn list(
 ) -> Result<()> {
     let (client, _eff) = super::build_client(config_dir, cli_endpoint, cli_token)?;
     let notes = client.notes().await?;
-    print_table(&notes, NOTES_LIST_COLUMNS, opts)
+    let rows = super::note_rows(&notes)?;
+    print_table(&rows, NOTES_LIST_COLUMNS, opts)
 }
 
 pub async fn get(

@@ -8,7 +8,14 @@ use crate::cli::output::{OutputOpts, print_table};
 use crate::error::{Error, Result};
 use crate::types::{CommentPermissionType, CreateNoteOptions, NotePermissionRole};
 
-const TEAM_NOTES_LIST_COLUMNS: &[&str] = &["id", "title", "userPath", "teamPath", "lastChangedAt"];
+const TEAM_NOTES_LIST_COLUMNS: &[&str] = &[
+    "id",
+    "title",
+    "userPath",
+    "teamPath",
+    "visibility",
+    "lastChangedAt",
+];
 const TEAM_NOTES_CREATE_COLUMNS: &[&str] = &["id", "title", "userPath", "teamPath"];
 
 pub async fn list(
@@ -20,7 +27,8 @@ pub async fn list(
 ) -> Result<()> {
     let (client, _eff) = super::build_client(config_dir, cli_endpoint, cli_token)?;
     let notes = client.team_notes(team_path).await?;
-    print_table(&notes, TEAM_NOTES_LIST_COLUMNS, opts)
+    let rows = super::note_rows(&notes)?;
+    print_table(&rows, TEAM_NOTES_LIST_COLUMNS, opts)
 }
 
 #[allow(clippy::too_many_arguments)]
