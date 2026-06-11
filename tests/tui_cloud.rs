@@ -43,12 +43,6 @@ async fn recv(ctx: &mut CloudContext) -> CloudMsg {
     panic!("no CloudMsg within 5s");
 }
 
-fn single_note_json(id: &str, title: &str, content: &str) -> serde_json::Value {
-    let mut v = list_note_json(id, title);
-    v["content"] = serde_json::Value::String(content.to_string());
-    v
-}
-
 fn list_note_json(id: &str, title: &str) -> serde_json::Value {
     serde_json::json!({
         "id": id,
