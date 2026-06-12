@@ -577,6 +577,27 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
             _ => {}
         }
     }
+    // macOS terminals (Terminal.app, iTerm default profile) send Option-
+    // arrow as the emacs sequences `Esc b` / `Esc f`, which crossterm
+    // reports as Alt-b / Alt-f rather than an Alt-modified arrow. `Esc d`
+    // (Alt-d) is the matching emacs forward word delete.
+    if alt {
+        match key.code {
+            KeyCode::Char('b') => {
+                app.edit_move_word(-1);
+                return Ok(());
+            }
+            KeyCode::Char('f') => {
+                app.edit_move_word(1);
+                return Ok(());
+            }
+            KeyCode::Char('d') => {
+                app.edit_delete_word(true);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
 
     // Save: Ctrl-S primary, Ctrl-W backup (some terminals eat Ctrl-S as
     // XOFF / flow control).
@@ -620,7 +641,7 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Delete => app.edit_delete(),
         KeyCode::Enter => app.edit_insert("\n"),
         KeyCode::Tab => app.edit_insert("  "),
-        KeyCode::Char(c) if !ctrl => {
+        KeyCode::Char(c) if !ctrl && !alt => {
             // Buffer the char as a UTF-8 string. Single-char allocation is
             // negligible compared to the re-render that follows.
             let mut buf = [0u8; 4];
@@ -692,7 +713,11 @@ fn handle_edit_command_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 }
             }
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             // A leading ':' is implicit (the UI already shows it); typing
             // one anyway is tolerated and folded away.
             if let View::Reader(r) = &mut app.view {
@@ -880,7 +905,11 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 p.input.clear();
             }
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             if let Some(p) = &mut app.prompt {
                 p.input.push(c);
             }
@@ -966,7 +995,11 @@ fn handle_doc_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
             app.doc_search_refresh();
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             if let View::Reader(r) = &mut app.view {
                 if let Some(s) = &mut r.doc_search {
                     s.query.push(c);
@@ -1028,7 +1061,11 @@ fn handle_search_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 s.refresh();
             }
         }
-        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
             if let Some(s) = &mut app.search {
                 s.query.push(c);
                 s.refresh();
