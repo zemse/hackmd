@@ -64,6 +64,11 @@ pub fn run_blocking(opts: LaunchOpts, cloud: cloud::CloudContext) -> Result<()> 
     // Probe for graphics support only after entering the alt screen, so any
     // unrecognized response bytes don't pollute the user's shell on exit.
     app.init_image_picker();
+    // Terminals without APC support (e.g. Apple Terminal) print part of the
+    // kitty graphics query as literal text instead of consuming it. Clear so
+    // the first frame repaints every cell — ratatui's diff draw would
+    // otherwise leave that junk visible wherever the frame is blank.
+    term.clear()?;
 
     let panic_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
