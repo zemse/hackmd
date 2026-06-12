@@ -285,6 +285,37 @@ pub struct EditState {
     /// scrolling does not touch the cursor, so the follow logic stays put
     /// and the scroll sticks.
     pub last_drawn_cursor: Option<usize>,
+    /// Drag-selection in the raw pane. Armed on mouse-down, activated by
+    /// the first drag that moves off the anchor, and kept after mouse-up
+    /// so the user can choose an action (`y` copy, Del delete) instead of
+    /// the reader's copy-on-release behaviour.
+    pub selection: Option<EditSelection>,
+}
+
+/// A drag-selection in the raw editor pane, as byte offsets into
+/// `Reader::raw`. Both ends always sit on UTF-8 char boundaries (they come
+/// from the same click→byte mapping as the cursor).
+#[derive(Clone, Debug)]
+pub struct EditSelection {
+    /// Where the mouse went down.
+    pub anchor: usize,
+    /// Where the mouse is / was released. May be before `anchor`.
+    pub focus: usize,
+    /// True once a drag moved the focus off the anchor; a plain click
+    /// never activates the selection.
+    pub dragged: bool,
+}
+
+impl EditSelection {
+    /// Ordered `(start, end)` byte range.
+    pub fn range(&self) -> (usize, usize) {
+        (self.anchor.min(self.focus), self.anchor.max(self.focus))
+    }
+
+    /// True if the selection covers a non-empty range the user dragged out.
+    pub fn is_active(&self) -> bool {
+        self.dragged && self.anchor != self.focus
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1787,6 +1818,7 @@ impl App {
                 redo: Vec::new(),
                 mode: EditMode::Split,
                 last_drawn_cursor: None,
+                selection: None,
             });
             r.rendered = None;
             r.scroll = 0;
@@ -2014,6 +2046,59 @@ impl App {
         e.dirty = true;
         e.command = None;
         r.rendered = None;
+    }
+
+    /// Text covered by the active editor drag-selection, if any.
+    pub fn edit_selection_text(&self) -> Option<String> {
+        let View::Reader(r) = &self.view else {
+            return None;
+        };
+        let sel = r.edit.as_ref()?.selection.as_ref()?;
+        if !sel.is_active() {
+            return None;
+        }
+        let (from, to) = sel.range();
+        r.raw.get(from..to.min(r.raw.len())).map(str::to_string)
+    }
+
+    /// Delete the active editor drag-selection. One undo snapshot; the
+    /// cursor lands where the selection started.
+    pub fn edit_delete_selection(&mut self) {
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        let Some((from, to)) = r
+            .edit
+            .as_ref()
+            .and_then(|e| e.selection.as_ref())
+            .filter(|s| s.is_active())
+            .map(|s| s.range())
+        else {
+            return;
+        };
+        let from = floor_char_boundary(&r.raw, from.min(r.raw.len()));
+        let to = floor_char_boundary(&r.raw, to.min(r.raw.len()));
+        if from >= to {
+            r.edit.as_mut().unwrap().selection = None;
+            return;
+        }
+        push_undo(r);
+        r.raw.replace_range(from..to, "");
+        let e = r.edit.as_mut().unwrap();
+        e.cursor = from;
+        e.dirty = true;
+        e.command = None;
+        e.selection = None;
+        r.rendered = None;
+    }
+
+    /// Drop the editor drag-selection without touching the buffer.
+    pub fn edit_clear_selection(&mut self) {
+        if let View::Reader(r) = &mut self.view {
+            if let Some(e) = r.edit.as_mut() {
+                e.selection = None;
+            }
+        }
     }
 
     /// Move cursor by one char left/right (`delta` ±1). Re-renders so the
@@ -4320,6 +4405,7 @@ mod cloud_msg_tests {
             redo: Vec::new(),
             mode: EditMode::Split,
             last_drawn_cursor: None,
+            selection: None,
         }
     }
 
@@ -4523,6 +4609,55 @@ mod cloud_msg_tests {
         assert!(app.cloud.pending_nav.is_none());
         assert_eq!(app.history.len(), h0);
         assert!(app.status.contains("404"));
+    }
+
+    #[test]
+    fn edit_selection_copy_and_delete() {
+        // "hello world" — select bytes 6..11 ("world").
+        let mut app = test_app();
+        let n = note("n1", "T", "hello world");
+        let mut r = Reader::from_cloud(&n, None);
+        let mut e = edit_state(false);
+        e.selection = Some(EditSelection {
+            anchor: 6,
+            focus: 11,
+            dragged: true,
+        });
+        r.edit = Some(e);
+        app.view = View::Reader(r);
+
+        assert_eq!(app.edit_selection_text().as_deref(), Some("world"));
+
+        app.edit_delete_selection();
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        assert_eq!(r.raw, "hello ");
+        let e = r.edit.as_ref().expect("editing");
+        assert_eq!(e.cursor, 6);
+        assert!(e.dirty);
+        assert!(e.selection.is_none(), "selection cleared after delete");
+        assert_eq!(e.undo.len(), 1, "one undo snapshot for the delete");
+
+        // A merely armed (never dragged) selection is inert: no text, and
+        // delete is a no-op.
+        let mut app = test_app();
+        let mut r = Reader::from_cloud(&n, None);
+        let mut e = edit_state(false);
+        e.selection = Some(EditSelection {
+            anchor: 3,
+            focus: 3,
+            dragged: false,
+        });
+        r.edit = Some(e);
+        app.view = View::Reader(r);
+        assert_eq!(app.edit_selection_text(), None);
+        app.edit_delete_selection();
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        assert_eq!(r.raw, "hello world");
+        assert!(!r.edit.as_ref().expect("editing").dirty);
     }
 
     #[test]

@@ -560,6 +560,38 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
     }
     f.render_widget(Paragraph::new(raw_lines), raw_area);
 
+    // Drag-selection highlight: reverse-video over the selected byte range,
+    // row by row (rows wholly outside the range are skipped).
+    if let Some(sel) = r
+        .edit
+        .as_ref()
+        .and_then(|e| e.selection.as_ref())
+        .filter(|s| s.is_active())
+    {
+        let (sel_start, sel_end) = sel.range();
+        let buf = f.buffer_mut();
+        for i in 0..visible_h_raw {
+            let Some(row) = raw_rows.get(raw_scroll + i) else {
+                break;
+            };
+            let from = row.source_range.start.max(sel_start);
+            let to = row.source_range.end.min(sel_end);
+            if from >= to {
+                continue;
+            }
+            let c0 = app::raw_col_for_cursor(&r.raw, row, from);
+            let c1 = app::raw_col_for_cursor(&r.raw, row, to);
+            let y = raw_area.y + i as u16;
+            for x in c0..c1 {
+                let col = raw_area.x + x;
+                if col < raw_area.x + raw_area.width {
+                    let cell = &mut buf[(col, y)];
+                    cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
+    }
+
     // Cursor: reverse-video cell at (cur_col, cur_row_idx - raw_scroll).
     let cy_view = cur_row_idx as i32 - raw_scroll as i32;
     if cy_view >= 0 && (cy_view as u16) < raw_area.height {
@@ -1511,7 +1543,11 @@ fn compute_middle(app: &App) -> Mid {
     }
     if let View::Reader(r) = &app.view {
         // Edit-mode hint replaces the normal viewer hint when active.
-        if r.edit.is_some() {
+        if let Some(e) = r.edit.as_ref() {
+            // An active drag-selection swaps in its action menu.
+            if e.selection.as_ref().map(|s| s.is_active()).unwrap_or(false) {
+                return Mid::Hint("selection  y copy  Del delete  Esc cancel".into());
+            }
             return Mid::Hint(
                 "type to edit  Ctrl-S save  Alt-←/→ word  Ctrl-Z undo  Esc command".into(),
             );
@@ -1695,6 +1731,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from("  Ctrl-S           save  (Ctrl-W fallback for XOFF terminals)"),
         Line::from("  Ctrl-Z / Ctrl-Y  undo / redo          Esc Esc  discard"),
         Line::from("  Alt-←/→          word jump    Alt-Bksp/Del  word delete"),
+        Line::from("  drag             select text — then y copy, Del delete, Esc cancel"),
         Line::from("  Esc              command line — :w :wq :q :preview (Tab completes)"),
         Line::from(""),
         section(" Local files"),

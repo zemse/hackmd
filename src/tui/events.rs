@@ -554,6 +554,40 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return handle_edit_command_key(app, key);
     }
 
+    // An active drag-selection captures the next key: y copies, Backspace/
+    // Delete deletes, Esc cancels. Any other key drops the selection and is
+    // then handled normally (it does NOT replace the selected text).
+    let sel_active = matches!(
+        &app.view,
+        View::Reader(r) if r
+            .edit
+            .as_ref()
+            .and_then(|e| e.selection.as_ref())
+            .map(|s| s.is_active())
+            .unwrap_or(false)
+    );
+    if sel_active {
+        match key.code {
+            KeyCode::Char('y') if !ctrl && !alt => {
+                if let Some(text) = app.edit_selection_text() {
+                    copy_to_clipboard(&text);
+                    app.status = format!("Copied {} chars", text.chars().count());
+                }
+                app.edit_clear_selection();
+                return Ok(());
+            }
+            KeyCode::Delete | KeyCode::Backspace => {
+                app.edit_delete_selection();
+                return Ok(());
+            }
+            KeyCode::Esc => {
+                app.edit_clear_selection();
+                return Ok(());
+            }
+            _ => app.edit_clear_selection(),
+        }
+    }
+
     // Word-level movement and deletion (Alt-arrow / Alt-Backspace / Alt-
     // Delete on macOS, Ctrl-arrow / Ctrl-Backspace on Linux/Windows).
     if alt || ctrl {
@@ -1340,13 +1374,75 @@ fn handle_split_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
         MouseEventKind::Down(MouseButton::Left) => {
             if in_raw {
                 split_click_raw(app, m.column, m.row);
+                // Arm a selection at the click position; it only activates
+                // if a drag moves the focus off this anchor.
+                if let View::Reader(r) = &mut app.view {
+                    if let Some(e) = r.edit.as_mut() {
+                        e.selection = Some(crate::tui::app::EditSelection {
+                            anchor: e.cursor,
+                            focus: e.cursor,
+                            dragged: false,
+                        });
+                    }
+                }
             } else if in_prev {
+                app.edit_clear_selection();
                 split_click_preview(app, m.column, m.row);
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            split_drag_raw(app, m.column, m.row);
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // A plain click leaves no selection behind. A real drag keeps
+            // it highlighted; the statusline offers y copy / Del delete /
+            // Esc cancel (handled in `handle_edit_key`).
+            if let View::Reader(r) = &mut app.view {
+                if let Some(e) = r.edit.as_mut() {
+                    if !e.selection.as_ref().map(|s| s.is_active()).unwrap_or(false) {
+                        e.selection = None;
+                    }
+                }
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Extend an armed raw-pane selection to the pointer position. The pointer
+/// is clamped into the raw pane so a drag that wanders past an edge keeps
+/// extending to the nearest cell. No-op when no selection was armed (e.g.
+/// the drag started in the preview pane).
+fn split_drag_raw(app: &mut App, col: u16, row: u16) {
+    let area = app.edit_raw_area;
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let col = col.clamp(area.x, area.x + area.width - 1);
+    let row = row.clamp(area.y, area.y + area.height - 1);
+    let raw_w = area.width.max(1) as usize;
+    let View::Reader(r) = &mut app.view else {
+        return;
+    };
+    if r.edit.as_ref().and_then(|e| e.selection.as_ref()).is_none() {
+        return;
+    }
+    let local_row = (row - area.y) as usize + r.scroll as usize;
+    let local_col = (col - area.x) as usize;
+    let rows = crate::tui::app::render_raw_pane(&r.raw, raw_w);
+    let byte = crate::tui::app::raw_click_to_source(&rows, &r.raw, local_row, local_col);
+    let e = r.edit.as_mut().unwrap();
+    let sel = e.selection.as_mut().unwrap();
+    sel.focus = byte;
+    if !sel.dragged && sel.focus != sel.anchor {
+        sel.dragged = true;
+    }
+    // The cursor follows the drag focus so the auto-scroll keeps the
+    // selection edge visible.
+    e.cursor = byte;
+    e.command = None;
+    r.rendered = None;
 }
 
 /// Scroll the raw pane by `delta` rows, clamping to the wrapped row count
