@@ -1053,6 +1053,31 @@ impl App {
         }
     }
 
+    /// Open a just-created cloud note straight into the split editor (the
+    /// `hackmd new` flow). The create response is seeded into the note
+    /// cache so no fetch round-trip is needed; the cursor lands on the
+    /// blank body line below the title heading.
+    pub fn open_created_note(&mut self, note: crate::types::SingleNote) {
+        let id = note.id.clone();
+        let title = note.title.clone();
+        self.cloud.note_cache.insert(
+            id.clone(),
+            crate::tui::cloud::CachedNote { note, etag: None },
+        );
+        if let Err(e) = self.navigate_to(EntryKind::CloudNote { id, title }, 0) {
+            self.status = format!("HackMD open: {e}");
+            return;
+        }
+        self.enter_edit();
+        if let View::Reader(r) = &mut self.view
+            && let Some(edit) = &mut r.edit
+        {
+            // First blank line after the heading (template shape from
+            // `hackmd new`); byte 0 when the content has no blank line.
+            edit.cursor = r.raw.find("\n\n").map_or(0, |i| i + 2).min(r.raw.len());
+        }
+    }
+
     /// `H` (browsers) / `gh` (anywhere): flip between the local file world
     /// and the HackMD cloud browser. Toggling out of cloud returns to the
     /// most recent local view.
@@ -4441,6 +4466,27 @@ mod cloud_msg_tests {
         assert_eq!(r.raw, "# body");
         assert_eq!(r.scroll, 5);
         assert!(matches!(&r.origin, ReaderOrigin::CloudNote { id, .. } if id == "n1"));
+    }
+
+    #[test]
+    fn open_created_note_enters_editor_with_cursor_on_body() {
+        let mut app = test_app();
+        let content = "# Hello\n\n\n\n---\n\n*footer*\n";
+        let h0 = app.history.len();
+
+        app.open_created_note(note("n9", "Hello", content));
+
+        assert!(app.cloud.note_cache.contains_key("n9"), "cache seeded");
+        assert_eq!(app.history.len(), h0 + 1, "local view stays one Esc away");
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader view");
+        };
+        assert!(matches!(&r.origin, ReaderOrigin::CloudNote { id, .. } if id == "n9"));
+        assert_eq!(r.raw, content);
+        let edit = r.edit.as_ref().expect("editor open");
+        assert!(!edit.dirty);
+        // Cursor on the blank body line between the heading and the rule.
+        assert_eq!(edit.cursor, content.find("\n\n").expect("blank line") + 2);
     }
 
     #[test]

@@ -25,6 +25,7 @@ The `cli` and `tui` features are on by default; library-only consumers should op
 hackmd                # cloud notes view when logged in, else browses the cwd
 hackmd .              # browse the current directory
 hackmd notes.md       # open a file (or any dir/file path) in the reader
+hackmd new meeting notes   # create a cloud note titled "meeting notes" and edit it
 hackmd tui            # same as bare `hackmd`
 ```
 
@@ -106,6 +107,8 @@ hackmd team-notes --team-path <p> create  ...         # same flags as `notes cre
 hackmd team-notes --team-path <p> update --note-id <id> --content <c>
 hackmd team-notes --team-path <p> delete --note-id <id>
 
+hackmd new [TITLE...]                                 # create a note and open it in the TUI editor
+                                                      # (alias: hackmd create; quotes around the title optional)
 hackmd [PATH]                                         # the TUI: cloud view bare, local browser/reader with a path
 ```
 

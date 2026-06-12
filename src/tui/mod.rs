@@ -32,6 +32,9 @@ pub struct LaunchOpts {
     /// Open in the HackMD cloud browser when a token is configured;
     /// without one the TUI starts (and stays usable) on `source`.
     pub start_cloud: bool,
+    /// Open straight into the split editor on this just-created note
+    /// (the `hackmd new` flow). Takes precedence over `start_cloud`.
+    pub start_note: Option<Box<crate::types::SingleNote>>,
 }
 
 /// Run the TUI event loop on the calling thread until the user quits.
@@ -50,7 +53,10 @@ pub fn run_blocking(opts: LaunchOpts, cloud: cloud::CloudContext) -> Result<()> 
     };
 
     let mut app = app::App::with_cloud(opts.source, app_opts, cloud)?;
-    if opts.start_cloud && app.cloud.is_connected() {
+    if let Some(note) = opts.start_note {
+        // `hackmd new` — straight into the editor on the fresh note.
+        app.open_created_note(*note);
+    } else if opts.start_cloud && app.cloud.is_connected() {
         // Open on the cloud browser; the local view stays one Esc/H away.
         let _ = app.navigate_to(app::EntryKind::CloudList, 0);
     }

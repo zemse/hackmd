@@ -39,6 +39,7 @@ fn top_level_help_lists_all_subcommands() {
         .stdout(predicate::str::contains("teams"))
         .stdout(predicate::str::contains("notes"))
         .stdout(predicate::str::contains("team-notes"))
+        .stdout(predicate::str::contains("new"))
         .stdout(predicate::str::contains("tui"));
 }
 
@@ -53,6 +54,7 @@ fn each_subcommand_help_succeeds() {
         "teams",
         "notes",
         "team-notes",
+        "new",
         "tui",
     ] {
         bin().args([sub, "--help"]).assert().success();

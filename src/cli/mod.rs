@@ -68,6 +68,9 @@ pub enum Command {
     /// Manage team notes (list, create, update, delete).
     #[command(name = "team-notes")]
     TeamNotes(TeamNotesArgs),
+    /// Create a new note and open it in the TUI editor.
+    #[command(visible_alias = "create")]
+    New(NewArgs),
     /// Launch the TUI (requires the `tui` feature at build time).
     Tui,
 }
@@ -97,6 +100,13 @@ pub struct ExportArgs {
 pub struct TeamsArgs {
     #[command(flatten)]
     pub output: OutputOpts,
+}
+
+#[derive(Debug, Args)]
+pub struct NewArgs {
+    /// Note title — quotes optional, words are joined with spaces.
+    #[arg(value_name = "TITLE")]
+    pub title: Vec<String>,
 }
 
 // ─── `notes` ────────────────────────────────────────────────────────────────
@@ -381,6 +391,7 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::New(a) => commands::tui::new_note(config_dir, endpoint, token, a.title).await,
         Command::Tui => commands::tui::run(config_dir, endpoint, token, cli.path).await,
     }
 }
