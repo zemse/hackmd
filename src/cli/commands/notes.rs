@@ -7,7 +7,7 @@ use crate::CachedResponse;
 use crate::cli::editor::open_in_editor;
 use crate::cli::output::{OutputOpts, print_table};
 use crate::error::{Error, Result};
-use crate::types::{CommentPermissionType, CreateNoteOptions, NotePermissionRole};
+use crate::types::{CreateNoteOptions, UpdateNoteOptions};
 
 const NOTES_LIST_COLUMNS: &[&str] = &["id", "title", "owner", "visibility", "lastChangedAt"];
 const NOTES_GET_COLUMNS: &[&str] = &[
@@ -51,44 +51,36 @@ pub async fn get(
     print_table(&[note], NOTES_GET_COLUMNS, opts)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn create(
     config_dir: Option<&Path>,
     cli_endpoint: Option<&str>,
     cli_token: Option<&str>,
-    title: Option<String>,
-    content: Option<String>,
-    read_permission: Option<NotePermissionRole>,
-    write_permission: Option<NotePermissionRole>,
-    comment_permission: Option<CommentPermissionType>,
+    mut payload: CreateNoteOptions,
     use_editor: bool,
     opts: &OutputOpts,
 ) -> Result<()> {
     let (client, _eff) = super::build_client(config_dir, cli_endpoint, cli_token)?;
+    payload.content = resolve_content(payload.content, use_editor)?;
+    let note = client.create_note(payload).await?;
+    print_table(&[note], NOTES_CREATE_COLUMNS, opts)
+}
 
-    // Content precedence: --editor > stdin (if piped) > --content.
-    let final_content = if use_editor {
-        Some(open_in_editor()?)
-    } else if !std::io::stdin().is_terminal() {
+/// Content precedence: `--editor` > stdin (if piped) > `--content`.
+/// Shared with `team-notes create`.
+pub(crate) fn resolve_content(content: Option<String>, use_editor: bool) -> Result<Option<String>> {
+    if use_editor {
+        return Ok(Some(open_in_editor()?));
+    }
+    if !std::io::stdin().is_terminal() {
         let mut buf = String::new();
         std::io::stdin()
             .read_to_string(&mut buf)
             .map_err(Error::Io)?;
-        if buf.is_empty() { content } else { Some(buf) }
-    } else {
-        content
-    };
-
-    let payload = CreateNoteOptions {
-        title,
-        content: final_content,
-        read_permission,
-        write_permission,
-        comment_permission,
-        ..Default::default()
-    };
-    let note = client.create_note(payload).await?;
-    print_table(&[note], NOTES_CREATE_COLUMNS, opts)
+        if !buf.is_empty() {
+            return Ok(Some(buf));
+        }
+    }
+    Ok(content)
 }
 
 pub async fn update(
@@ -96,10 +88,10 @@ pub async fn update(
     cli_endpoint: Option<&str>,
     cli_token: Option<&str>,
     note_id: &str,
-    content: Option<String>,
+    opts: UpdateNoteOptions,
 ) -> Result<()> {
     let (client, _eff) = super::build_client(config_dir, cli_endpoint, cli_token)?;
-    client.update_note_content(note_id, content).await?;
+    client.update_note(note_id, opts).await?;
     Ok(())
 }
 

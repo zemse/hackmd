@@ -39,7 +39,10 @@ fn top_level_help_lists_all_subcommands() {
         .stdout(predicate::str::contains("teams"))
         .stdout(predicate::str::contains("notes"))
         .stdout(predicate::str::contains("team-notes"))
+        .stdout(predicate::str::contains("folders"))
+        .stdout(predicate::str::contains("team-folders"))
         .stdout(predicate::str::contains("new"))
+        .stdout(predicate::str::contains("version"))
         .stdout(predicate::str::contains("tui"));
 }
 
@@ -54,7 +57,10 @@ fn each_subcommand_help_succeeds() {
         "teams",
         "notes",
         "team-notes",
+        "folders",
+        "team-folders",
         "new",
+        "version",
         "tui",
     ] {
         bin().args([sub, "--help"]).assert().success();
@@ -250,4 +256,350 @@ async fn tui_subcommand_explains_missing_feature() {
         .assert()
         .success()
         .stdout(predicate::str::contains("built without the `tui` feature"));
+}
+
+// ─── Original `hackmd-cli` compatibility ────────────────────────────────────
+
+fn note_json(id: &str, title: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "title": title,
+        "tags": [],
+        "lastChangedAt": "2024-01-01T00:00:00.000Z",
+        "createdAt": "2024-01-01T00:00:00.000Z",
+        "lastChangeUser": null,
+        "publishType": "view",
+        "publishedAt": null,
+        "userPath": "alice",
+        "teamPath": null,
+        "permalink": null,
+        "shortId": "s1",
+        "publishLink": format!("https://hackmd.io/{id}"),
+        "readPermission": "owner",
+        "writePermission": "owner"
+    })
+}
+
+fn args_with_server(server: &MockServer, dir: &TempDir, rest: &[&str]) -> Vec<String> {
+    let mut v = vec![
+        "--config-dir".to_string(),
+        dir.path().to_str().expect("path utf-8").to_string(),
+        "--endpoint".to_string(),
+        server.uri(),
+        "--token".to_string(),
+        "test-token".to_string(),
+    ];
+    v.extend(rest.iter().map(|s| s.to_string()));
+    v
+}
+
+/// `hackmd notes` with no subcommand lists, exactly like the original CLI.
+#[tokio::test]
+async fn bare_notes_lists_like_original_cli() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/notes"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([note_json("n1", "First note")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().expect("tmp");
+    bin()
+        .args(args_with_server(&server, &dir, &["notes"]))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("First note"));
+}
+
+/// `hackmd notes --noteId=<id>` (camelCase, no subcommand) fetches one note.
+#[tokio::test]
+async fn notes_with_camelcase_note_id_fetches_single_note() {
+    let server = MockServer::start().await;
+    let mut single = note_json("n1", "Solo note");
+    single["content"] = serde_json::json!("# Solo note");
+    Mock::given(method("GET"))
+        .and(path("/notes/n1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(single))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().expect("tmp");
+    bin()
+        .args(args_with_server(&server, &dir, &["notes", "--noteId=n1"]))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Solo note"));
+}
+
+/// `hackmd export --noteId=<id>` — camelCase alias on export.
+#[tokio::test]
+async fn export_accepts_camelcase_note_id() {
+    let server = MockServer::start().await;
+    let mut single = note_json("n9", "Exported");
+    single["content"] = serde_json::json!("# Exported body");
+    Mock::given(method("GET"))
+        .and(path("/notes/n9"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(single))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().expect("tmp");
+    bin()
+        .args(args_with_server(&server, &dir, &["export", "--noteId=n9"]))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("# Exported body"));
+}
+
+/// `notes create` passes tags and parentFolderId through to the API body.
+#[tokio::test]
+async fn notes_create_sends_tags_and_parent_folder() {
+    use wiremock::matchers::body_partial_json;
+    let server = MockServer::start().await;
+    let mut created = note_json("n2", "Tagged");
+    created["content"] = serde_json::json!("x");
+    Mock::given(method("POST"))
+        .and(path("/notes"))
+        .and(body_partial_json(serde_json::json!({
+            "tags": ["a", "b"],
+            "parentFolderId": "f-1"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(created))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().expect("tmp");
+    bin()
+        .args(args_with_server(
+            &server,
+            &dir,
+            &[
+                "notes",
+                "create",
+                "--title=Tagged",
+                "--content=x",
+                "--tags=a,b",
+                "--parentFolderId=f-1",
+            ],
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Tagged"));
+}
+
+/// `notes update` sends the full metadata PATCH the original CLI supports.
+#[tokio::test]
+async fn notes_update_sends_metadata_fields() {
+    use wiremock::matchers::body_partial_json;
+    let server = MockServer::start().await;
+    Mock::given(method("PATCH"))
+        .and(path("/notes/n1"))
+        .and(body_partial_json(serde_json::json!({
+            "readPermission": "owner",
+            "permalink": "my-link",
+            "tags": ["t1"]
+        })))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().expect("tmp");
+    bin()
+        .args(args_with_server(
+            &server,
+            &dir,
+            &[
+                "notes",
+                "update",
+                "--noteId=n1",
+                "--readPermission=owner",
+                "--permalink=my-link",
+                "--tags=t1",
+            ],
+        ))
+        .assert()
+        .success();
+}
+
+fn folder_json(id: &str, name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": id,
+        "name": name,
+        "description": "docs",
+        "icon": "1F600",
+        "color": "#4F46E5",
+        "parentFolderId": null,
+        "createdAt": 1700000000000_i64,
+        "updatedAt": 1700000001000_i64
+    })
+}
+
+#[tokio::test]
+async fn bare_folders_lists() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/folders"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([folder_json("f1", "engineering")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().expect("tmp");
+    bin()
+        .args(args_with_server(&server, &dir, &["folders"]))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("engineering"));
+}
+
+#[tokio::test]
+async fn folders_create_posts_body_and_prints_row() {
+    use wiremock::matchers::body_partial_json;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/folders"))
+        .and(body_partial_json(serde_json::json!({
+            "name": "docs",
+            "parentFolderId": "f-root"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(folder_json("f2", "docs")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().expect("tmp");
+    bin()
+        .args(args_with_server(
+            &server,
+            &dir,
+            &[
+                "folders",
+                "create",
+                "--name=docs",
+                "--parentFolderId=f-root",
+            ],
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("docs"));
+}
+
+#[tokio::test]
+async fn team_folders_lists_with_camelcase_team_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/teams/demo/folders"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([folder_json("f3", "team-docs")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().expect("tmp");
+    bin()
+        .args(args_with_server(
+            &server,
+            &dir,
+            &["team-folders", "--teamPath=demo"],
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("team-docs"));
+}
+
+#[tokio::test]
+async fn folders_order_prints_current_order_as_json() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/folders/folder-order"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"root": ["f1", "f2"]})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().expect("tmp");
+    bin()
+        .args(args_with_server(&server, &dir, &["folders", "order"]))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("root"))
+        .stdout(predicate::str::contains("f1"));
+}
+
+/// `team-notes --teamPath=<p>` with no subcommand lists, like the original.
+#[tokio::test]
+async fn bare_team_notes_lists_with_camelcase_team_path() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/teams/demo/notes"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([note_json("tn1", "Team note")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().expect("tmp");
+    bin()
+        .args(args_with_server(
+            &server,
+            &dir,
+            &["team-notes", "--teamPath=demo"],
+        ))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Team note"));
+}
+
+/// `--csv` is a shorthand for `--output=csv`, like oclif's table flag.
+#[tokio::test]
+async fn csv_flag_outputs_csv() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/notes"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!([note_json("n1", "CSV note")])),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let dir = TempDir::new().expect("tmp");
+    bin()
+        .args(args_with_server(&server, &dir, &["notes", "--csv"]))
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("id,title"))
+        .stdout(predicate::str::contains("n1,CSV note"));
+}
+
+#[test]
+fn version_subcommand_and_short_v_flag_work() {
+    bin()
+        .args(["version"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hackmd"));
+    bin()
+        .args(["-v"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("hackmd"));
 }

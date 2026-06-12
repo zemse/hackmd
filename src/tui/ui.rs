@@ -603,17 +603,27 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
     }
     f.render_widget(Paragraph::new(prev_lines), preview_area);
 
-    // Highlight the row in the preview that corresponds to the cursor's
-    // block, as a subtle reverse-video bar at the start of the row. Helps
-    // the user see where their cursor is in the rendered output.
+    // Mark the preview row that corresponds to the cursor's block. In the
+    // side-by-side layout we stamp the marker onto the center divider column
+    // (preview_area.x - 1) so it never steals the row's first glyph; in the
+    // vertical stack — which has no left divider beside the preview — we tint
+    // the row's background instead, again leaving every character visible.
     let cy_prev = preview_target as i32 - prev_scroll as i32;
-    if cy_prev >= 0 && (cy_prev as u16) < preview_area.height {
+    if cy_prev >= 0 && (cy_prev as u16) < preview_area.height && preview_area.width > 0 {
         let row = preview_area.y + cy_prev as u16;
         let buf = f.buffer_mut();
-        if preview_area.width > 0 {
-            let cell = &mut buf[(preview_area.x, row)];
-            cell.set_char('▎');
+        if horizontal {
+            // Use the heavy box-drawing vertical so it sits centered in the
+            // cell exactly like the `│` divider it replaces — just bolder and
+            // colored to flag the active row.
+            let cell = &mut buf[(preview_area.x - 1, row)];
+            cell.set_char('┃');
             cell.set_style(Style::default().fg(theme.heading[0]));
+        } else {
+            let wash = theme.code_bg.unwrap_or(theme.heading[0]);
+            for col in preview_area.x..preview_area.x + preview_area.width {
+                buf[(col, row)].set_bg(wash);
+            }
         }
     }
 

@@ -22,7 +22,10 @@ pub const ENV_CONFIG_DIR: &str = "HMD_CLI_CONFIG_DIR";
 
 /// On-disk representation of the CLI config (`~/.hackmd/config.json`).
 ///
-/// Mirrors the upstream Node CLI schema (camelCase wire keys).
+/// Mirrors the upstream Node CLI schema (camelCase wire keys). The file
+/// is shared with `@hackmd/hackmd-cli` — both CLIs read and write the
+/// same path, so `hackmd login` here is visible to the Node CLI and
+/// vice versa.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -36,6 +39,12 @@ pub struct Config {
     /// Stored access token (`accessToken` on the wire).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_token: Option<String>,
+    /// Any other keys found in the file. The upstream CLI rewrites the
+    /// whole JSON object on `login`/`logout`, preserving keys it doesn't
+    /// know — carrying them here makes our load→save round-trip do the
+    /// same instead of silently deleting them.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Resolve the config directory using the standard precedence.
@@ -174,6 +183,7 @@ mod tests {
         let cfg = Config {
             hackmd_api_endpoint_url: Some("https://example.test/v1".into()),
             access_token: Some("tok-xyz".into()),
+            extra: Default::default(),
         };
         cfg.save_to(dir.path()).expect("save");
         let back = Config::load_from(dir.path()).expect("load");
@@ -190,6 +200,7 @@ mod tests {
         let cfg = Config {
             hackmd_api_endpoint_url: Some("https://example.test/v1".into()),
             access_token: Some("tok".into()),
+            extra: Default::default(),
         };
         cfg.save_to(dir.path()).expect("save");
         let raw = std::fs::read_to_string(config_file_path(dir.path())).expect("read");
@@ -218,6 +229,7 @@ mod tests {
         let cfg = Config {
             hackmd_api_endpoint_url: Some("https://file.test/v1".into()),
             access_token: Some("file-token".into()),
+            extra: Default::default(),
         };
         cfg.save_to(dir.path()).expect("save");
 
@@ -246,5 +258,47 @@ mod tests {
         std::fs::write(config_file_path(dir.path()), "").expect("write empty");
         let cfg = Config::load_from(dir.path()).expect("load empty");
         assert!(cfg.access_token.is_none());
+    }
+
+    /// The Node CLI rewrites the whole config object on login/logout,
+    /// preserving keys it doesn't know. Ours must do the same so the two
+    /// CLIs can share `~/.hackmd/config.json` without clobbering each other.
+    #[test]
+    fn unknown_keys_survive_set_access_token() {
+        let dir = TempDir::new().expect("tmp");
+        std::fs::create_dir_all(dir.path()).expect("dir");
+        std::fs::write(
+            config_file_path(dir.path()),
+            r#"{"accessToken":"old","hackmdAPIEndpointURL":"https://x.test/v1","futureKey":{"nested":true}}"#,
+        )
+        .expect("write");
+
+        set_access_token(dir.path(), "new-token").expect("set");
+
+        let raw = std::fs::read_to_string(config_file_path(dir.path())).expect("read");
+        let v: serde_json::Value = serde_json::from_str(&raw).expect("json");
+        assert_eq!(v["accessToken"], "new-token");
+        assert_eq!(v["hackmdAPIEndpointURL"], "https://x.test/v1");
+        assert_eq!(v["futureKey"]["nested"], true, "unknown key dropped: {raw}");
+    }
+
+    /// A config written by `@hackmd/hackmd-cli` reads cleanly, including
+    /// its logout convention of `accessToken: ""` (treated as logged out).
+    #[test]
+    fn node_cli_written_config_interops() {
+        let dir = TempDir::new().expect("tmp");
+        std::fs::create_dir_all(dir.path()).expect("dir");
+        std::fs::write(
+            config_file_path(dir.path()),
+            "{\n  \"accessToken\": \"\",\n  \"hackmdAPIEndpointURL\": \"https://ee.test/v1\"\n}",
+        )
+        .expect("write");
+
+        let eff = effective(Some(dir.path()), None, None).expect("effective");
+        assert_eq!(eff.endpoint, "https://ee.test/v1");
+        assert!(
+            eff.token.is_none(),
+            "empty accessToken (Node CLI logout) must read as logged out"
+        );
     }
 }

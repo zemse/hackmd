@@ -91,35 +91,67 @@ hackmd whoami                                         # show the authenticated u
 hackmd history                                        # list browse history
 hackmd export --note-id <id>                          # dump raw markdown to stdout
 hackmd teams                                          # list teams
+hackmd version                                        # print version (also -v / --version)
 
+hackmd notes [--note-id <id>]                         # bare = list your notes; with an id = fetch one
 hackmd notes list                                     # list your notes
 hackmd notes get --note-id <id>                       # fetch a single note
 hackmd notes create [--title <t>] [--content <c>] \
+                    [--tags t1,t2] \
                     [--read-permission <r>] \
                     [--write-permission <w>] \
                     [--comment-permission <c>] \
+                    [--parent-folder-id <id>] \
                     [-e | --editor]                   # create a note (stdin or $EDITOR also accepted)
-hackmd notes update --note-id <id> --content <c>      # replace a note's content
+hackmd notes update --note-id <id> [--content <c>] \
+                    [--tags t1,t2] [--permalink <p>] \
+                    [--read-permission <r>] \
+                    [--write-permission <w>] \
+                    [--parent-folder-id <id>]         # update content and/or metadata
 hackmd notes delete --note-id <id>                    # delete a note
 
+hackmd team-notes --team-path <p>                     # bare = list the team's notes
 hackmd team-notes --team-path <p> list
 hackmd team-notes --team-path <p> create  ...         # same flags as `notes create`
-hackmd team-notes --team-path <p> update --note-id <id> --content <c>
+hackmd team-notes --team-path <p> update --note-id <id> ...  # same flags as `notes update`
 hackmd team-notes --team-path <p> delete --note-id <id>
+
+hackmd folders [--folder-id <id>]                     # bare = list folders; with an id = fetch one
+hackmd folders create [--name <n>] [--description <d>] \
+                      [--icon <i>] [--color <c>] \
+                      [--parent-folder-id <id>]
+hackmd folders update --folder-id <id> ...            # same metadata flags as create
+hackmd folders delete --folder-id <id>
+hackmd folders order [--order '{"root":["id",...]}']  # bare = print order JSON; with --order = replace it
+
+hackmd team-folders --team-path <p> ...               # same surface as `folders`, team-scoped
 
 hackmd new [TITLE...]                                 # create a note and open it in the TUI editor
                                                       # (alias: hackmd create; quotes around the title optional)
 hackmd [PATH]                                         # the TUI: cloud view bare, local browser/reader with a path
 ```
 
+### Drop-in compatibility with `@hackmd/hackmd-cli`
+
+Command lines written for the original [hackmd-cli](https://github.com/hackmdio/hackmd-cli) work unchanged — alias `hackmd-cli=hackmd` and existing scripts keep running:
+
+- every camelCase flag is accepted (`--noteId`, `--teamPath`, `--readPermission`, `--writePermission`, `--commentPermission`, `--parentFolderId`, `--folderId`), with the kebab-case spellings as this crate's preferred forms;
+- bare `notes` / `team-notes` / `folders` / `team-folders` list, and `--noteId` / `--folderId` without a subcommand fetches a single record, exactly like upstream;
+- the oclif table flags work: `--csv`, `-x`/`--extended`, `--no-header`, `--no-truncate`, `--filter key=value` (partial match), `--sort -column` (descending), and `--columns` matches header-style names case-insensitively (`--columns=ID,Title`);
+- **the config file is shared**: both CLIs read and write `~/.hackmd/config.json` with the same `accessToken` / `hackmdAPIEndpointURL` keys (and the same `HMD_*` env vars), so logging in with either CLI logs in the other, and unknown keys in the file are preserved on write.
+
+Not implemented: `autocomplete` (oclif-specific shell completion).
+
 Every list-style command accepts shared output flags:
 
 | flag | meaning |
 |---|---|
 | `--output {table\|json\|csv\|tsv\|yaml}` | output format — defaults to `table` on a terminal and `tsv` when stdout is piped, so scripts and LLM agents get parseable rows without any flag |
-| `--columns id,title,...` | project a subset of columns |
-| `--sort <column>` | sort rows by a column (string compare) |
-| `--filter key=value` | keep rows where `row[key] == value` |
+| `--csv` | shorthand for `--output csv` |
+| `--columns id,title,...` | project a subset of columns (names match case-insensitively, spaces ignored) |
+| `-x`, `--extended` | show every column of the records, not just the defaults |
+| `--sort <column>` | sort rows by a column (string compare; `-column` for descending) |
+| `--filter key=value` | keep rows where `row[key]` contains `value` |
 | `--no-header` | omit the header row |
 | `--no-truncate` | don't shrink wide cells to fit the terminal |
 

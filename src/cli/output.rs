@@ -37,13 +37,19 @@ pub struct OutputOpts {
     /// Output format [default: table on a terminal, tsv when piped]
     #[arg(long = "output", value_enum)]
     pub format: Option<Format>,
+    /// Shorthand for `--output csv`.
+    #[arg(long = "csv", default_value_t = false, conflicts_with = "format")]
+    pub csv: bool,
     /// Comma-separated subset of columns to show (e.g. `id,title`).
     #[arg(long = "columns")]
     pub columns: Option<String>,
-    /// Column to sort by (best-effort string sort).
+    /// Show every column of the records, not just the defaults.
+    #[arg(short = 'x', long = "extended", default_value_t = false)]
+    pub extended: bool,
+    /// Column to sort by (string sort; prepend `-` for descending).
     #[arg(long = "sort")]
     pub sort: Option<String>,
-    /// `key=value` filter — keep rows where `row[key] == value`.
+    /// `key=value` filter — keep rows where `row[key]` contains `value`.
     #[arg(long = "filter")]
     pub filter: Option<String>,
     /// Omit the table header row.
@@ -70,7 +76,9 @@ pub fn print_table<T: Serialize>(
     use std::io::IsTerminal;
     let mut opts = opts.clone();
     if opts.format.is_none() {
-        opts.format = Some(if std::io::stdout().is_terminal() {
+        opts.format = Some(if opts.csv {
+            Format::Csv
+        } else if std::io::stdout().is_terminal() {
             Format::Table
         } else {
             Format::Tsv
@@ -93,32 +101,67 @@ pub fn print_table_to<W: Write, T: Serialize>(
         other => vec![other],
     };
 
-    // Apply filter (naive `key=value` equality on JSON values).
+    // Apply filter — partial string matching, like oclif's `--filter`.
     if let Some(filt) = opts.filter.as_deref()
         && let Some((k, v)) = filt.split_once('=')
     {
         array.retain(|row| match row.get(k) {
-            Some(field) => json_field_to_string(field) == v,
+            Some(field) => json_field_to_string(field).contains(v),
             None => false,
         });
     }
 
-    // Apply sort (naive string-cmp).
+    // Apply sort (string-cmp; a `-` prefix sorts descending, like oclif).
     if let Some(key) = opts.sort.as_deref() {
+        let (key, descending) = match key.strip_prefix('-') {
+            Some(k) => (k, true),
+            None => (key, false),
+        };
         array.sort_by(|a, b| {
             let sa = a.get(key).map(json_field_to_string).unwrap_or_default();
             let sb = b.get(key).map(json_field_to_string).unwrap_or_default();
-            sa.cmp(&sb)
+            if descending { sb.cmp(&sa) } else { sa.cmp(&sb) }
         });
     }
 
-    // Compute the column list.
+    // Compute the column list. `--columns` names are matched against the
+    // row keys case-insensitively, ignoring spaces, so the header-style
+    // names the original CLI shows (`--columns=ID,Title`) work too.
+    // `--extended` appends every remaining row key after the defaults.
+    let row_keys: Vec<String> = array
+        .first()
+        .and_then(|row| row.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default();
     let columns: Vec<String> = match opts.columns.as_deref() {
-        Some(s) => s.split(',').map(|c| c.trim().to_string()).collect(),
-        None => default_columns.iter().map(|s| s.to_string()).collect(),
+        Some(s) => s
+            .split(',')
+            .map(|c| {
+                let c = c.trim();
+                row_keys
+                    .iter()
+                    .find(|k| normalize_column(k) == normalize_column(c))
+                    .cloned()
+                    .unwrap_or_else(|| c.to_string())
+            })
+            .collect(),
+        None => {
+            let mut cols: Vec<String> = default_columns.iter().map(|s| s.to_string()).collect();
+            if opts.extended {
+                for k in &row_keys {
+                    if !cols.contains(k) {
+                        cols.push(k.clone());
+                    }
+                }
+            }
+            cols
+        }
     };
 
-    match opts.format.unwrap_or_default() {
+    let format = opts
+        .format
+        .unwrap_or(if opts.csv { Format::Csv } else { Format::Table });
+    match format {
         Format::Json => {
             let projected = project(&array, &columns);
             let text = serde_json::to_string_pretty(&projected).map_err(Error::Json)?;
@@ -203,6 +246,15 @@ fn project(
             }
             m
         })
+        .collect()
+}
+
+/// Case- and space-insensitive form for `--columns` name matching
+/// (`User Path` / `userpath` / `userPath` all hit the `userPath` key).
+fn normalize_column(name: &str) -> String {
+    name.chars()
+        .filter(|c| !c.is_whitespace())
+        .map(|c| c.to_ascii_lowercase())
         .collect()
 }
 
@@ -379,5 +431,67 @@ mod tests {
         print_table_to(&mut buf, &rs, &["title"], &o).expect("ok");
         let text = String::from_utf8(buf).expect("utf8");
         assert!(text.contains("\"hello, world\""), "got: {text}");
+    }
+
+    #[test]
+    fn csv_shorthand_flag_selects_csv_format() {
+        let mut buf = Vec::new();
+        let mut o = opts();
+        o.csv = true; // no explicit --output
+        print_table_to(&mut buf, &rows(), &["id", "title"], &o).expect("ok");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(text.starts_with("id,title"), "got: {text}");
+    }
+
+    #[test]
+    fn extended_appends_remaining_columns_after_defaults() {
+        let mut buf = Vec::new();
+        let mut o = opts();
+        o.format = Some(Format::Csv);
+        o.extended = true;
+        print_table_to(&mut buf, &rows(), &["id"], &o).expect("ok");
+        let text = String::from_utf8(buf).expect("utf8");
+        // Default column first, then the rest of the record's keys.
+        assert!(text.starts_with("id,"), "got: {text}");
+        assert!(text.contains("title"));
+        assert!(text.contains("teamPath"));
+    }
+
+    #[test]
+    fn sort_dash_prefix_sorts_descending() {
+        let mut buf = Vec::new();
+        let mut o = opts();
+        o.format = Some(Format::Csv);
+        o.sort = Some("-title".into());
+        print_table_to(&mut buf, &rows(), &["id", "title"], &o).expect("ok");
+        let text = String::from_utf8(buf).expect("utf8");
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].starts_with("n2,Second"), "got: {text}");
+        assert!(lines[2].starts_with("n1,First"));
+    }
+
+    #[test]
+    fn columns_match_header_style_names_case_insensitively() {
+        let mut buf = Vec::new();
+        let mut o = opts();
+        o.format = Some(Format::Csv);
+        // oclif-style header names: spaces and case shouldn't matter.
+        o.columns = Some("ID,Team Path".into());
+        print_table_to(&mut buf, &rows(), &["id", "title"], &o).expect("ok");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(text.starts_with("id,teamPath"), "got: {text}");
+        assert!(text.contains("n2,demo"));
+    }
+
+    #[test]
+    fn filter_uses_partial_match() {
+        let mut buf = Vec::new();
+        let mut o = opts();
+        o.format = Some(Format::Csv);
+        o.filter = Some("title=Sec".into()); // partial, like oclif
+        print_table_to(&mut buf, &rows(), &["id", "title"], &o).expect("ok");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(text.contains("n2,Second"));
+        assert!(!text.contains("n1,First"));
     }
 }
