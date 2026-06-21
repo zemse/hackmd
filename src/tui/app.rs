@@ -1256,7 +1256,41 @@ impl App {
                     self.status = NO_TOKEN_HINT.into();
                 }
             }
-            None => self.prompt_push(path),
+            None => {
+                // First publish: infer the title from the document's first H1
+                // (`# Title`). Only fall back to the title prompt when the file
+                // has no H1 to take it from.
+                let clean = crate::tui::hackmd_meta::strip(&content);
+                match first_h1(&clean) {
+                    Some(title) => self.create_pushed_note(path, title),
+                    None => self.prompt_push(path),
+                }
+            }
+        }
+    }
+
+    /// Create a new HackMD note from a local file's content (block stripped),
+    /// linking the file on success via [`CreateIntent::PushedFrom`].
+    pub fn create_pushed_note(&mut self, path: PathBuf, title: String) {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = format!("read {}: {e}", path.display());
+                return;
+            }
+        };
+        let clean = crate::tui::hackmd_meta::strip(&content);
+        let opts = crate::types::CreateNoteOptions {
+            title: Some(title),
+            content: Some(clean),
+            ..Default::default()
+        };
+        if !self.cloud.request_create(
+            None,
+            opts,
+            crate::tui::cloud::CreateIntent::PushedFrom(path),
+        ) {
+            self.status = NO_TOKEN_HINT.into();
         }
     }
 
@@ -1437,25 +1471,7 @@ impl App {
                     self.status = "Cancelled — empty title".into();
                     return;
                 }
-                let content = match std::fs::read_to_string(&path) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        self.status = format!("read {}: {e}", path.display());
-                        return;
-                    }
-                };
-                let opts = crate::types::CreateNoteOptions {
-                    title: Some(title),
-                    content: Some(content),
-                    ..Default::default()
-                };
-                if !self.cloud.request_create(
-                    None,
-                    opts,
-                    crate::tui::cloud::CreateIntent::PushedFrom(path),
-                ) {
-                    self.status = NO_TOKEN_HINT.into();
-                }
+                self.create_pushed_note(path, title);
             }
             PromptKind::DownloadFilename { id } => {
                 let name = p.input.trim();
@@ -2674,6 +2690,36 @@ impl App {
             }
         }
     }
+}
+
+/// The text of the document's first level-1 ATX heading (`# Title`), if any.
+/// Used to title a note inferred from a local file. Skips a leading YAML
+/// front-matter block (`---` … `---`) so a `title:` key there doesn't shadow
+/// the heading scan. `## Sub` and deeper are ignored — only a true H1 counts.
+fn first_h1(content: &str) -> Option<String> {
+    let mut lines = content.lines().peekable();
+    // Skip YAML front matter if the very first line is `---`.
+    if lines.peek().map(|l| l.trim_end()) == Some("---") {
+        lines.next();
+        for l in lines.by_ref() {
+            if l.trim_end() == "---" {
+                break;
+            }
+        }
+    }
+    for line in lines {
+        let t = line.trim_start();
+        // H1 is `#` followed by whitespace then text; `##`+ is not an H1.
+        if let Some(rest) = t.strip_prefix('#') {
+            if rest.starts_with(char::is_whitespace) {
+                let title = rest.trim().trim_end_matches('#').trim();
+                if !title.is_empty() {
+                    return Some(title.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Filesystem-friendly slug of a note title for the download default:
@@ -5336,5 +5382,28 @@ mod cloud_msg_tests {
         assert_eq!(slugify("Meeting Notes 2024"), "meeting-notes-2024");
         assert_eq!(slugify("  --weird__ / title!  "), "weird-title");
         assert_eq!(slugify("???"), "note");
+    }
+
+    #[test]
+    fn first_h1_extracts_title_or_none() {
+        assert_eq!(first_h1("# Hello World\n\nbody").as_deref(), Some("Hello World"));
+        // Leading prose then an H1 still counts.
+        assert_eq!(
+            first_h1("intro line\n# Real Title\n").as_deref(),
+            Some("Real Title")
+        );
+        // `##` and deeper are not H1s.
+        assert_eq!(first_h1("## Sub\n### Deep\n").as_deref(), None);
+        // Closed ATX (`# Title #`) trims the trailing hashes.
+        assert_eq!(first_h1("# Title #\n").as_deref(), Some("Title"));
+        // YAML front matter is skipped so its `title:` doesn't shadow the H1.
+        assert_eq!(
+            first_h1("---\ntitle: Front\n---\n# Body Heading\n").as_deref(),
+            Some("Body Heading")
+        );
+        // No heading at all.
+        assert_eq!(first_h1("just text\nmore text\n"), None);
+        // `#nospace` is not a heading.
+        assert_eq!(first_h1("#nospace\n"), None);
     }
 }
