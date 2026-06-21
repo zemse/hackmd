@@ -31,6 +31,14 @@
 //! With `default-features = false` you get a pure async SDK with no clap /
 //! comfy-table / ratatui / etc. dependencies pulled into the binary.
 
+/// Attribution footer this tool adds once to a note's content when it creates
+/// the note (`hackmd new`) or first publishes a local file to HackMD. It's
+/// ordinary markdown — it lives in the note body on hackmd.io (unlike the
+/// local-only `<!-- hackmd … -->` link block), and once added it's just
+/// content the user can edit or remove.
+pub(crate) const TUI_FOOTER: &str =
+    "*Written in the terminal with [hackmd TUI](https://github.com/zemse/hackmd)*";
+
 pub mod api;
 #[cfg(feature = "cli")]
 pub mod cli;

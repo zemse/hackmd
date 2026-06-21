@@ -74,10 +74,6 @@ pub async fn run(
     Ok(())
 }
 
-/// Footer appended to notes started with `hackmd new`.
-const NEW_NOTE_FOOTER: &str =
-    "*Written in the terminal with [hackmd TUI](https://github.com/zemse/hackmd)*";
-
 /// `hackmd new [TITLE…]` — create a cloud note pre-filled with a title
 /// heading and footer, then open it straight in the TUI split editor.
 pub async fn new_note(
@@ -92,7 +88,7 @@ pub async fn new_note(
     let title = if title.is_empty() { "New note" } else { title };
     // Blank body line between the heading and the footer rule — the editor
     // opens with the cursor there (see `App::open_created_note`).
-    let content = format!("# {title}\n\n\n\n---\n\n{NEW_NOTE_FOOTER}\n");
+    let content = format!("# {title}\n\n\n\n---\n\n{}\n", crate::TUI_FOOTER);
     let note = client
         .create_note(crate::types::CreateNoteOptions {
             title: Some(title.to_string()),

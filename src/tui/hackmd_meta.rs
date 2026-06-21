@@ -1,11 +1,12 @@
 //! Local ↔ HackMD link bookkeeping embedded in a markdown file.
 //!
 //! When a local file is published to HackMD we stamp a small HTML comment at
-//! the very top of the file recording the note's id and links. HTML comments
+//! the bottom of the file recording the note's id and links. HTML comments
 //! are invisible in rendered markdown (HackMD's own preview, GitHub, this
 //! TUI's reader), so the block is unobtrusive, but it lets a later "publish"
 //! recognise the file as already-linked and *update* the existing note instead
-//! of creating a duplicate.
+//! of creating a duplicate. (Blocks left at the top by older versions are
+//! still recognised and migrate to the bottom on the next write.)
 //!
 //! Format (key: value lines bounded by an opening tag and `-->`):
 //!
@@ -46,7 +47,9 @@ impl HackmdMeta {
 
 /// Locate the managed block in `content`, returning the inclusive
 /// `(start_byte, end_byte)` range of the lines it spans (start at the `<!--`
-/// line, end just past the `-->` line's newline). `None` if absent.
+/// line, end just past the `-->` line's newline). `None` if absent. The block
+/// may sit anywhere (it lives at the bottom now, but older files put it at the
+/// top); the first `<!-- hackmd`…`-->` pair wins.
 fn block_span(content: &str) -> Option<(usize, usize)> {
     let mut offset = 0usize;
     let mut start: Option<usize> = None;
@@ -56,11 +59,6 @@ fn block_span(content: &str) -> Option<(usize, usize)> {
             None => {
                 if trimmed == OPEN_MARKER {
                     start = Some(offset);
-                } else if !trimmed.is_empty() {
-                    // The block, if present, must be the first non-blank
-                    // content. A non-blank line that isn't the marker means
-                    // there's no (leading) block to manage.
-                    return None;
                 }
             }
             Some(s) => {
@@ -125,41 +123,61 @@ pub fn block(meta: &HackmdMeta, synced: &str) -> String {
     s
 }
 
-/// Content with the managed block removed (and any single blank line that
-/// followed it), leaving the user's actual document. If no block is present
-/// the input is returned unchanged.
+/// The user's document with the managed block (and its surrounding blank-line
+/// separators) removed, normalised to end in a single newline. If no block is
+/// present the input is returned unchanged.
 pub fn strip(content: &str) -> String {
-    let Some((start, mut end)) = block_span(content) else {
+    let Some((start, end)) = block_span(content) else {
         return content.to_string();
     };
-    // Swallow one blank separator line after the block so repeated
-    // strip/insert cycles don't accumulate blank lines.
-    let rest = &content[end..];
-    if let Some(nl) = rest.find('\n') {
-        if rest[..nl].trim().is_empty() {
-            end += nl + 1;
-        }
-    } else if rest.trim().is_empty() {
-        end = content.len();
-    }
+    // Text before the block, with the blank-line separator we insert before it
+    // trimmed off.
+    let head = content[..start].trim_end_matches(['\n', '\r', ' ', '\t']);
+    // Any real text after the block (rare — the block sits at the bottom), with
+    // leading blank lines trimmed.
+    let tail = content[end..].trim_start_matches(['\n', '\r']);
     let mut out = String::with_capacity(content.len());
-    out.push_str(&content[..start]);
-    out.push_str(&content[end..]);
+    if !head.is_empty() {
+        out.push_str(head);
+        out.push('\n');
+    }
+    if !tail.is_empty() {
+        out.push_str(tail);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
     out
 }
 
-/// Insert or replace the managed block at the top of `content`, returning the
-/// updated document. The user's text (everything after any existing block) is
-/// preserved verbatim, separated from the block by one blank line.
+/// Insert or replace the managed block at the *bottom* of `content`, returning
+/// the updated document. The user's text is preserved above it, separated by
+/// one blank line.
 pub fn upsert(content: &str, meta: &HackmdMeta, synced: &str) -> String {
     let body = strip(content);
     let block = block(meta, synced);
     if body.trim().is_empty() {
-        // Brand-new / empty file: block plus a trailing newline.
         format!("{block}\n")
     } else {
-        format!("{block}\n\n{body}")
+        // `body` ends with a single newline; one more gives the blank-line
+        // separator before the block.
+        format!("{body}\n{block}\n")
     }
+}
+
+/// Ensure the attribution footer ([`crate::TUI_FOOTER`]) is present in `body`,
+/// appending it (after a `---` rule) when missing. Idempotent — once added,
+/// the footer is plain content the user may edit or delete, and it won't be
+/// re-added on later syncs. Used only at first publish, mirroring `hackmd new`.
+pub fn ensure_footer(body: &str) -> String {
+    if body.contains(crate::TUI_FOOTER) {
+        return body.to_string();
+    }
+    let core = body.trim_end_matches(['\n', '\r', ' ', '\t']);
+    if core.is_empty() {
+        return format!("{}\n", crate::TUI_FOOTER);
+    }
+    format!("{core}\n\n---\n\n{}\n", crate::TUI_FOOTER)
 }
 
 #[cfg(test)]
@@ -176,11 +194,12 @@ mod tests {
     }
 
     #[test]
-    fn upsert_then_parse_roundtrips() {
+    fn upsert_puts_block_at_bottom_and_parse_roundtrips() {
         let doc = "# Title\n\nbody text\n";
         let stamped = upsert(doc, &meta(), "2026-06-21T00:00:00Z");
-        // The original body survives untouched after the block.
-        assert!(stamped.ends_with("# Title\n\nbody text\n"));
+        // The body comes first; the block is appended at the bottom.
+        assert!(stamped.starts_with("# Title\n\nbody text\n"));
+        assert!(stamped.trim_end().ends_with("-->"));
         let parsed = parse(&stamped).expect("block parses");
         assert_eq!(parsed, meta());
     }
@@ -192,21 +211,44 @@ mod tests {
         let twice = upsert(&once, &meta(), "t2");
         // Exactly one opening marker after a re-stamp.
         assert_eq!(twice.matches(OPEN_MARKER).count(), 1);
-        // Body preserved.
-        assert!(twice.ends_with("hello\n"));
+        // Body preserved at the top.
+        assert!(twice.starts_with("hello\n"));
     }
 
     #[test]
-    fn strip_removes_block_and_separator() {
+    fn strip_removes_bottom_block_and_separator() {
         let stamped = upsert("real content\n", &meta(), "t");
         assert_eq!(strip(&stamped), "real content\n");
     }
 
     #[test]
-    fn parse_none_when_no_block() {
+    fn strip_then_upsert_round_trips_body() {
+        // The base/local comparison the sync relies on: strip(upsert(x)) == x
+        // for a body that already ends in a single newline.
+        let body = "# Doc\n\nsome text\n";
+        let stamped = upsert(body, &meta(), "t");
+        assert_eq!(strip(&stamped), body);
+    }
+
+    #[test]
+    fn parse_finds_block_anywhere() {
         assert!(parse("# Just a doc\n").is_none());
-        // A block not at the very top isn't ours to manage.
-        assert!(parse("text\n<!-- hackmd\nid: x\n-->\n").is_none());
+        // A block at the bottom (the new placement) is recognised.
+        assert!(parse("text\n\n<!-- hackmd\nid: x\n-->\n").is_some());
+        // As is one left at the top by an older version.
+        assert!(parse("<!-- hackmd\nid: y\n-->\n\ntext\n").is_some());
+    }
+
+    #[test]
+    fn ensure_footer_appends_once() {
+        let body = "# Doc\n\ntext\n";
+        let with = ensure_footer(body);
+        assert!(with.contains(crate::TUI_FOOTER));
+        assert!(with.contains("\n---\n"));
+        // Idempotent: a second call doesn't add a second footer.
+        let again = ensure_footer(&with);
+        assert_eq!(again, with);
+        assert_eq!(again.matches(crate::TUI_FOOTER).count(), 1);
     }
 
     #[test]

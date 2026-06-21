@@ -1045,17 +1045,24 @@ impl App {
                                     .map(|n| n.publish_link.clone())
                                     .unwrap_or_default(),
                             };
-                            self.stamp_local_file(&path, &meta);
-                            // Seed the sync base with the content we just
-                            // pushed (== the note's content), so future syncs
-                            // have a correct common ancestor from the start.
-                            let base = self
+                            // Rewrite the local file to exactly the pushed
+                            // content (which now carries the footer) plus the
+                            // link block at the bottom, so local and upstream
+                            // match from the start and the file gains the
+                            // footer too. Falls back to a plain re-stamp if the
+                            // cloud copy isn't cached for some reason.
+                            let pushed = self
                                 .cloud
                                 .note_cache
                                 .get(&id)
-                                .map(|c| c.note.content.clone())
-                                .unwrap_or_default();
-                            let _ = crate::tui::sync::write_base(&self.root, &id, &base);
+                                .map(|c| c.note.content.clone());
+                            match pushed {
+                                Some(body) => {
+                                    self.write_synced_local(&path, &meta, &body);
+                                    let _ = crate::tui::sync::write_base(&self.root, &id, &body);
+                                }
+                                None => self.stamp_local_file(&path, &meta),
+                            }
                             self.status = format!("Pushed {name} → \"{title}\" (linked)");
                         }
                     }
@@ -1459,10 +1466,13 @@ impl App {
                 return;
             }
         };
+        // First publish gets the attribution footer (once), mirroring
+        // `hackmd new`. After this it's plain content the user can edit.
         let clean = crate::tui::hackmd_meta::strip(&content);
+        let body = crate::tui::hackmd_meta::ensure_footer(&clean);
         let opts = crate::types::CreateNoteOptions {
             title: Some(title),
-            content: Some(clean),
+            content: Some(body),
             ..Default::default()
         };
         if !self.cloud.request_create(
