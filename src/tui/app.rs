@@ -56,6 +56,11 @@ pub struct App {
     /// recorded by the renderer so a click on it can copy the (untruncated)
     /// URL to the clipboard.
     pub statusline_url_hit: Option<(u16, u16, String)>,
+    /// Column range and publish link of the HackMD status badge shown on the
+    /// statusline right (just left of the scroll indicator), recorded by the
+    /// renderer so a click on it copies the note's publish link. `None` when
+    /// the current doc isn't linked to HackMD or has no link to copy.
+    pub statusline_badge_hit: Option<(u16, u16, String)>,
     /// The file path on the statusline left, recorded by the renderer:
     /// `(start_col, end_col, displayed text, full path to copy)`. A click on
     /// it copies the full path; a drag selects part of the displayed text.
@@ -315,6 +320,28 @@ pub struct CloudTarget {
     /// Empty when targeting a browser row (rows don't carry the link); the
     /// reader origin always has it.
     pub publish_link: String,
+}
+
+/// Visibility/sync state of the HackMD note the open reader is linked to,
+/// surfaced as a status-line badge. `None` for docs not on HackMD.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum HackmdBadgeKind {
+    /// A cloud sync is in flight for this note.
+    Syncing,
+    /// Readable by anyone with the link (`read_permission == Guest`).
+    Public,
+    /// Owner-only / signed-in-only — not publicly readable.
+    Private,
+    /// Linked to a note whose live permission we haven't fetched yet.
+    Unknown,
+}
+
+pub struct HackmdBadge {
+    pub kind: HackmdBadgeKind,
+    /// Short label, e.g. "Public", "Private (only me)", "Syncing".
+    pub label: String,
+    /// Publish link to copy when the badge is clicked (may be empty).
+    pub link: String,
 }
 
 pub enum View {
@@ -784,6 +811,7 @@ impl App {
             back_button_hit: None,
             cloud_tab_hits: Vec::new(),
             statusline_url_hit: None,
+            statusline_badge_hit: None,
             statusline_path_hit: None,
             statusline_path_drag: None,
             count_prefix: None,
@@ -1070,7 +1098,20 @@ impl App {
                                 }
                                 None => self.stamp_local_file(&path, &meta),
                             }
-                            self.status = format!("Pushed {name} → \"{title}\" (linked)");
+                            // Copy the note's link so the user can paste it
+                            // right after publishing. Prefer the publish link;
+                            // fall back to the editor URL when not yet known.
+                            let link = if meta.publish_link.is_empty() {
+                                meta.url.clone()
+                            } else {
+                                meta.publish_link.clone()
+                            };
+                            self.status = if link.is_empty() {
+                                format!("Pushed {name} → \"{title}\" (linked)")
+                            } else {
+                                crate::tui::events::copy_to_clipboard(&link);
+                                format!("Pushed {name} → \"{title}\" (linked) · link copied")
+                            };
                         }
                     }
                 }
@@ -1397,6 +1438,64 @@ impl App {
             },
             View::Browser(_) => None,
         }
+    }
+
+    /// HackMD status badge for the doc open in the reader, or `None` when the
+    /// doc isn't linked to HackMD. Covers both cloud notes (live permission
+    /// from the origin) and local files carrying a `<!-- hackmd … -->` block
+    /// (permission looked up in the note cache when available). A cloud sync
+    /// in flight takes precedence and shows as `Syncing`.
+    pub fn hackmd_badge(&self) -> Option<HackmdBadge> {
+        let View::Reader(r) = &self.view else {
+            return None;
+        };
+        // Resolve (live read permission, is-team, publish link) for the doc.
+        let (perm, team, link): (Option<crate::types::NotePermissionRole>, bool, String) =
+            match &r.origin {
+                ReaderOrigin::CloudNote {
+                    read_permission,
+                    team_path,
+                    publish_link,
+                    ..
+                } => (
+                    Some(*read_permission),
+                    team_path.is_some(),
+                    publish_link.clone(),
+                ),
+                ReaderOrigin::File(_) => {
+                    let meta = crate::tui::hackmd_meta::parse(&r.raw)?;
+                    let cached = self.cloud.note_cache.get(&meta.id).map(|c| &c.note);
+                    let team = meta.team_path.is_some()
+                        || cached.map(|n| n.team_path.is_some()).unwrap_or(false);
+                    (cached.map(|n| n.read_permission), team, meta.publish_link)
+                }
+                ReaderOrigin::Stdin => return None,
+            };
+        if self.cloud.pending > 0 {
+            return Some(HackmdBadge {
+                kind: HackmdBadgeKind::Syncing,
+                label: "Syncing".into(),
+                link,
+            });
+        }
+        let (kind, label) = match perm {
+            None => (HackmdBadgeKind::Unknown, "On HackMD".to_string()),
+            Some(crate::types::NotePermissionRole::Guest) => {
+                (HackmdBadgeKind::Public, "Public".to_string())
+            }
+            Some(crate::types::NotePermissionRole::SignedIn) => {
+                (HackmdBadgeKind::Private, "Private (signed-in)".to_string())
+            }
+            Some(crate::types::NotePermissionRole::Owner) => (
+                HackmdBadgeKind::Private,
+                if team {
+                    "Private (team)".to_string()
+                } else {
+                    "Private (only me)".to_string()
+                },
+            ),
+        };
+        Some(HackmdBadge { kind, label, link })
     }
 
     /// `n` in the cloud browser: prompt for a new note's title.

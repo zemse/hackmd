@@ -1303,9 +1303,29 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
     // Resolve middle content + classify the mode (search / hover / hint).
     let middle = compute_middle(app);
 
-    // Right span: scroll %.
-    let right = Span::styled(format!(" {} ", scroll_pos), bg);
-    let right_w = UnicodeWidthStr::width(right.content.as_ref());
+    // Right side: an optional HackMD status badge, then the scroll indicator.
+    let scroll_span = Span::styled(format!(" {} ", scroll_pos), bg);
+    let scroll_w = UnicodeWidthStr::width(scroll_span.content.as_ref());
+    let badge = app.hackmd_badge();
+    let badge_span: Option<Span> = badge.as_ref().map(|b| {
+        let (sym, style) = match b.kind {
+            crate::tui::app::HackmdBadgeKind::Public => (
+                "●",
+                Style::default()
+                    .fg(theme.heading[3])
+                    .add_modifier(Modifier::BOLD),
+            ),
+            crate::tui::app::HackmdBadgeKind::Private => ("○", Style::default().fg(theme.muted)),
+            crate::tui::app::HackmdBadgeKind::Syncing => ("⟳", Style::default().fg(theme.link)),
+            crate::tui::app::HackmdBadgeKind::Unknown => ("·", Style::default().fg(theme.muted)),
+        };
+        Span::styled(format!(" {sym} {} ", b.label), style)
+    });
+    let badge_w = badge_span
+        .as_ref()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .unwrap_or(0);
+    let right_w = scroll_w + badge_w;
 
     // Left span: edit-mode badge (if editing) OR optional back button +
     // path. The edit badge takes precedence over Back so the user always
@@ -1313,6 +1333,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
     let mut back_span: Option<Span> = None;
     app.back_button_hit = None;
     app.statusline_url_hit = None;
+    app.statusline_badge_hit = None;
     app.statusline_path_hit = None;
     let edit_badge: Option<Span> = if let View::Reader(r) = &app.view {
         r.edit.as_ref().map(|e| {
@@ -1391,7 +1412,10 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
             line_spans.push(Span::raw(" ".repeat(total_w.saturating_sub(used))));
             url_hit_region = url_hit(&line_spans, mid_w);
             line_spans.push(mid_styled);
-            line_spans.push(right);
+            if let Some(b) = badge_span.clone() {
+                line_spans.push(b);
+            }
+            line_spans.push(scroll_span.clone());
         }
         EdgeSwap::Left => {
             // URL takes the left of the row, suppressing the path.
@@ -1405,7 +1429,10 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
             line_spans.push(mid_styled);
             let used = span_width(&line_spans) + right_w;
             line_spans.push(Span::raw(" ".repeat(total_w.saturating_sub(used))));
-            line_spans.push(right);
+            if let Some(b) = badge_span.clone() {
+                line_spans.push(b);
+            }
+            line_spans.push(scroll_span.clone());
         }
         EdgeSwap::None => {
             // Default layout: [back] [path]   <middle>   <right>
@@ -1424,10 +1451,21 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
             }
             let used = span_width(&line_spans) + right_w;
             line_spans.push(Span::raw(" ".repeat(total_w.saturating_sub(used))));
-            line_spans.push(right);
+            if let Some(b) = badge_span.clone() {
+                line_spans.push(b);
+            }
+            line_spans.push(scroll_span.clone());
         }
     }
     app.statusline_url_hit = url_hit_region;
+    // The right group sits flush-right in every layout, so the badge occupies
+    // the columns `[total_w - right_w, total_w - scroll_w)`. Only register a hit
+    // when there's a link to copy.
+    app.statusline_badge_hit = badge.as_ref().filter(|b| !b.link.is_empty()).map(|b| {
+        let sx = area.x + total_w.saturating_sub(right_w) as u16;
+        let ex = area.x + total_w.saturating_sub(scroll_w) as u16;
+        (sx, ex, b.link.clone())
+    });
     if let (Some((ps, pe)), Some(full)) = (path_cols, full_path) {
         let start = area.x + ps as u16;
         let end = (area.x + pe as u16).min(area.x + area.width);

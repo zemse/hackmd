@@ -1596,6 +1596,14 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
                 return Ok(());
             }
         }
+        // Click the HackMD status badge → copy the note's publish link.
+        if let Some((sx, ex, link)) = app.statusline_badge_hit.clone() {
+            if m.column >= sx && m.column < ex {
+                copy_to_clipboard(&link);
+                app.status = format!("Copied: {}", link);
+                return Ok(());
+            }
+        }
         // Mouse-down on the path arms a drag; mouse-up decides whether it was
         // a click (copy the full path) or a drag (copy the selected slice).
         if let Some((sx, ex)) = app.statusline_path_hit.as_ref().map(|h| (h.0, h.1)) {
@@ -2102,7 +2110,7 @@ fn col_slice(s: &str, from: usize, to: usize) -> String {
     out
 }
 
-fn copy_to_clipboard(text: &str) {
+pub(crate) fn copy_to_clipboard(text: &str) {
     #[cfg(target_os = "macos")]
     {
         use std::io::Write;
