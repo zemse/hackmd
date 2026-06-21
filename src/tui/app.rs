@@ -1499,9 +1499,15 @@ impl App {
         // `hackmd new`. After this it's plain content the user can edit.
         let clean = crate::tui::hackmd_meta::strip(&content);
         let body = crate::tui::hackmd_meta::ensure_footer(&clean);
+        // Default a freshly-published note to "anyone with link" rather than
+        // HackMD's owner-only default: guest read so the link works without a
+        // login, everyone may comment, but write stays owner-only.
         let opts = crate::types::CreateNoteOptions {
             title: Some(title),
             content: Some(body),
+            read_permission: Some(crate::types::NotePermissionRole::Guest),
+            write_permission: Some(crate::types::NotePermissionRole::Owner),
+            comment_permission: Some(crate::types::CommentPermissionType::Everyone),
             ..Default::default()
         };
         if !self.cloud.request_create(
