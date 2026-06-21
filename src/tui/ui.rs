@@ -1609,10 +1609,10 @@ fn default_hint(app: &App) -> String {
             ReaderOrigin::CloudNote { .. } => {
                 "j/k:scroll  /:find  t:toc  e:edit  y:link  ?:help  q:quit".into()
             }
-            _ => "j/k:scroll  /:find  t:toc  e:edit  Tab:links  ?:help  q:quit".into(),
+            _ => "j/k:scroll  /:find  e:edit  U:publish  Tab:links  ?:help  q:quit".into(),
         },
         View::Browser(_) => {
-            "j/k  Enter:open  n:new  c:rename  f:find  H:hackmd  ?:help  q:quit".into()
+            "j/k  Enter:open  n:new  U:publish  c:rename  f:find  H:hackmd  ?:help".into()
         }
         View::Cloud(c) => {
             if c.show_tab_bar() {
