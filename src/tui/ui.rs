@@ -247,6 +247,21 @@ fn draw_lookup(f: &mut Frame, app: &mut App) {
         l.rect = popup;
     }
 
+    // Highlight the looked-up word in the document (reverse video, matching the
+    // drag-selection style) so it's clear which word the popover is defining.
+    // The anchor is absolute screen cells; the document can't scroll while the
+    // popover is open (a scroll dismisses it), so it stays accurate.
+    {
+        let x_end = anchor_col.saturating_add(anchor_w).min(area.x + area.width);
+        if anchor_row >= area.y && anchor_row < area.y + area.height {
+            let buf = f.buffer_mut();
+            for cx in anchor_col.max(area.x)..x_end {
+                let cell = &mut buf[(cx, anchor_row)];
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
+
     let scrolled = body.len() > inner_h;
     let title = if scrolled {
         format!(" {word} ↕ ")
