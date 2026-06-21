@@ -39,6 +39,18 @@ pub fn write_base(root: &Path, id: &str, content: &str) -> std::io::Result<()> {
     std::fs::write(path, content)
 }
 
+/// Normalise line endings to `\n`. HackMD may return `\r\n` while the local
+/// file is `\n`; [`merge3`] compares exact strings, so without this every line
+/// would read as changed and a first sync would explode into a whole-file
+/// conflict. Cheap no-op when there's no `\r`.
+pub fn normalize_newlines(s: &str) -> String {
+    if s.contains('\r') {
+        s.replace("\r\n", "\n")
+    } else {
+        s.to_string()
+    }
+}
+
 /// One piece of a (possibly conflicted) merged document, in document order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Segment {
@@ -181,6 +193,23 @@ mod tests {
             .expect("a conflict segment");
         assert!(conflict.0.contains("local change"));
         assert!(conflict.1.contains("remote change"));
+    }
+
+    #[test]
+    fn crlf_remote_against_lf_local_merges_clean() {
+        // The bug: HackMD returns `\r\n`, the local file is `\n`. Without
+        // normalisation every line differs and the same content conflicts.
+        let local = "line one\nline two\n";
+        let remote_crlf = "line one\r\nline two\r\n";
+        // Raw, the two are unequal and a no-base merge would conflict.
+        assert_ne!(local, remote_crlf);
+        let local_n = normalize_newlines(local);
+        let remote_n = normalize_newlines(remote_crlf);
+        assert_eq!(local_n, remote_n);
+        assert_eq!(
+            merge3("", &local_n, &remote_n),
+            MergeOutcome::Clean(local.into())
+        );
     }
 
     #[test]

@@ -43,6 +43,19 @@ Needs a human terminal; headless PTY smoke check already passed.
 - [ ] No token: `H` shows the login instruction, app stays usable locally
 - [ ] `cargo run --features tui -- tui` opens the cloud view via the `hackmd` bin
 
+## Sync hardening — remaining edge cases (from a code review)
+
+The high-impact sync bugs are fixed (cloud-edit no longer reverts a linked
+file; a hand-written `<!-- hackmd-sync` marker is no longer eaten; a corrupted
+link block warns instead of duplicating; a team note recovers its `team:` from
+cache; CRLF remote no longer spuriously conflicts; skipped pushes report
+"deferred" rather than "synced"). These narrower ones are left:
+
+- [ ] Two local files linked to the same note id share one base (`<root>/.hackmd/<id>.base` is keyed by id, not path) — a second linked copy can clobber the first's base. Would need per-(id,path) base keying.
+- [ ] First-publish and conflict-resolve write a snapshot captured a moment earlier; an external on-disk edit in that sub-second window is lost. Narrow race; would need a re-read + recheck before the write.
+- [ ] Missing base cache (`.hackmd/<id>.base` deleted) turns any local≠remote difference into a whole-file conflict. Equal sides already merge clean and rebuild the base; only the genuinely-diverged case is noisy. A "no base" path could offer take-local / take-remote instead of a giant conflict.
+- [ ] `parse_conflicts` keys conflict markers off `starts_with(repeat(7))`, so a user line beginning with 7+ `<`/`=`/`>`/`|` chars could be misread as a marker. Exotic; would need fenced-code / exact-marker awareness.
+
 ## HackMD comments (API gap)
 
 The v1 REST API has no comment/reaction endpoints — see `RESEARCH.md` and

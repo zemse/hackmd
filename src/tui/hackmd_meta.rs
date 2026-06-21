@@ -11,7 +11,7 @@
 //! Format (key: value lines bounded by an opening tag and `-->`):
 //!
 //! ```text
-//! <!-- hackmd
+//! <!-- hackmd-sync
 //! id: AbCdEf123
 //! url: https://hackmd.io/AbCdEf123
 //! publish: https://hackmd.io/s/xyz
@@ -22,11 +22,19 @@
 //!
 //! `team` is omitted for personal notes. Parsing is line-oriented and
 //! tolerant: unknown keys are ignored and the block is matched by its opening
-//! `<!-- hackmd` marker, so hand-edited whitespace doesn't break round-trips.
+//! `<!-- hackmd-sync` marker, so hand-edited whitespace doesn't break
+//! round-trips. The marker is deliberately specific (not a bare `<!-- hackmd`)
+//! so a comment a user writes by hand is far less likely to collide, and a
+//! block is only ever *removed* when it parses to valid link metadata (see
+//! [`strip`]) — a stray marker with no `id:` is left untouched, never eaten.
 
 /// The opening marker for the managed block. A line whose trimmed content
 /// equals this starts the block; the next `-->` line closes it.
-const OPEN_MARKER: &str = "<!-- hackmd";
+const OPEN_MARKER: &str = "<!-- hackmd-sync";
+/// Earlier releases stamped a bare `<!-- hackmd` marker. Still recognised on
+/// read so already-linked files aren't orphaned (and re-create duplicates);
+/// they migrate to [`OPEN_MARKER`] on the next write.
+const LEGACY_OPEN_MARKER: &str = "<!-- hackmd";
 const CLOSE_MARKER: &str = "-->";
 
 /// Parsed link metadata for a published note.
@@ -51,13 +59,14 @@ impl HackmdMeta {
 /// may sit anywhere (it lives at the bottom now, but older files put it at the
 /// top); the first `<!-- hackmd`…`-->` pair wins.
 fn block_span(content: &str) -> Option<(usize, usize)> {
+    let is_open = |trimmed: &str| trimmed == OPEN_MARKER || trimmed == LEGACY_OPEN_MARKER;
     let mut offset = 0usize;
     let mut start: Option<usize> = None;
     for line in content.split_inclusive('\n') {
         let trimmed = line.trim();
         match start {
             None => {
-                if trimmed == OPEN_MARKER {
+                if is_open(trimmed) {
                     start = Some(offset);
                 }
             }
@@ -104,6 +113,14 @@ pub fn parse(content: &str) -> Option<HackmdMeta> {
     })
 }
 
+/// True if `content` carries a managed-block marker, whether or not it parses.
+/// Lets a caller tell a corrupted link block (e.g. the `id:` line was deleted)
+/// apart from a genuinely unlinked file, so it can warn instead of creating a
+/// duplicate note.
+pub fn has_block(content: &str) -> bool {
+    block_span(content).is_some()
+}
+
 /// Render the managed block (without a trailing blank line). `synced` is an
 /// already-formatted timestamp string (e.g. RFC 3339).
 pub fn block(meta: &HackmdMeta, synced: &str) -> String {
@@ -127,6 +144,12 @@ pub fn block(meta: &HackmdMeta, synced: &str) -> String {
 /// separators) removed, normalised to end in a single newline. If no block is
 /// present the input is returned unchanged.
 pub fn strip(content: &str) -> String {
+    // Only remove a block that actually parses to valid link metadata. A
+    // marker the user typed by hand (e.g. while documenting this very feature)
+    // with no `id:` line is left in place rather than silently eaten.
+    if parse(content).is_none() {
+        return content.to_string();
+    }
     let Some((start, end)) = block_span(content) else {
         return content.to_string();
     };
@@ -249,6 +272,41 @@ mod tests {
         let again = ensure_footer(&with);
         assert_eq!(again, with);
         assert_eq!(again.matches(crate::TUI_FOOTER).count(), 1);
+    }
+
+    #[test]
+    fn strip_leaves_a_hand_written_marker_untouched() {
+        // A user documenting this feature writes the marker but no real `id:`
+        // block. It must survive `strip` verbatim rather than being eaten.
+        let doc = "# Notes\n\n<!-- hackmd-sync is the sync marker -->\n\nmore\n";
+        assert_eq!(strip(doc), doc);
+        // Even a multi-line block that never closes with a valid `id:` stays.
+        let doc2 = "intro\n\n<!-- hackmd-sync\nnot a real block\n-->\n\ntail\n";
+        assert_eq!(strip(doc2), doc2);
+        assert!(parse(doc2).is_none());
+    }
+
+    #[test]
+    fn legacy_bare_marker_still_parses_and_migrates_on_write() {
+        // Files stamped by an older release used a bare `<!-- hackmd` marker.
+        let legacy = "body\n\n<!-- hackmd\nid: Old123\nurl: https://hackmd.io/Old123\n-->\n";
+        let parsed = parse(legacy).expect("legacy block parses");
+        assert_eq!(parsed.id, "Old123");
+        // Re-stamping migrates it to the new marker, leaving exactly one block.
+        let restamped = upsert(legacy, &parsed, "t");
+        assert_eq!(restamped.matches(OPEN_MARKER).count(), 1);
+        assert!(!restamped.contains("<!-- hackmd\n"));
+    }
+
+    #[test]
+    fn has_block_detects_corrupted_block() {
+        // Marker present but the `id:` line was deleted → corrupted, not
+        // unlinked. `has_block` sees it even though `parse` rejects it.
+        let corrupted = "text\n\n<!-- hackmd-sync\nurl: https://hackmd.io/x\n-->\n";
+        assert!(has_block(corrupted));
+        assert!(parse(corrupted).is_none());
+        // A plain unlinked file has no block.
+        assert!(!has_block("# Just a doc\n"));
     }
 
     #[test]
