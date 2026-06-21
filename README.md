@@ -56,11 +56,16 @@ Log in once (`hackmd login`, or set `HMD_API_ACCESS_TOKEN`), then press `H` in a
 | `y` | cloud note | copy the publish link |
 | `o` | cloud note | open the publish link in your browser |
 | `S` | cloud browser / note | download note to a local file |
-| `U` | local file / browser | push a local file up as a new note |
+| `U` | local file / browser | publish a local file — links it, then keeps it in sync |
+| `A` / `O` | reader | open the editor at end-of-doc / a new top line |
 
 The cloud browser shows one workspace tab per owner — your notes first, then each team (the tab bar only appears when there's more than one). Every note carries a visibility badge: `[published]` (on the owner's public profile, indexable), `[anyone with link]`, `[signed in]`, `[only team]`, or `[only me]`. Fetched notes are cached and revalidated by ETag, so reopening is instant and remote edits show up on their own. Saves are pessimistic — the dirty marker only clears once the server confirms. All network traffic runs on background tasks; the UI never blocks.
 
-Publishing flips the note's `readPermission` between `guest` and `owner` — that's how the HackMD v1 API models it (there is no separate publish endpoint, and no comments API).
+Publishing flips the note's `readPermission` between `guest` and `owner` — that's how the HackMD v1 API models it (there is no separate publish endpoint).
+
+**Local ↔ HackMD sync.** Pressing `U` on a local file the first time creates the note and stamps the file with a managed `<!-- hackmd … -->` link block (note id, URL, publish link, last-synced time — don't hand-edit it). From then on the file and its note stay in sync automatically: on open, on save, and on a background poll. Changes from both sides are three-way merged against a cached base under `<root>/.hackmd/`; when local and upstream both edit the same lines, a full-screen resolver lets you pick a side per hunk (`l`/`u`/`b`/`n`, then `Enter`). The note title is taken from the file's first `# H1` (you're prompted only when there isn't one).
+
+**Comments.** The HackMD v1 REST API exposes no comment or reaction endpoints, so comments on a note are **not fetchable** through this tool (or any v1 API client). See [hackmdio/hackmd-io-issues#428](https://github.com/hackmdio/hackmd-io-issues/issues/428).
 
 ## `hackmd` — CLI
 

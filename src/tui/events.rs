@@ -737,6 +737,23 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return Ok(());
     }
 
+    // GUI line-edge motion: Cmd-←/→ on macOS (reported as the SUPER modifier
+    // by terminals that support it). Mirrors Home/End. Ctrl/Alt-arrow stay on
+    // word motion below, matching the Linux convention.
+    if key.modifiers.contains(KeyModifiers::SUPER) {
+        match key.code {
+            KeyCode::Left => {
+                app.edit_move_line_edge(false);
+                return Ok(());
+            }
+            KeyCode::Right => {
+                app.edit_move_line_edge(true);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     // Word-level movement and deletion (Alt-arrow / Alt-Backspace / Alt-
     // Delete on macOS, Ctrl-arrow / Ctrl-Backspace on Linux/Windows).
     if alt || ctrl {
