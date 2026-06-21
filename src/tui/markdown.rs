@@ -858,7 +858,10 @@ fn wrap_to_width(s: &str, max_w: usize) -> Vec<(std::ops::Range<usize>, String)>
     let chars: Vec<(usize, char)> = s.char_indices().collect();
     let mut line_start = 0usize;
     let mut col = 0usize;
-    let mut last_break: Option<usize> = None; // byte just after the most recent whitespace
+    // Byte offset and char index just after the most recent whitespace, so a
+    // wrap can both cut at that byte boundary and rewind the scan to it.
+    let mut last_break: Option<usize> = None;
+    let mut last_break_ci: Option<usize> = None;
     let mut ci = 0usize;
     while ci < chars.len() {
         let (idx, ch) = chars[ci];
@@ -866,19 +869,28 @@ fn wrap_to_width(s: &str, max_w: usize) -> Vec<(std::ops::Range<usize>, String)>
         if col + w > max_w && col > 0 {
             // Wrap. Prefer the most recent whitespace boundary; if there
             // wasn't one inside the current line, hard-break at `idx`.
-            let break_at = last_break.filter(|&b| b > line_start).unwrap_or(idx);
+            let whitespace_break = last_break.filter(|&b| b > line_start);
+            let break_at = whitespace_break.unwrap_or(idx);
             let text = s[line_start..break_at]
                 .trim_end_matches(|c: char| c.is_whitespace())
                 .to_string();
             out.push((line_start..break_at, text));
             line_start = break_at;
             col = 0;
+            // When we cut at an earlier whitespace boundary, the scan head
+            // `ci` is past it — rewind to the break so the new line's width
+            // is recounted from `break_at`. A hard break is at the current
+            // char, so leave `ci` to re-evaluate it on the fresh line.
+            if let Some(bci) = last_break_ci.filter(|_| whitespace_break.is_some()) {
+                ci = bci;
+            }
             last_break = None;
-            // Re-evaluate this char on the new line.
+            last_break_ci = None;
             continue;
         }
         if ch.is_whitespace() {
             last_break = Some(idx + ch.len_utf8());
+            last_break_ci = Some(ci + 1);
         }
         col += w;
         ci += 1;
@@ -2232,6 +2244,43 @@ mod tests {
     use super::*;
     use crate::tui::links::{LinkTarget, TableHit};
     use crate::tui::theme::Theme;
+
+    /// Every wrapped chunk must fit within `max_w` columns. Regression for a
+    /// bug where wrapping at a whitespace boundary behind the scan head left
+    /// `col` under-counted, so a long token (e.g. a markdown link URL)
+    /// followed by more words collapsed onto one overwide, clipped row.
+    #[test]
+    fn wrap_never_exceeds_width() {
+        use unicode_width::UnicodeWidthChar;
+        let line = "- Contributed [PR 1433](https://github.com/ReamLabs/ream/pull/1433) to cover a lean spec update in Ream.";
+        for w in 5..=80usize {
+            for (range, text) in wrap_to_width(line, w) {
+                let cols: usize = text.chars().map(|c| c.width().unwrap_or(0)).sum();
+                assert!(
+                    cols <= w,
+                    "row {:?} is {} cols, exceeds width {}",
+                    text,
+                    cols,
+                    w
+                );
+                // Ranges must stay within bounds and produce the right slice.
+                assert!(range.end <= line.len());
+            }
+        }
+    }
+
+    /// Chunk byte ranges must tile the input gap-free and in order, so the
+    /// editor's cursor/click mapping over wrapped rows stays correct.
+    #[test]
+    fn wrap_ranges_are_contiguous() {
+        let line = "- Contributed [PR 1433](https://github.com/ReamLabs/ream/pull/1433) to cover a lean spec update in Ream.";
+        let chunks = wrap_to_width(line, 62);
+        assert_eq!(chunks.first().unwrap().0.start, 0);
+        assert_eq!(chunks.last().unwrap().0.end, line.len());
+        for pair in chunks.windows(2) {
+            assert_eq!(pair[0].0.end, pair[1].0.start, "ranges must be contiguous");
+        }
+    }
 
     #[test]
     fn renders_paragraph_and_link() {
