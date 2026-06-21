@@ -2433,6 +2433,34 @@ impl App {
         }
     }
 
+    /// `A` in the reader: enter the editor with the cursor at the end of the
+    /// buffer (append to the document).
+    pub fn enter_edit_append(&mut self) {
+        self.enter_edit();
+        if let View::Reader(r) = &mut self.view {
+            if let Some(e) = r.edit.as_mut() {
+                e.cursor = floor_char_boundary(&r.raw, r.raw.len());
+                r.rendered = None;
+            }
+        }
+    }
+
+    /// `O` in the reader: enter the editor with a fresh blank line opened at
+    /// the very top, cursor on it (open-above).
+    pub fn enter_edit_open_above(&mut self) {
+        self.enter_edit();
+        if !matches!(&self.view, View::Reader(r) if r.edit.is_some()) {
+            return; // stdin / no editor
+        }
+        self.edit_insert("\n");
+        if let View::Reader(r) = &mut self.view {
+            if let Some(e) = r.edit.as_mut() {
+                e.cursor = 0;
+                r.rendered = None;
+            }
+        }
+    }
+
     /// Discard buffer changes and exit edit mode. Reloads the file from disk
     /// (or the cloud cache) to drop any unsaved edits, then returns the
     /// reader to view mode.
@@ -2787,6 +2815,82 @@ impl App {
         e.command = None;
         e.selection = None;
         r.rendered = None;
+    }
+
+    /// Wrap the active drag-selection in `open`…`close` (pair completion over
+    /// a selection, e.g. select a word and press `*` → `*word*`). Returns
+    /// `true` when a selection was wrapped. One undo step; the cursor lands
+    /// just past the closing delimiter and the selection is cleared.
+    pub fn edit_wrap_selection(&mut self, open: char, close: char) -> bool {
+        let View::Reader(r) = &mut self.view else {
+            return false;
+        };
+        let range = r
+            .edit
+            .as_ref()
+            .and_then(|e| e.selection.as_ref())
+            .filter(|s| s.is_active())
+            .map(|s| s.range());
+        let Some((from, to)) = range else {
+            return false;
+        };
+        let from = floor_char_boundary(&r.raw, from.min(r.raw.len()));
+        let to = floor_char_boundary(&r.raw, to.min(r.raw.len()));
+        if from >= to {
+            return false;
+        }
+        push_undo(r);
+        // Insert the closer first so `from` stays valid for the opener.
+        r.raw.insert(to, close);
+        r.raw.insert(from, open);
+        let e = r.edit.as_mut().unwrap();
+        e.cursor = to + open.len_utf8() + close.len_utf8();
+        e.dirty = true;
+        e.command = None;
+        e.selection = None;
+        r.rendered = None;
+        true
+    }
+
+    /// Insert an `open``close` pair at the cursor and place the cursor between
+    /// them (bracket auto-close). One undo step.
+    pub fn edit_insert_pair(&mut self, open: char, close: char) {
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        if r.edit.is_none() {
+            return;
+        }
+        push_undo(r);
+        let e = r.edit.as_mut().unwrap();
+        let pos = floor_char_boundary(&r.raw, e.cursor.min(r.raw.len()));
+        r.raw.insert(pos, close);
+        r.raw.insert(pos, open);
+        let e = r.edit.as_mut().unwrap();
+        e.cursor = pos + open.len_utf8();
+        e.dirty = true;
+        e.command = None;
+        r.rendered = None;
+    }
+
+    /// If the char immediately after the cursor is `close`, step over it
+    /// instead of inserting (so typing the closing bracket of an auto-closed
+    /// pair just moves past it). Returns `true` when it stepped over.
+    pub fn edit_try_type_over(&mut self, close: char) -> bool {
+        let View::Reader(r) = &mut self.view else {
+            return false;
+        };
+        let Some(e) = r.edit.as_ref() else {
+            return false;
+        };
+        let pos = floor_char_boundary(&r.raw, e.cursor.min(r.raw.len()));
+        if r.raw[pos..].chars().next() == Some(close) {
+            let e = r.edit.as_mut().unwrap();
+            e.cursor = pos + close.len_utf8();
+            r.rendered = None;
+            return true;
+        }
+        false
     }
 
     /// Move cursor by one char left/right (`delta` ±1). Re-renders so the

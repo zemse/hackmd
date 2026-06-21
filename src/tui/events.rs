@@ -307,6 +307,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // `e` and vim's `i` both open the editor (which starts in insert
         // mode, so `i` lands exactly where a vim user expects).
         KeyCode::Char('e') | KeyCode::Char('i') => app.enter_edit(),
+        // `A` opens the editor at the end of the document (append); `O` opens
+        // it with a fresh blank line at the top. (`o` is taken by open-link.)
+        KeyCode::Char('A') if matches!(app.view, View::Reader(_)) => app.enter_edit_append(),
+        KeyCode::Char('O') if matches!(app.view, View::Reader(_)) => app.enter_edit_open_above(),
 
         // HackMD note actions — active wherever a cloud note is targeted
         // (cloud browser row or open cloud reader); no-ops elsewhere.
@@ -710,6 +714,13 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.edit_delete_selection();
                 return Ok(());
             }
+            // Pair completion over a selection: `*`/`_`/`` ` ``/`(`/`[`/`{`
+            // wrap the selected text in that delimiter.
+            KeyCode::Char(c) if !ctrl && !alt && pair_for(c).is_some() => {
+                let (open, close) = pair_for(c).unwrap();
+                app.edit_wrap_selection(open, close);
+                return Ok(());
+            }
             KeyCode::Esc => {
                 app.edit_clear_selection();
                 return Ok(());
@@ -816,15 +827,55 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Enter => app.edit_newline(),
         KeyCode::Tab => app.edit_insert("  "),
         KeyCode::Char(c) if !ctrl && !alt => {
-            // Buffer the char as a UTF-8 string. Single-char allocation is
-            // negligible compared to the re-render that follows.
-            let mut buf = [0u8; 4];
-            let s = c.encode_utf8(&mut buf);
-            app.edit_insert(s);
+            // Bracket auto-close: `(`/`[`/`{` insert the matching closer and
+            // sit the cursor between. Typing the closer when it's already
+            // under the cursor steps over it instead of duplicating. Emphasis
+            // (`*`/`_`/`` ` ``) is NOT auto-closed here — that would break
+            // bullet/maths entry — but it does wrap a selection (handled
+            // above).
+            if let Some((open, close)) = bracket_open_pair(c) {
+                app.edit_insert_pair(open, close);
+            } else if is_bracket_closer(c) && app.edit_try_type_over(c) {
+                // Stepped over an existing closer — nothing more to do.
+            } else {
+                let mut buf = [0u8; 4];
+                let s = c.encode_utf8(&mut buf);
+                app.edit_insert(s);
+            }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Delimiter pair for pair-completion over a selection. Symmetric for
+/// emphasis (`*`/`_`/`` ` ``), matched brackets otherwise.
+fn pair_for(c: char) -> Option<(char, char)> {
+    match c {
+        '(' => Some(('(', ')')),
+        '[' => Some(('[', ']')),
+        '{' => Some(('{', '}')),
+        '*' => Some(('*', '*')),
+        '_' => Some(('_', '_')),
+        '`' => Some(('`', '`')),
+        _ => None,
+    }
+}
+
+/// Opening brackets that auto-close on insert (no selection). Emphasis is
+/// deliberately excluded so a lone `*`/`_` doesn't fight bullet/maths entry.
+fn bracket_open_pair(c: char) -> Option<(char, char)> {
+    match c {
+        '(' => Some(('(', ')')),
+        '[' => Some(('[', ']')),
+        '{' => Some(('{', '}')),
+        _ => None,
+    }
+}
+
+/// The closing brackets matching [`bracket_open_pair`], for type-over.
+fn is_bracket_closer(c: char) -> bool {
+    matches!(c, ')' | ']' | '}')
 }
 
 /// Editor commands the command line accepts, in suggestion order. `:` is
