@@ -41,6 +41,7 @@ tui = [
     "dep:image",
     "dep:base64",
     "dep:toml",
+    "dep:diffy",
 ]
 
 [dependencies]
@@ -69,6 +70,8 @@ ratatui-image = { version = "11", default-features = false, features = ["serde"]
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"], optional = true }
 base64 = { version = "0.22", optional = true }
 toml = { version = "1", optional = true }
+# Three-way merge for local ↔ HackMD sync (git-style conflict detection).
+diffy = { version = "0.4", optional = true }
 
 [dev-dependencies]
 wiremock = "0.6"

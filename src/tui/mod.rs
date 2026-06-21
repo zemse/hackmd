@@ -10,6 +10,7 @@ pub mod cloud;
 pub mod events;
 pub mod hackmd_meta;
 mod jsonl;
+pub mod sync;
 mod links;
 mod markdown;
 mod md_config;
