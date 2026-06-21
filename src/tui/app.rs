@@ -147,6 +147,12 @@ pub struct App {
     /// Active conflict-resolution session (local vs upstream), shown as a
     /// full-screen resolver. `None` when there's no unresolved conflict.
     pub conflict: Option<ConflictState>,
+    /// Editor `:`-command history (most recent last), navigated with ↑/↓ on
+    /// the command line. Persists across edit sessions within a run.
+    pub edit_cmd_history: Vec<String>,
+    /// Transient cursor into `edit_cmd_history` while navigating it; `None`
+    /// when on the live (just-typed) command line.
+    pub edit_cmd_nav: Option<usize>,
 }
 
 /// How often a still-open linked file re-syncs with upstream in the
@@ -809,6 +815,8 @@ impl App {
             pending_sync: false,
             last_sync: None,
             conflict: None,
+            edit_cmd_history: Vec::new(),
+            edit_cmd_nav: None,
         })
     }
 
@@ -3814,7 +3822,7 @@ fn list_continuation(line: &str, cursor_at_end: bool) -> Option<ListContinue> {
 /// Snapshot the current (raw, cursor) into the reader's undo stack.
 /// Clears the redo stack since a new mutation diverges the timeline.
 /// Caps the undo stack at `UNDO_LIMIT` entries (FIFO eviction).
-fn push_undo(r: &mut Reader) {
+pub(crate) fn push_undo(r: &mut Reader) {
     let Some(e) = r.edit.as_mut() else { return };
     e.undo.push(EditSnapshot {
         raw: r.raw.clone(),

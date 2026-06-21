@@ -801,6 +801,8 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
                     e.command = Some(String::new());
                 }
             }
+            // Fresh command line starts at the live entry, not mid-history.
+            app.edit_cmd_nav = None;
             return Ok(());
         }
         KeyCode::Left => app.edit_move_horizontal(-1),
@@ -861,9 +863,18 @@ fn handle_edit_command_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 _ => None,
             };
             if let Some(input) = input {
-                exec_edit_command(app, input.trim().trim_start_matches(':').trim())?;
+                let cmd = input.trim().trim_start_matches(':').trim().to_string();
+                // Record in history (skip blanks and consecutive duplicates).
+                if !cmd.is_empty() && app.edit_cmd_history.last() != Some(&cmd) {
+                    app.edit_cmd_history.push(cmd.clone());
+                }
+                app.edit_cmd_nav = None;
+                exec_edit_command(app, &cmd)?;
             }
         }
+        // ↑/↓ walk the command history (most-recent first), like a shell.
+        KeyCode::Up => cmd_history_prev(app),
+        KeyCode::Down => cmd_history_next(app),
         KeyCode::Tab => {
             if let View::Reader(r) = &mut app.view {
                 if let Some(cmd) = r.edit.as_mut().and_then(|e| e.command.as_mut()) {
@@ -931,9 +942,13 @@ fn exec_edit_command(app: &mut App, cmd: &str) -> Result<()> {
         // unsaved edits but staying in the editor.
         "e!" => edit_reload(app),
         other => {
-            // `:N` — move the cursor to the start of line N (1-based,
-            // clamped to the buffer like vim).
-            if let Ok(n) = other.parse::<usize>() {
+            // `:s/old/new/[g]` (current line) and `:%s/old/new/[g]` (whole
+            // buffer) — literal substitution (no regex).
+            if looks_like_substitute(other) {
+                edit_substitute(app, other);
+            } else if let Ok(n) = other.parse::<usize>() {
+                // `:N` — move the cursor to the start of line N (1-based,
+                // clamped to the buffer like vim).
                 edit_goto_line(app, n);
             } else {
                 app.status = format!("Not an editor command: :{other}");
@@ -941,6 +956,139 @@ fn exec_edit_command(app: &mut App, cmd: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Replace the open command-line text with `val`. No-op if the command line
+/// isn't open.
+fn set_command_line(app: &mut App, val: String) {
+    if let View::Reader(r) = &mut app.view {
+        if let Some(e) = r.edit.as_mut() {
+            if e.command.is_some() {
+                e.command = Some(val);
+            }
+        }
+    }
+}
+
+/// ↑ on the command line: step to an older history entry.
+fn cmd_history_prev(app: &mut App) {
+    if app.edit_cmd_history.is_empty() {
+        return;
+    }
+    let idx = match app.edit_cmd_nav {
+        None => app.edit_cmd_history.len() - 1,
+        Some(i) => i.saturating_sub(1),
+    };
+    app.edit_cmd_nav = Some(idx);
+    set_command_line(app, app.edit_cmd_history[idx].clone());
+}
+
+/// ↓ on the command line: step to a newer entry, or back to a blank live line
+/// past the newest.
+fn cmd_history_next(app: &mut App) {
+    let Some(i) = app.edit_cmd_nav else {
+        return;
+    };
+    if i + 1 < app.edit_cmd_history.len() {
+        app.edit_cmd_nav = Some(i + 1);
+        set_command_line(app, app.edit_cmd_history[i + 1].clone());
+    } else {
+        app.edit_cmd_nav = None;
+        set_command_line(app, String::new());
+    }
+}
+
+/// True when `cmd` looks like a substitute command: an optional `%`, then `s`,
+/// then a non-alphanumeric delimiter (so `:s` collides with nothing real).
+fn looks_like_substitute(cmd: &str) -> bool {
+    let rest = cmd.strip_prefix('%').unwrap_or(cmd);
+    let mut chars = rest.chars();
+    chars.next() == Some('s')
+        && matches!(chars.next(), Some(d) if !d.is_alphanumeric() && !d.is_whitespace())
+}
+
+/// Apply a literal `:s`/`:%s` substitution. The delimiter is whatever single
+/// char follows `s` (vim-style), so `s#a#b#` works too. Flags: `g` (all
+/// occurrences per line). Without `%`, only the cursor's line is touched.
+fn edit_substitute(app: &mut App, cmd: &str) {
+    let all_lines = cmd.starts_with('%');
+    let rest = cmd.strip_prefix('%').unwrap_or(cmd);
+    // Skip the leading `s`; the next char is the delimiter.
+    let body = &rest[1..];
+    let Some(delim) = body.chars().next() else {
+        app.status = "Bad substitute (no delimiter)".into();
+        return;
+    };
+    // pattern / replacement / flags — at most 3 fields; a missing closing
+    // delimiter just means empty flags.
+    let mut parts = body[delim.len_utf8()..].splitn(3, delim);
+    let pattern = parts.next().unwrap_or("");
+    let replacement = parts.next().unwrap_or("");
+    let flags = parts.next().unwrap_or("");
+    if pattern.is_empty() {
+        app.status = "Bad substitute (empty pattern)".into();
+        return;
+    }
+    let global = flags.contains('g');
+
+    let View::Reader(r) = &mut app.view else {
+        return;
+    };
+    if r.edit.is_none() {
+        return;
+    }
+    let cursor = r.edit.as_ref().unwrap().cursor.min(r.raw.len());
+    // Resolve the line range to operate on.
+    let (from, to) = if all_lines {
+        (0, r.raw.len())
+    } else {
+        let start = r.raw[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let end = r.raw[cursor..]
+            .find('\n')
+            .map(|i| cursor + i)
+            .unwrap_or(r.raw.len());
+        (start, end)
+    };
+    let region = &r.raw[from..to];
+    let (replaced, count) = substitute_region(region, pattern, replacement, global);
+    if count == 0 {
+        app.status = format!("Pattern not found: {pattern}");
+        return;
+    }
+    crate::tui::app::push_undo(r);
+    r.raw.replace_range(from..to, &replaced);
+    let e = r.edit.as_mut().unwrap();
+    e.cursor = from.min(r.raw.len());
+    e.dirty = true;
+    e.command = None;
+    r.rendered = None;
+    app.status = format!("{count} substitution{}", if count == 1 { "" } else { "s" });
+}
+
+/// Literal substitution over `region`. With `global`, every occurrence is
+/// replaced; otherwise only the first on each line. Returns the rewritten
+/// text and the number of replacements made.
+fn substitute_region(region: &str, pattern: &str, replacement: &str, global: bool) -> (String, usize) {
+    if global {
+        (
+            region.replace(pattern, replacement),
+            region.matches(pattern).count(),
+        )
+    } else {
+        let mut out = String::with_capacity(region.len());
+        let mut n = 0;
+        for line in region.split_inclusive('\n') {
+            if let Some(pos) = line.find(pattern) {
+                out.push_str(&line[..pos]);
+                out.push_str(replacement);
+                out.push_str(&line[pos + pattern.len()..]);
+                n += 1;
+            } else {
+                out.push_str(line);
+            }
+        }
+        (out, n)
+    }
 }
 
 /// `:N` — place the edit cursor at the start of source line `n` (1-based).
@@ -1951,6 +2099,41 @@ fn osc52_copy(text: &str) {
         let _ = write!(out, "\x1b]52;c;{}\x1b\\", encoded);
     }
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod substitute_tests {
+    use super::{looks_like_substitute, substitute_region};
+
+    #[test]
+    fn recognises_substitute_commands() {
+        assert!(looks_like_substitute("s/a/b/"));
+        assert!(looks_like_substitute("%s/a/b/g"));
+        assert!(looks_like_substitute("s#a#b#"));
+        // Not substitutes.
+        assert!(!looks_like_substitute("s")); // bare `s`
+        assert!(!looks_like_substitute("set")); // word
+        assert!(!looks_like_substitute("wq"));
+        assert!(!looks_like_substitute("42"));
+    }
+
+    #[test]
+    fn global_replaces_all_first_only_replaces_one_per_line() {
+        let region = "foo foo\nfoo bar\n";
+        let (g, gn) = substitute_region(region, "foo", "X", true);
+        assert_eq!(g, "X X\nX bar\n");
+        assert_eq!(gn, 3);
+        let (f, fn_) = substitute_region(region, "foo", "X", false);
+        assert_eq!(f, "X foo\nX bar\n");
+        assert_eq!(fn_, 2);
+    }
+
+    #[test]
+    fn no_match_reports_zero() {
+        let (out, n) = substitute_region("hello\n", "zzz", "x", true);
+        assert_eq!(out, "hello\n");
+        assert_eq!(n, 0);
+    }
 }
 
 #[cfg(test)]
