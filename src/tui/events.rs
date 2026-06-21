@@ -158,6 +158,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if app.search.is_some() {
         return handle_search_key(app, key);
     }
+    // Browser type-ahead find (lf-style): once `f` arms it, characters extend
+    // the query and the selection live-jumps. Captures all keys until dismissed.
+    if let View::Browser(b) = &app.view {
+        if b.find.is_some() {
+            return handle_browser_find_key(app, key);
+        }
+    }
     if let View::Reader(r) = &app.view {
         if r.doc_search.as_ref().map(|s| s.editing).unwrap_or(false) {
             return handle_doc_search_key(app, key);
@@ -277,12 +284,17 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             View::Browser(_) | View::Cloud(_) => app.open_search(),
         },
         KeyCode::Char('T') => app.open_search(),
-        // `n` creates a note in the cloud browser; elsewhere it's the
-        // doc-search "next match" motion.
+        // `n` creates a note in the cloud browser and a file in the local
+        // browser; in the Reader it's the doc-search "next match" motion.
         KeyCode::Char('n') => match &app.view {
             View::Cloud(_) => app.prompt_new_note(),
+            View::Browser(_) => app.prompt_new_file(),
             _ => app.doc_search_step(true),
         },
+        // `c` / F2 renames the selected entry in the local browser.
+        KeyCode::Char('c') | KeyCode::F(2) if matches!(app.view, View::Browser(_)) => {
+            app.prompt_rename();
+        }
         KeyCode::Char('N') => app.doc_search_step(false),
         KeyCode::Char('m') => toggle_mouse(app),
         // `e` and vim's `i` both open the editor (which starts in insert
@@ -300,10 +312,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         {
             copy_publish_link(app);
         }
-        // Push a local file up as a new HackMD note.
+        // Publish a local file to HackMD — creates a new note the first time
+        // (stamping the file with a managed link block) and updates the linked
+        // note on subsequent pushes.
         KeyCode::Char('U') => {
             if let Some(path) = local_push_target(app) {
-                app.prompt_push(path);
+                app.push_local(path);
             }
         }
 
@@ -332,10 +346,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => app.go_back()?,
         KeyCode::Backspace => app.go_back()?,
 
-        // Plain `f`/`b` page like less/more (mirrors Ctrl-F/Ctrl-B).
+        // `f` arms type-ahead find in the browser; in the Reader it pages like
+        // less/more (mirrors Ctrl-F).
         KeyCode::Char('f') => {
-            let n = consume_count(&mut app.count_prefix);
-            scroll_by_page(app, n, false);
+            if let View::Browser(b) = &mut app.view {
+                b.find = Some(String::new());
+            } else {
+                let n = consume_count(&mut app.count_prefix);
+                scroll_by_page(app, n, false);
+            }
         }
         KeyCode::Char('b') => {
             let n = consume_count(&mut app.count_prefix);
@@ -507,6 +526,87 @@ fn center_focus_or_top(app: &mut App) {
     }
 }
 
+/// Browser type-ahead find handler. Active while `Browser::find.is_some()`.
+/// Typed characters extend the query and the selection live-jumps to the first
+/// anchored, smartcase match (forward from the top). `;`/`,` cycle to the
+/// next/previous match of the current query; Backspace edits; Enter opens the
+/// landed entry; Esc (or any other key) leaves find mode.
+fn handle_browser_find_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    let View::Browser(b) = &mut app.view else {
+        return Ok(());
+    };
+    let Some(query) = b.find.clone() else {
+        return Ok(());
+    };
+    match key.code {
+        KeyCode::Esc => {
+            b.find = None;
+        }
+        KeyCode::Enter => {
+            b.find = None;
+            activate(app)?;
+        }
+        KeyCode::Backspace => {
+            let mut q = query;
+            q.pop();
+            if let Some(i) = b.find_from(&q, 0) {
+                b.selected = i;
+            }
+            b.find = Some(q);
+            keep_browser_selection_visible(app);
+        }
+        // Cycle to the next / previous match of the current query without
+        // changing it (lf's find-next `;` / find-prev `,`).
+        KeyCode::Char(';') if !query.is_empty() => {
+            let start = (b.selected + 1) % b.entries.len().max(1);
+            if let Some(i) = b.find_from(&query, start) {
+                b.selected = i;
+            }
+            keep_browser_selection_visible(app);
+        }
+        KeyCode::Char(',') if !query.is_empty() => {
+            if let Some(i) = b.find_back_from(&query, b.selected) {
+                b.selected = i;
+            }
+            keep_browser_selection_visible(app);
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            let mut q = query;
+            q.push(c);
+            // Live-jump to the first match. If nothing matches, keep the query
+            // (so Backspace recovers) but leave the cursor where it was.
+            if let Some(i) = b.find_from(&q, 0) {
+                b.selected = i;
+            }
+            b.find = Some(q);
+            keep_browser_selection_visible(app);
+        }
+        // Any other key (arrows, Tab, etc.) ends find mode and is ignored this
+        // press; the user can repeat it to act normally.
+        _ => {
+            b.find = None;
+        }
+    }
+    Ok(())
+}
+
+/// Clamp `Browser::scroll` so the selected row stays on screen after a find
+/// jump. Mirrors the visibility math in `scroll_by`.
+fn keep_browser_selection_visible(app: &mut App) {
+    let h = app.viewport.height.saturating_sub(2) as usize;
+    if let View::Browser(b) = &mut app.view {
+        if b.selected < b.scroll as usize {
+            b.scroll = b.selected as u16;
+        } else if b.selected >= b.scroll as usize + h.max(1) {
+            b.scroll = (b.selected + 1 - h.max(1)) as u16;
+        }
+    }
+}
+
 /// Edit-mode key handler. Active while `Reader::edit.is_some()`. Plain text
 /// goes into the buffer (insert mode is the default); arrows/home/end/etc.
 /// move the source cursor; Ctrl-S (or Ctrl-W backup) saves. The first Esc
@@ -572,8 +672,31 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 if let Some(text) = app.edit_selection_text() {
                     copy_to_clipboard(&text);
                     app.status = format!("Copied {} chars", text.chars().count());
+                    app.yank = Some(text);
                 }
                 app.edit_clear_selection();
+                return Ok(());
+            }
+            // Cut: copy the selection to the clipboard/register, then delete
+            // it. `x` mirrors the copy `y`; Ctrl-X is the GUI binding.
+            KeyCode::Char('x') if !alt => {
+                if let Some(text) = app.edit_selection_text() {
+                    copy_to_clipboard(&text);
+                    app.status = format!("Cut {} chars", text.chars().count());
+                    app.yank = Some(text);
+                }
+                app.edit_delete_selection();
+                return Ok(());
+            }
+            // Paste over the selection: overwrite the selected text with the
+            // clipboard/register contents. `p` mirrors copy/cut; Ctrl-V is the
+            // GUI binding.
+            KeyCode::Char('p') if !ctrl && !alt => {
+                paste_over_selection(app);
+                return Ok(());
+            }
+            KeyCode::Char('v') if ctrl => {
+                paste_over_selection(app);
                 return Ok(());
             }
             KeyCode::Delete | KeyCode::Backspace => {
@@ -586,6 +709,14 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
             _ => app.edit_clear_selection(),
         }
+    }
+
+    // Paste at the cursor (no selection). Ctrl-V is the universal GUI binding;
+    // it works whether or not text is selected (the selection branch above
+    // handles the paste-over case).
+    if ctrl && matches!(key.code, KeyCode::Char('v')) {
+        paste_over_selection(app);
+        return Ok(());
     }
 
     // Word-level movement and deletion (Alt-arrow / Alt-Backspace / Alt-
@@ -673,7 +804,7 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::End => app.edit_move_line_edge(true),
         KeyCode::Backspace => app.edit_backspace(),
         KeyCode::Delete => app.edit_delete(),
-        KeyCode::Enter => app.edit_insert("\n"),
+        KeyCode::Enter => app.edit_newline(),
         KeyCode::Tab => app.edit_insert("  "),
         KeyCode::Char(c) if !ctrl && !alt => {
             // Buffer the char as a UTF-8 string. Single-char allocation is
@@ -1722,6 +1853,42 @@ fn copy_to_clipboard(text: &str) {
     osc52_copy(text);
 }
 
+/// Read the system clipboard, if we can. Only macOS (`pbpaste`) is wired up —
+/// there's no portable, terminal-safe clipboard *read* (OSC 52 read is widely
+/// disabled for security). Returns `None` everywhere else, so callers fall
+/// back to the in-app yank register.
+fn read_clipboard() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::process::Command;
+        if let Ok(out) = Command::new("pbpaste").output() {
+            if out.status.success() {
+                return String::from_utf8(out.stdout).ok();
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the text to paste: the system clipboard if readable, else the
+/// in-app yank register set by the last copy/cut.
+fn clipboard_or_yank(app: &App) -> Option<String> {
+    read_clipboard().or_else(|| app.yank.clone())
+}
+
+/// Paste the clipboard/register over the active editor selection, or at the
+/// cursor when nothing is selected. Clears the selection either way and
+/// reports the result on the statusline.
+fn paste_over_selection(app: &mut App) {
+    if let Some(text) = clipboard_or_yank(app) {
+        app.edit_replace_selection(&text);
+        app.status = format!("Pasted {} chars", text.chars().count());
+    } else {
+        app.edit_clear_selection();
+        app.status = "Clipboard empty".into();
+    }
+}
+
 fn osc52_copy(text: &str) {
     use base64::Engine;
     use std::io::Write;
@@ -2469,6 +2636,13 @@ fn scroll_by(app: &mut App, delta: i32) {
 }
 
 fn scroll_by_page(app: &mut App, dir: i32, half: bool) {
+    // Paging is meaningless in the file browser — listings fit on one screen,
+    // so a page jump would just wrap the selection around disorientingly. Row
+    // movement there is `j`/`k` (and arrows) via `scroll_by`. Reader/Cloud page
+    // normally.
+    if matches!(app.view, View::Browser(_)) {
+        return;
+    }
     let h = app.viewport.height as i32;
     let amt = if half { (h / 2).max(1) } else { (h - 1).max(1) };
     scroll_by(app, dir * amt);

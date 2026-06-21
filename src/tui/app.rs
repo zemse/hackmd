@@ -133,6 +133,10 @@ pub struct App {
     /// `Some` while a text/confirm prompt overlay is active (new note title,
     /// push title, download filename, delete confirmation).
     pub prompt: Option<Prompt>,
+    /// Internal yank register — the last text copied or cut in the editor.
+    /// Paste prefers the system clipboard (so external copies work) but falls
+    /// back to this when the clipboard can't be read (no `pbpaste`, headless).
+    pub yank: Option<String>,
 }
 
 /// Modal one-line prompt. Input handling mirrors the doc-search prompt:
@@ -158,6 +162,12 @@ pub enum PromptKind {
         title: String,
         team_path: Option<String>,
     },
+    /// `n` in the local browser — create a file with the typed name under
+    /// `dir`, then open it in the editor.
+    NewFile { dir: PathBuf },
+    /// `c` / F2 in the local browser — rename the entry at `from` to the
+    /// typed name (kept in the same parent directory).
+    RenameFile { from: PathBuf },
 }
 
 /// The cloud note a context-sensitive action (`P`/`D`/`S`/`y`/`o`) applies
@@ -562,6 +572,10 @@ pub struct Browser {
     /// comparing this each tick tells us when the listing is stale — without a
     /// file-watcher thread. `None` when the dir is gone or unstatable.
     pub last_meta: Option<(std::time::SystemTime, u64)>,
+    /// Active type-ahead find buffer (lf-style). `Some(query)` while find mode
+    /// is on: typed characters extend the query and the selection live-jumps to
+    /// the first anchored, smartcase match. `None` when not finding.
+    pub find: Option<String>,
 }
 
 #[derive(Clone)]
@@ -660,6 +674,7 @@ impl App {
             cloud: CloudState::new(cloud),
             last_local: None,
             prompt: None,
+            yank: None,
         })
     }
 
@@ -848,7 +863,20 @@ impl App {
                                 .and_then(|s| s.to_str())
                                 .unwrap_or("file")
                                 .to_string();
-                            self.status = format!("Pushed {name} → \"{title}\"");
+                            // Stamp the local file with the new note's id and
+                            // links so a later `U` updates it instead of
+                            // creating a duplicate.
+                            let cached = self.cloud.note_cache.get(&id).map(|c| &c.note);
+                            let meta = crate::tui::hackmd_meta::HackmdMeta {
+                                id: id.clone(),
+                                team_path: cached.and_then(|n| n.team_path.clone()),
+                                url: crate::tui::hackmd_meta::HackmdMeta::editor_url(&id),
+                                publish_link: cached
+                                    .map(|n| n.publish_link.clone())
+                                    .unwrap_or_default(),
+                            };
+                            self.stamp_local_file(&path, &meta);
+                            self.status = format!("Pushed {name} → \"{title}\" (linked)");
                         }
                     }
                 }
@@ -1190,6 +1218,75 @@ impl App {
         });
     }
 
+    /// `U` on a local file: publish it to HackMD. If the file already carries
+    /// a managed `<!-- hackmd … -->` block (it was published before), update
+    /// the linked note in place; otherwise fall through to the title prompt
+    /// that creates a fresh note.
+    pub fn push_local(&mut self, path: PathBuf) {
+        if !self.cloud.is_connected() {
+            self.status = NO_TOKEN_HINT.into();
+            return;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = format!("read {}: {e}", path.display());
+                return;
+            }
+        };
+        match crate::tui::hackmd_meta::parse(&content) {
+            Some(meta) => {
+                // Already linked → PATCH the existing note with the document
+                // body (our managed block is local-only, so strip it before
+                // pushing).
+                let clean = crate::tui::hackmd_meta::strip(&content);
+                if self.cloud.saving.contains(&meta.id) {
+                    self.status = "Update already in flight…".into();
+                    return;
+                }
+                if self
+                    .cloud
+                    .request_save(meta.id.clone(), meta.team_path.clone(), clean)
+                {
+                    // Optimistically refresh the `synced:` stamp; the PATCH
+                    // almost always succeeds and the id/links don't change.
+                    self.stamp_local_file(&path, &meta);
+                    self.status = format!("⟳ updating \"{}\"…", meta.id);
+                } else {
+                    self.status = NO_TOKEN_HINT.into();
+                }
+            }
+            None => self.prompt_push(path),
+        }
+    }
+
+    /// Write (or refresh) the managed HackMD block at the top of `path`. Best-
+    /// effort: a write failure only sets the statusline, since the cloud side
+    /// already succeeded.
+    pub fn stamp_local_file(&mut self, path: &Path, meta: &crate::tui::hackmd_meta::HackmdMeta) {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let synced = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let stamped = crate::tui::hackmd_meta::upsert(&content, meta, &synced);
+        if stamped == content {
+            return;
+        }
+        if let Err(e) = std::fs::write(path, &stamped) {
+            self.status = format!("stamp {}: {e}", path.display());
+            return;
+        }
+        // If this file is the one open in the reader, keep the buffer and
+        // fingerprint in sync so the watcher doesn't flag our own write.
+        if let View::Reader(r) = &mut self.view {
+            if matches!(&r.origin, ReaderOrigin::File(p) if p == path) {
+                r.raw = stamped;
+                r.rendered = None;
+                r.last_meta = file_meta(path);
+            }
+        }
+    }
+
     /// `U` on a local file: prompt for the pushed note's title (defaults to
     /// the file stem).
     pub fn prompt_push(&mut self, path: PathBuf) {
@@ -1211,6 +1308,46 @@ impl App {
             title: format!(" Push {name} to HackMD — title "),
             input: stem,
             kind: PromptKind::PushTitle(path),
+        });
+    }
+
+    /// `n` in the local browser: prompt for a new file's name. The file is
+    /// created under the current directory and opened in the editor.
+    pub fn prompt_new_file(&mut self) {
+        let View::Browser(b) = &self.view else {
+            return;
+        };
+        let dir = b.dir.clone();
+        self.prompt = Some(Prompt {
+            title: " New file — name ".into(),
+            input: String::new(),
+            kind: PromptKind::NewFile { dir },
+        });
+    }
+
+    /// `c` / F2 in the local browser: prompt to rename the selected entry.
+    /// Pre-fills the current name so the user edits rather than retypes.
+    pub fn prompt_rename(&mut self) {
+        let View::Browser(b) = &self.view else {
+            return;
+        };
+        let Some(entry) = b
+            .entries
+            .get(b.selected)
+            .filter(|e| !matches!(e.kind, BrowserEntryKind::ParentDir))
+        else {
+            return;
+        };
+        let from = entry.path.clone();
+        let name = from
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        self.prompt = Some(Prompt {
+            title: format!(" Rename {name} — new name "),
+            input: name,
+            kind: PromptKind::RenameFile { from },
         });
     }
 
@@ -1351,6 +1488,74 @@ impl App {
                 if !self.cloud.request_delete(id, title, team_path) {
                     self.status = NO_TOKEN_HINT.into();
                 }
+            }
+            PromptKind::NewFile { dir } => {
+                let name = p.input.trim();
+                if name.is_empty() {
+                    self.status = "Cancelled — empty name".into();
+                    return;
+                }
+                // Reject path separators so a stray `foo/bar` can't escape the
+                // browsed directory or create implicit subdirs the user didn't
+                // ask for.
+                if name.contains('/') || name.contains('\\') {
+                    self.status = "Name can't contain a path separator".into();
+                    return;
+                }
+                let path = dir.join(name);
+                if path.exists() {
+                    self.status = format!("Already exists: {}", path.display());
+                    return;
+                }
+                // Create the (empty) file, then open it in the editor so the
+                // user can start writing immediately.
+                if let Err(e) = std::fs::write(&path, "") {
+                    self.status = format!("create {}: {e}", path.display());
+                    return;
+                }
+                if let Err(e) = self.navigate_to(EntryKind::File(path.clone()), 0) {
+                    self.status = format!("open {}: {e}", path.display());
+                    return;
+                }
+                self.enter_edit();
+                self.status = format!("New file {}", path.display());
+            }
+            PromptKind::RenameFile { from } => {
+                let name = p.input.trim();
+                if name.is_empty() {
+                    self.status = "Cancelled — empty name".into();
+                    return;
+                }
+                if name.contains('/') || name.contains('\\') {
+                    self.status = "Name can't contain a path separator".into();
+                    return;
+                }
+                let Some(parent) = from.parent() else {
+                    self.status = "Can't rename: no parent directory".into();
+                    return;
+                };
+                let to = parent.join(name);
+                if to == from {
+                    self.status = "Name unchanged".into();
+                    return;
+                }
+                if to.exists() {
+                    self.status = format!("Already exists: {}", to.display());
+                    return;
+                }
+                if let Err(e) = std::fs::rename(&from, &to) {
+                    self.status = format!("rename: {e}");
+                    return;
+                }
+                // Rebuild the listing and re-select the renamed entry so the
+                // cursor follows it rather than snapping to the top.
+                if let View::Browser(b) = &mut self.view {
+                    let _ = b.rebuild();
+                    if let Some(i) = b.entries.iter().position(|e| e.path == to) {
+                        b.selected = i;
+                    }
+                }
+                self.status = format!("Renamed to {name}");
             }
         }
     }
@@ -1897,6 +2102,48 @@ impl App {
         r.rendered = None;
     }
 
+    /// Enter in the editor. Inside a markdown list this auto-continues the
+    /// list: a bullet, numbered, or checkbox line spawns the next marker on
+    /// the new line. Pressing Enter on an *empty* list item (just the marker)
+    /// instead terminates the list, clearing the marker and leaving a blank
+    /// line — the standard GitHub/Obsidian behaviour. Outside a list it's a
+    /// plain newline.
+    pub fn edit_newline(&mut self) {
+        let View::Reader(r) = &self.view else {
+            return;
+        };
+        let Some(e) = r.edit.as_ref() else { return };
+        let cursor = floor_char_boundary(&r.raw, e.cursor.min(r.raw.len()));
+        let line_start = r.raw[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let line_end = r.raw[cursor..]
+            .find('\n')
+            .map(|i| cursor + i)
+            .unwrap_or(r.raw.len());
+        let line = r.raw[line_start..line_end].to_string();
+        let cursor_at_end = cursor == line_end;
+        match list_continuation(&line, cursor_at_end) {
+            Some(ListContinue::Marker(marker)) => {
+                self.edit_insert(&format!("\n{marker}"));
+            }
+            Some(ListContinue::Empty) => {
+                // Terminate the list: blank the marker-only line, cursor at
+                // its start. No new line is added — pressing Enter again then
+                // produces a normal newline.
+                let View::Reader(r) = &mut self.view else {
+                    return;
+                };
+                push_undo(r);
+                r.raw.replace_range(line_start..line_end, "");
+                let e = r.edit.as_mut().unwrap();
+                e.cursor = line_start;
+                e.dirty = true;
+                e.command = None;
+                r.rendered = None;
+            }
+            None => self.edit_insert("\n"),
+        }
+    }
+
     /// Delete `n` chars to the left of the cursor (Backspace). No-op if
     /// the cursor is at byte 0.
     pub fn edit_backspace(&mut self) {
@@ -2101,6 +2348,45 @@ impl App {
         }
     }
 
+    /// Replace the active editor drag-selection with `text` (paste-over), or
+    /// insert `text` at the cursor when no selection is active. One undo
+    /// snapshot; the cursor lands just past the inserted text. No-op outside
+    /// edit mode.
+    pub fn edit_replace_selection(&mut self, text: &str) {
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        if r.edit.is_none() {
+            return;
+        }
+        // An active drag-selection defines the range to overwrite; otherwise
+        // we paste at the cursor (a zero-width range).
+        let range = r
+            .edit
+            .as_ref()
+            .and_then(|e| e.selection.as_ref())
+            .filter(|s| s.is_active())
+            .map(|s| s.range());
+        let (from, to) = match range {
+            Some((a, b)) => (
+                floor_char_boundary(&r.raw, a.min(r.raw.len())),
+                floor_char_boundary(&r.raw, b.min(r.raw.len())),
+            ),
+            None => {
+                let c = floor_char_boundary(&r.raw, r.edit.as_ref().unwrap().cursor.min(r.raw.len()));
+                (c, c)
+            }
+        };
+        push_undo(r);
+        r.raw.replace_range(from..to, text);
+        let e = r.edit.as_mut().unwrap();
+        e.cursor = from + text.len();
+        e.dirty = true;
+        e.command = None;
+        e.selection = None;
+        r.rendered = None;
+    }
+
     /// Move cursor by one char left/right (`delta` ±1). Re-renders so the
     /// block-level toggle can swap blocks if the cursor crossed a boundary.
     pub fn edit_move_horizontal(&mut self, delta: i32) {
@@ -2289,6 +2575,9 @@ impl App {
         } else {
             user_width.min(width)
         };
+        // Viewport height for the post-render scroll clamp below. Captured
+        // before the `view` borrow so it can be read while `r` is held.
+        let viewport_h = self.viewport.height as usize;
         if let View::Reader(r) = &mut self.view {
             let needs = match &r.rendered {
                 Some(rd) => rd.width != target_w || r.edit.is_some(),
@@ -2367,8 +2656,19 @@ impl App {
                         .as_ref()
                         .map(|e| e.mode == EditMode::Split)
                         .unwrap_or(false);
-                    if !in_split && r.scroll > max_scroll {
-                        r.scroll = max_scroll;
+                    // Clamp the view-mode scroll so it never leaves the
+                    // viewport blank. The last useful scroll keeps a full
+                    // screen of content visible (`lines - height`), matching
+                    // `scroll_by`'s `max`. Without subtracting the height,
+                    // exiting edit mode after deleting most of a long buffer
+                    // would strand `scroll` near the old end and show an empty
+                    // screen with only the final line at the top.
+                    if !in_split {
+                        let page_max =
+                            rd.lines.len().saturating_sub(viewport_h.max(1)) as u16;
+                        if r.scroll > page_max {
+                            r.scroll = page_max;
+                        }
                     }
                 }
             }
@@ -2967,6 +3267,113 @@ fn parse_unified_diff(diff: &str) -> Vec<DiffRow> {
     out
 }
 
+/// Outcome of inspecting the current editor line for list auto-continuation.
+enum ListContinue {
+    /// The line is a non-empty list item; Enter should insert a newline plus
+    /// this already-rendered marker string (indent + marker + trailing space).
+    Marker(String),
+    /// The line is an *empty* list item (marker only); Enter should terminate
+    /// the list by clearing the line instead of adding another marker.
+    Empty,
+}
+
+/// If `s` begins with a markdown checkbox (`[ ]`, `[x]`, `[X]`) followed by at
+/// least one space, return the byte length consumed (the brackets plus the
+/// trailing spaces). `None` otherwise.
+fn checkbox_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    if b.len() >= 3 && b[0] == b'[' && b[2] == b']' && matches!(b[1], b' ' | b'x' | b'X') {
+        let after = &s[3..];
+        let sp = after.len() - after.trim_start_matches(' ').len();
+        if sp >= 1 {
+            return Some(3 + sp);
+        }
+    }
+    None
+}
+
+/// The next letter in an alphabetic ordered list (`a`→`b`, `A`→`B`). At `z`/`Z`
+/// it stays put rather than overflowing past the alphabet.
+fn next_alpha(c: char) -> char {
+    match c {
+        'z' | 'Z' => c,
+        _ if c.is_ascii_alphabetic() => (c as u8 + 1) as char,
+        _ => c,
+    }
+}
+
+/// Inspect a full source `line` (no trailing newline) for a markdown list
+/// marker, deciding how Enter should behave. `cursor_at_end` is whether the
+/// edit cursor sits at the line's end — an empty item only terminates the
+/// list when the cursor is there (otherwise Enter just splits the line).
+///
+/// Recognises unordered bullets (`-`/`*`/`+`), task checkboxes
+/// (`- [ ]`/`- [x]`), numbered lists (`1.`/`1)`), and single-letter alphabetic
+/// lists (`a.`/`A)`). The continued marker normalises to one trailing space;
+/// numbered/alpha markers advance by one; new checkboxes start unchecked.
+fn list_continuation(line: &str, cursor_at_end: bool) -> Option<ListContinue> {
+    let indent_len = line
+        .find(|c: char| c != ' ' && c != '\t')
+        .unwrap_or(line.len());
+    let (indent, rest) = line.split_at(indent_len);
+    let count_spaces = |s: &str| s.len() - s.trim_start_matches(' ').len();
+    let empty_or = |content: &str, marker: String| {
+        if content.trim().is_empty() && cursor_at_end {
+            ListContinue::Empty
+        } else {
+            ListContinue::Marker(marker)
+        }
+    };
+
+    let first = rest.chars().next()?;
+
+    // Unordered bullets and task checkboxes.
+    if matches!(first, '-' | '*' | '+') {
+        let after = &rest[1..];
+        let sp = count_spaces(after);
+        if sp == 0 {
+            return None; // e.g. "-5" or "*bold*" — not a list item.
+        }
+        let after_sp = &after[sp..];
+        if let Some(cb) = checkbox_len(after_sp) {
+            let content = &after_sp[cb..];
+            return Some(empty_or(content, format!("{indent}{first} [ ] ")));
+        }
+        return Some(empty_or(after_sp, format!("{indent}{first} ")));
+    }
+
+    // Numbered lists: one or more digits, then `.` or `)`, then a space.
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        let after = &rest[digits.len()..];
+        let sep = after.chars().next().filter(|c| *c == '.' || *c == ')')?;
+        let after_sep = &after[1..];
+        let sp = count_spaces(after_sep);
+        if sp == 0 {
+            return None;
+        }
+        let content = &after_sep[sp..];
+        let next = digits.parse::<u64>().unwrap_or(0).saturating_add(1);
+        return Some(empty_or(content, format!("{indent}{next}{sep} ")));
+    }
+
+    // Alphabetic ordered lists: a single letter, then `.` or `)`, then a space.
+    if first.is_ascii_alphabetic() {
+        let after = &rest[first.len_utf8()..];
+        let sep = after.chars().next().filter(|c| *c == '.' || *c == ')')?;
+        let after_sep = &after[1..];
+        let sp = count_spaces(after_sep);
+        if sp == 0 {
+            return None;
+        }
+        let content = &after_sep[sp..];
+        let next = next_alpha(first);
+        return Some(empty_or(content, format!("{indent}{next}{sep} ")));
+    }
+
+    None
+}
+
 /// Snapshot the current (raw, cursor) into the reader's undo stack.
 /// Clears the redo stack since a new mutation diverges the timeline.
 /// Caps the undo stack at `UNDO_LIMIT` entries (FIFO eviction).
@@ -3349,6 +3756,7 @@ impl Browser {
             selected: 0,
             scroll: 0,
             last_meta: None,
+            find: None,
         };
         b.rebuild()?;
         Ok(b)
@@ -3397,6 +3805,50 @@ impl Browser {
     #[allow(dead_code)]
     pub fn selected_entry(&self) -> Option<&BrowserEntry> {
         self.entries.get(self.selected)
+    }
+
+    /// Does `entry`'s display name start with `query`? Anchored prefix match,
+    /// smartcase: case-insensitive unless `query` itself contains an uppercase
+    /// letter (then the comparison is case-sensitive). The trailing `/` on
+    /// directory rows is part of `display`, which is fine — users type the bare
+    /// name and the prefix still matches.
+    fn find_matches(entry: &BrowserEntry, query: &str) -> bool {
+        if query.is_empty() {
+            return false;
+        }
+        let smart = query.chars().any(|c| c.is_uppercase());
+        if smart {
+            entry.display.starts_with(query)
+        } else {
+            entry
+                .display
+                .to_lowercase()
+                .starts_with(&query.to_lowercase())
+        }
+    }
+
+    /// Index of the first entry matching `query`, searching forward from
+    /// `start` and wrapping. `None` when nothing matches.
+    pub fn find_from(&self, query: &str, start: usize) -> Option<usize> {
+        let n = self.entries.len();
+        if n == 0 {
+            return None;
+        }
+        (0..n)
+            .map(|off| (start + off) % n)
+            .find(|&i| Self::find_matches(&self.entries[i], query))
+    }
+
+    /// Like [`find_from`](Self::find_from) but searching backward from `start`
+    /// (wrapping). Used by find-prev (`,`).
+    pub fn find_back_from(&self, query: &str, start: usize) -> Option<usize> {
+        let n = self.entries.len();
+        if n == 0 {
+            return None;
+        }
+        (1..=n)
+            .map(|off| (start + n - (off % n)) % n)
+            .find(|&i| Self::find_matches(&self.entries[i], query))
     }
 }
 
@@ -3519,6 +3971,79 @@ fn score_substring(text: &str, pattern: &str) -> Option<i32> {
     }
     score -= text.len() as i32 / 4;
     Some(score)
+}
+
+#[cfg(test)]
+mod list_continuation_tests {
+    use super::{list_continuation, ListContinue};
+
+    fn marker(line: &str) -> Option<String> {
+        match list_continuation(line, true) {
+            Some(ListContinue::Marker(m)) => Some(m),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn bullets_continue_with_same_char_and_indent() {
+        assert_eq!(marker("- item").as_deref(), Some("- "));
+        assert_eq!(marker("* item").as_deref(), Some("* "));
+        assert_eq!(marker("+ item").as_deref(), Some("+ "));
+        assert_eq!(marker("  - nested").as_deref(), Some("  - "));
+    }
+
+    #[test]
+    fn checkboxes_continue_unchecked() {
+        assert_eq!(marker("- [ ] todo").as_deref(), Some("- [ ] "));
+        // A checked box still spawns a fresh *unchecked* one.
+        assert_eq!(marker("- [x] done").as_deref(), Some("- [ ] "));
+        assert_eq!(marker("  - [X] DONE").as_deref(), Some("  - [ ] "));
+    }
+
+    #[test]
+    fn numbered_lists_increment() {
+        assert_eq!(marker("1. first").as_deref(), Some("2. "));
+        assert_eq!(marker("9. ninth").as_deref(), Some("10. "));
+        assert_eq!(marker("3) paren").as_deref(), Some("4) "));
+        assert_eq!(marker("  2. nested").as_deref(), Some("  3. "));
+    }
+
+    #[test]
+    fn alpha_lists_advance() {
+        assert_eq!(marker("a. apple").as_deref(), Some("b. "));
+        assert_eq!(marker("A) Apple").as_deref(), Some("B) "));
+    }
+
+    #[test]
+    fn empty_item_terminates_when_cursor_at_end() {
+        assert!(matches!(
+            list_continuation("- ", true),
+            Some(ListContinue::Empty)
+        ));
+        assert!(matches!(
+            list_continuation("1. ", true),
+            Some(ListContinue::Empty)
+        ));
+        assert!(matches!(
+            list_continuation("- [ ] ", true),
+            Some(ListContinue::Empty)
+        ));
+        // Mid-line cursor: an empty marker still continues rather than clears.
+        assert!(matches!(
+            list_continuation("- ", false),
+            Some(ListContinue::Marker(_))
+        ));
+    }
+
+    #[test]
+    fn non_list_lines_are_plain_newlines() {
+        assert!(list_continuation("just prose", true).is_none());
+        assert!(list_continuation("-no space", true).is_none());
+        assert!(list_continuation("*emphasis*", true).is_none());
+        assert!(list_continuation("", true).is_none());
+        // "e.g." has no space after the dot, so it isn't a marker.
+        assert!(list_continuation("e.g whatever", true).is_none());
+    }
 }
 
 #[cfg(test)]
@@ -4277,6 +4802,7 @@ index abc..def 100644\n\
             selected: 0,
             scroll: 0,
             last_meta: None,
+            find: None,
         };
         // Re-scan (rebuild discovers `..` if the dir has a parent — fine, just
         // assert the fallback never out-of-bounds).
@@ -4284,6 +4810,53 @@ index abc..def 100644\n\
         assert!(b.selected < b.entries.len());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn browser_with(names: &[&str]) -> Browser {
+        Browser {
+            dir: PathBuf::from("/tmp"),
+            entries: names
+                .iter()
+                .map(|n| BrowserEntry {
+                    path: PathBuf::from("/tmp").join(n),
+                    display: n.to_string(),
+                    kind: BrowserEntryKind::Markdown,
+                })
+                .collect(),
+            selected: 0,
+            scroll: 0,
+            last_meta: None,
+            find: None,
+        }
+    }
+
+    #[test]
+    fn find_is_anchored_prefix_and_smartcase() {
+        let b = browser_with(&["alpha.md", "beta.md", "Beacon.md", "bonus.md"]);
+        // Anchored: "be" matches "beta.md" (prefix), not "bonus.md".
+        assert_eq!(b.find_from("be", 0), Some(1));
+        // Lowercase query is case-insensitive (smartcase off): "bea" finds
+        // "Beacon.md".
+        assert_eq!(b.find_from("bea", 0), Some(2));
+        // Uppercase in query turns on case sensitivity: "Be" matches only
+        // "Beacon.md", skipping lowercase "beta.md".
+        assert_eq!(b.find_from("Be", 0), Some(2));
+        // A single char lands on the first item starting with it.
+        assert_eq!(b.find_from("b", 0), Some(1));
+        // No match → None.
+        assert_eq!(b.find_from("z", 0), None);
+    }
+
+    #[test]
+    fn find_next_and_prev_cycle_with_wraparound() {
+        let b = browser_with(&["bat.md", "bee.md", "bun.md", "cat.md"]);
+        // Forward from just past index 0 finds the next "b" (index 1), then 2,
+        // then wraps back to 0.
+        assert_eq!(b.find_from("b", 1), Some(1));
+        assert_eq!(b.find_from("b", 3 % 4), Some(0)); // wrap past "cat.md"
+        // Backward from index 0 wraps to the last "b" match (index 2).
+        assert_eq!(b.find_back_from("b", 0), Some(2));
+        assert_eq!(b.find_back_from("b", 2), Some(1));
     }
 
     #[test]

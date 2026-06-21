@@ -1,7 +1,67 @@
-- [x] pressing tab in the render file cycles through the links. however the normal status bar is not visible after that. it should reset if user presses other key like up down or mouse scroll or mouse click in some place. similarly in many places where the status bar is updated with some notification like "saved path" when user hit ctrl S, the status bar does not return to the state where it shows the shortcuts.
-- [x] clicking on the file path should copy the file path. dragging on the file path should select the portion of the file path and copy the selection.
-- [x] scroll bar is visible in render file screen even if the page is not long enough, i.e. the scroll bar's handle is the full height. scroll bar doesnt show up on edit screen which is good.
-- [x] we want to make the editor similar to vim/helix a bit + add touch of modern gui editors (mouse support, option < > for word jumps, optn delete for word delete, ctrl z for undo and redo, ctrl s) and we also want to support the command mode similar to vim. our flow -> from cli user can go into the browser then the preview or directly in the preview. in the preview there is no command, just few shortcuts that are possible (just like what it is now). when user presses "e", they go into edit mode -> this part will be the mix of vim/helix and modern gui texteditors. In the edit mode user already goes in the insert mode by default and they can type things, move across using arrow or mouse, use alt arrow keys to jump words. when user presses the first ESC thats when the cursor goes to the bottom status bar (or we can call it command place which usually is hidden) and user can type there something or press ESC again to discard changes (just in case they are not familiar with vim exit). When first ESC pressed on the bottom left it can say in grey type vim command and but further it can show the normal non-vim keyboard shortcuts, while the vim people can type some command like :wq (which will write and then quit the editor so we return back to the preview). :q will discard changes. however we want to add a :preview (we want to support autocomplete in grey as well so pressing tab tab while :pre can fill the suggested autocomplete). we want to explore typical commands from vim/helix and implement them we can create a VIM.md where we note down the commands to support from original vim or helix sides in checkbox fasion and then go ahead and impl them. The :preview should open a preview screen on top of the editor. i.e. if we have a stack like -> cli -> file browser -> md preview of the file -> edit -> preview of unsaved edit. single ESC on this screen takes it back to the editor. from the file preview we go into text editor by pressing "e", we also want support for "i" to do the same thing, it basically opens edit mode with insert mode (while pressing e opens edit mode with anyway starts with insert mode by default).
-  - core flow shipped: insert-by-default edit, Esc → command line on the statusline (grey hint + non-vim shortcuts), :w/:wq/:x/:q/:q!/:preview with grey Tab-autocomplete, second Esc discards, `i` opens the editor from preview. Remaining vim/helix commands are tracked as unchecked items in VIM.md.
-- [ ] work through the unchecked vim/helix commands in VIM.md (normal-mode motions, :N, :%s, command history, …)
-- [x] the file browser should update with the directories/files are created/deleted. right now it shows stale. (per-tick mtime poll of the listed dir — `poll_browser_change` — plus rescan on every navigation; covered by `poll_browser_change_rebuilds_when_dir_contents_change`)
+# Tasks
+
+Pending work only. The SDK/CLI port and the md-tui merge (M0–M7) are shipped;
+their plans were dropped. API/rate-limit reference lives in `RESEARCH.md`.
+
+## User suggested tasks
+
+- [x] When working with a bulleted list, new line should create bullet list, similarly patterns like number, alphabets for numbered ordering stuff should also happen when user press enter it should add with the next numbering. also "- [ ]" tick box should also repeat similar to the bullet list. Enter now auto-continues `-`/`*`/`+` bullets, `1.`/`1)` numbered (incrementing), `a.`/`A)` alpha (advancing), and `- [ ]`/`- [x]` checkboxes (new item unchecked); Enter on an empty marker terminates the list (`list_continuation` in `app.rs`).
+- [x] in the file/dir browser screen, type-ahead find. Implemented lf-style: `f` arms find mode, then typed chars build an anchored, smartcase prefix query and the selection live-jumps; `;`/`,` cycle next/prev match, `Enter` opens, `Esc` cancels. (Chose a trigger key over bare letters — the vim-TUI canon, e.g. lf/ranger/vifm/yazi — to avoid colliding with the single-letter command bindings.)
+- [x] create a new file (`n`) and rename an entry (`c` / F2) in the local browser; new file opens straight into the editor.
+- [x] publish a local file to HackMD (`U`) — stamps the file with a managed `<!-- hackmd … -->` link block (id, url, publish link, synced time) and re-pushes update the linked note instead of creating a duplicate (`src/tui/hackmd_meta.rs`).
+- [x] editor drag-selection now supports `x` cut and `p` / Ctrl-V paste-over (replace selection with clipboard) alongside the existing `y` copy / Del delete.
+- [ ] ability to publish a note or change visibility of note from the editor or preview (cloud notes; `P` already toggles visibility from the cloud browser/reader)
+
+## Editor — vim/helix command line (`:` after Esc)
+
+- [ ] `:s/old/new/` and `:%s/old/new/g` — substitute
+- [ ] command history (↑/↓ on the command line)
+
+## Editor — entering / leaving edit
+
+- [ ] `o` / `O` — open editor with a new line below / above
+- [ ] `A` — open editor with cursor at end of current line
+
+## Editor — insert-mode editing (modern-GUI flavor)
+
+- [ ] Cmd/Ctrl-←/→ — line start / end (GUI style)
+- [x] auto-indent continuation for lists (`- ` / `1. ` on Enter) — see the user-suggested item above
+- [ ] bracket/emphasis pair completion (`*`, `_`, `[`, `(`, `` ` ``)
+
+## Editor — normal-mode motion layer (future)
+
+The editor opens in insert mode; Esc goes to the command line, not a full
+normal mode. This whole layer is future work toward vim/helix navigation.
+
+- [ ] `h j k l` — char/line movement without leaving normal mode
+- [ ] `w b e` — word motions
+- [ ] `0 $ ^` — line start / end / first non-blank
+- [ ] `gg G` — buffer top / bottom
+- [ ] `{ }` — paragraph motions
+- [ ] counts on motions (`5j`, `3w`)
+- [ ] `dd yy p` — delete / yank / paste line
+- [ ] `x` — delete char, `r` — replace char
+- [ ] `u` / `Ctrl-R` — undo / redo (normal-mode bindings)
+- [ ] `v` visual selection + `y d` over it (helix-style select-first also fine)
+- [ ] `/` search within the buffer while editing
+- [ ] `.` — repeat last change
+
+## Cloud TUI — manual end-to-end verification
+
+Needs a human terminal; headless PTY smoke check already passed.
+
+- [ ] With a real token: `H` → cloud list loads; open a note; edit + Ctrl-S, verify on hackmd.io; `P` publish → open publish_link; `S` download; `U` push; `n` create; `D` delete
+- [ ] No token: `H` shows the login instruction, app stays usable locally
+- [ ] `cargo run --features tui -- tui` opens the cloud view via the `hackmd` bin
+
+## HackMD comments (API gap)
+
+The v1 REST API has no comment/reaction endpoints — see `RESEARCH.md` and
+upstream issue [hackmdio/hackmd-io-issues#428](https://github.com/hackmdio/hackmd-io-issues/issues/428).
+
+- [ ] Add weight to #428: 👍 + a comment as a third-party Rust SDK/CLI consumer
+- [ ] Note in README that comments aren't fetchable via the API (link #428)
+
+## Future (post-v0.1, was out of scope in the original plan)
+
+- [ ] Image upload — `POST /notes/{id}/images` (SDK + CLI)

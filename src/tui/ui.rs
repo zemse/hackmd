@@ -1528,6 +1528,20 @@ fn compute_middle(app: &App) -> Mid {
             }
         }
     }
+    // Browser type-ahead find: show the live query and whether it matches.
+    if let View::Browser(b) = &app.view {
+        if let Some(q) = b.find.as_ref() {
+            let matched = !q.is_empty() && b.find_from(q, 0).is_some();
+            let txt = if q.is_empty() {
+                "find: _  (type to jump  ;/, next/prev  Esc cancel)".to_string()
+            } else if matched {
+                format!("find: {q}_  (;/, next/prev  Enter open  Esc cancel)")
+            } else {
+                format!("find: {q}_  (no match)")
+            };
+            return Mid::Search(txt);
+        }
+    }
     if !app.status.is_empty() {
         return Mid::Status(app.status.clone());
     }
@@ -1546,7 +1560,9 @@ fn compute_middle(app: &App) -> Mid {
         if let Some(e) = r.edit.as_ref() {
             // An active drag-selection swaps in its action menu.
             if e.selection.as_ref().map(|s| s.is_active()).unwrap_or(false) {
-                return Mid::Hint("selection  y copy  Del delete  Esc cancel".into());
+                return Mid::Hint(
+                    "selection  y copy  x cut  p paste  Del delete  Esc cancel".into(),
+                );
             }
             return Mid::Hint(
                 "type to edit  Ctrl-S save  Alt-←/→ word  Ctrl-Z undo  Esc command".into(),
@@ -1595,7 +1611,9 @@ fn default_hint(app: &App) -> String {
             }
             _ => "j/k:scroll  /:find  t:toc  e:edit  Tab:links  ?:help  q:quit".into(),
         },
-        View::Browser(_) => "j/k  Enter:open  /search  T:fuzzy  H:hackmd  ?:help  q:quit".into(),
+        View::Browser(_) => {
+            "j/k  Enter:open  n:new  c:rename  f:find  H:hackmd  ?:help  q:quit".into()
+        }
         View::Cloud(c) => {
             if c.show_tab_bar() {
                 "j/k  Enter:open  Tab:workspace  R:refresh  H:local  ?:help  q:quit".into()
@@ -1731,11 +1749,13 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from("  Ctrl-S           save  (Ctrl-W fallback for XOFF terminals)"),
         Line::from("  Ctrl-Z / Ctrl-Y  undo / redo          Esc Esc  discard"),
         Line::from("  Alt-←/→          word jump    Alt-Bksp/Del  word delete"),
-        Line::from("  drag             select text — then y copy, Del delete, Esc cancel"),
+        Line::from("  drag select      y copy  x cut  p paste  Del delete  Esc cancel"),
+        Line::from("  Enter            continue list (-, 1., - [ ]); empty item ends it"),
         Line::from("  Esc              command line — :w :wq :q :preview (Tab completes)"),
         Line::from(""),
         section(" Local files"),
-        Line::from("  U                push file up as a new HackMD note"),
+        Line::from("  n                new file (browser)   c / F2  rename"),
+        Line::from("  U                publish to HackMD (re-push updates the note)"),
         Line::from("  Ctrl-G           git lens (diff vs HEAD; staged + unstaged)"),
         Line::from("  r                mark read (browser; dirs recurse)"),
         Line::from(""),
