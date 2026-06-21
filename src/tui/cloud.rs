@@ -77,6 +77,14 @@ pub enum CloudMsg {
         id: String,
         result: Result<NotePermissionRole, String>,
     },
+    /// A macOS dictionary lookup finished. `result` is the definition text, or
+    /// `None` when the word has no entry (or the platform is unsupported). Not
+    /// a network op — it runs on a plain background thread, so it works even
+    /// when logged out.
+    Defined {
+        word: String,
+        result: Option<String>,
+    },
 }
 
 /// Why a note fetch was issued — tells the receiver what to do with the body.
@@ -279,6 +287,17 @@ impl CloudContext {
             let result = res.map_err(|e| e.to_string());
             let _ = tx.send(CloudMsg::Deleted { id, title, result });
         })
+    }
+
+    /// Look up `word` in the macOS system dictionary on a background thread →
+    /// `Defined`. Independent of the HackMD client/runtime (the result returns
+    /// over the same channel), so it works while logged out.
+    pub fn spawn_lookup(&self, word: String) {
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::tui::dict::lookup(&word);
+            let _ = tx.send(CloudMsg::Defined { word, result });
+        });
     }
 
     /// PATCH `readPermission` — `guest` publishes, `owner` unpublishes

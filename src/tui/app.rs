@@ -158,11 +158,42 @@ pub struct App {
     /// Transient cursor into `edit_cmd_history` while navigating it; `None`
     /// when on the live (just-typed) command line.
     pub edit_cmd_nav: Option<usize>,
+    /// Dictionary-definition popover (double-click a word). `None` when closed.
+    pub lookup: Option<LookupState>,
 }
 
 /// How often a still-open linked file re-syncs with upstream in the
 /// background (catching edits made on hackmd.io).
 pub const SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// In-TUI dictionary-definition popover, opened by double-clicking a word in
+/// the reader (which also copies it). Anchored to the word on screen and
+/// dismissed on Esc, a scroll, or a click outside it.
+pub struct LookupState {
+    /// The word being looked up. The async `Defined` reply is matched against
+    /// this so a stale result for a previous word is ignored.
+    pub word: String,
+    /// Word position for anchoring the popover: `(start_col, row, width)` in
+    /// absolute terminal cells.
+    pub anchor: (u16, u16, u16),
+    /// Lookup progress / result.
+    pub status: LookupStatus,
+    /// Scroll offset into the definition text, for entries taller than the box.
+    pub scroll: u16,
+    /// Popup rect from the last frame, recorded by the renderer for mouse
+    /// hit-testing (click-inside vs click-outside). Empty until first drawn.
+    pub rect: Rect,
+}
+
+/// Progress of a dictionary lookup shown in the popover.
+pub enum LookupStatus {
+    /// Background lookup in flight.
+    Loading,
+    /// Definition text ready to display.
+    Ready(String),
+    /// The word has no dictionary entry (or lookup isn't supported here).
+    NotFound,
+}
 
 /// A full-screen conflict-resolution session: the three-way merge found
 /// regions local and upstream both changed, and the user picks a side per
@@ -843,6 +874,7 @@ impl App {
             conflict: None,
             edit_cmd_history: Vec::new(),
             edit_cmd_nav: None,
+            lookup: None,
         })
     }
 
@@ -860,7 +892,11 @@ impl App {
     /// Apply one finished cloud operation. Pure sync state transition —
     /// no terminal, no network — so it unit-tests without a runtime.
     pub fn apply_cloud_msg(&mut self, msg: CloudMsg) {
-        self.cloud.note_response_received();
+        // A dictionary lookup isn't a tracked cloud op (it never bumped the
+        // in-flight counter), so it must not decrement it either.
+        if !matches!(msg, CloudMsg::Defined { .. }) {
+            self.cloud.note_response_received();
+        }
         match msg {
             CloudMsg::Lists(Ok(lists)) => {
                 self.cloud.lists = Some(lists);
@@ -1195,6 +1231,28 @@ impl App {
                 }
                 Err(e) => self.status = format!("HackMD publish failed: {e}"),
             },
+            CloudMsg::Defined { word, result } => {
+                // Drop a stale reply: the popover may have closed or moved to a
+                // different word while this lookup was in flight.
+                if let Some(l) = self.lookup.as_mut()
+                    && l.word == word
+                {
+                    l.status = match result {
+                        Some(text) => LookupStatus::Ready(text),
+                        None => LookupStatus::NotFound,
+                    };
+                    l.scroll = 0;
+                }
+            }
+        }
+    }
+
+    /// Scroll the open definition popover by `delta` rows. The renderer clamps
+    /// the upper bound against the entry's length, so over-scrolling just rests
+    /// at the bottom.
+    pub fn lookup_scroll(&mut self, delta: i32) {
+        if let Some(l) = self.lookup.as_mut() {
+            l.scroll = (l.scroll as i32 + delta).max(0) as u16;
         }
     }
 

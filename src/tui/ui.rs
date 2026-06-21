@@ -130,6 +130,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.help_open {
         draw_help(f, app, area);
     }
+
+    // The definition popover sits above everything else, anchored to its word.
+    if app.lookup.is_some() {
+        draw_lookup(f, app);
+    }
 }
 
 /// Centered table-of-contents popup (`t` in the Reader). One row per
@@ -186,6 +191,124 @@ fn draw_toc(f: &mut Frame, app: &App, area: Rect) {
         .title(" Contents ")
         .border_style(Style::default().fg(theme.heading[0]));
     f.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Dictionary-definition popover, anchored under a double-clicked word. Sits
+/// just below the word and centered on it when it fits; clamps into the body
+/// and flips above the word when it would overflow the bottom. Records its rect
+/// on `app` so mouse handling can tell clicks inside it from clicks outside.
+fn draw_lookup(f: &mut Frame, app: &mut App) {
+    use crate::tui::app::LookupStatus;
+    let area = app.viewport;
+    let Some(l) = app.lookup.as_ref() else {
+        return;
+    };
+
+    let w = 52u16.min(area.width.saturating_sub(2)).max(24);
+    let text_w = w.saturating_sub(2).max(1) as usize;
+    let word = l.word.clone();
+    let anchor = l.anchor;
+    let scroll0 = l.scroll;
+    let body: Vec<String> = match &l.status {
+        LookupStatus::Loading => vec![format!("Looking up “{word}”…")],
+        LookupStatus::NotFound => vec![format!("No definition for “{word}”.")],
+        LookupStatus::Ready(text) => wrap_text(text, text_w),
+    };
+    let border = app.opts.theme.heading[0];
+
+    let max_h = area.height.saturating_sub(2).clamp(3, 16);
+    let h = (body.len() as u16 + 2).clamp(3, max_h);
+    let inner_h = h.saturating_sub(2) as usize;
+    let max_scroll = body.len().saturating_sub(inner_h);
+    let scroll = (scroll0 as usize).min(max_scroll);
+
+    // Horizontal: center on the word, clamp into the body.
+    let (anchor_col, anchor_row, anchor_w) = anchor;
+    let word_center = anchor_col.saturating_add(anchor_w / 2);
+    let max_x = (area.x + area.width.saturating_sub(w)).max(area.x);
+    let x = word_center.saturating_sub(w / 2).clamp(area.x, max_x);
+    // Vertical: just below the word if it fits, otherwise above it.
+    let bottom = area.y + area.height;
+    let below = anchor_row.saturating_add(1);
+    let y = if below + h <= bottom {
+        below
+    } else {
+        anchor_row.saturating_sub(h)
+    }
+    .clamp(area.y, bottom.saturating_sub(h));
+
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    if let Some(l) = app.lookup.as_mut() {
+        l.rect = popup;
+    }
+
+    let scrolled = body.len() > inner_h;
+    let title = if scrolled {
+        format!(" {word} ↕ ")
+    } else {
+        format!(" {word} ")
+    };
+    let lines: Vec<Line<'static>> = body
+        .into_iter()
+        .skip(scroll)
+        .take(inner_h)
+        .map(Line::from)
+        .collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(border));
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Greedy word-wrap `text` to `width` display columns, honoring its own line
+/// breaks. Over-long tokens are hard-split so nothing overflows the popover.
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        let mut line = String::new();
+        for word in para.split_whitespace() {
+            if word.width() > width {
+                // A single token wider than the box: hard-split it by char.
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                }
+                let mut chunk = String::new();
+                for ch in word.chars() {
+                    if chunk.width() + ch.width().unwrap_or(0) > width && !chunk.is_empty() {
+                        out.push(std::mem::take(&mut chunk));
+                    }
+                    chunk.push(ch);
+                }
+                line = chunk;
+                continue;
+            }
+            let need = if line.is_empty() {
+                word.width()
+            } else {
+                line.width() + 1 + word.width()
+            };
+            if !line.is_empty() && need > width {
+                out.push(std::mem::take(&mut line));
+            }
+            if line.is_empty() {
+                line.push_str(word);
+            } else {
+                line.push(' ');
+                line.push_str(word);
+            }
+        }
+        out.push(line);
+    }
+    out
 }
 
 /// Centered one-line modal prompt (new note title, push title, download
@@ -2043,6 +2166,21 @@ mod tests {
     use super::*;
     use crate::tui::app::{App, Options, Source, View};
     use crate::tui::theme::Theme;
+
+    #[test]
+    fn wrap_text_respects_width_and_breaks() {
+        let lines = wrap_text("the quick brown fox jumps", 9);
+        assert!(lines.iter().all(|l| l.chars().count() <= 9), "{lines:?}");
+        assert_eq!(lines.join(" "), "the quick brown fox jumps");
+        // Own line breaks are preserved.
+        assert_eq!(
+            wrap_text("a\nb", 20),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // A token longer than the box is hard-split rather than overflowing.
+        let hard = wrap_text("supercalifragilistic", 6);
+        assert!(hard.len() > 1 && hard.iter().all(|l| l.chars().count() <= 6));
+    }
 
     fn app_with_link() -> App {
         let mut p = std::env::temp_dir();

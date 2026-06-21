@@ -75,6 +75,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         return Ok(());
     }
+    // The definition popover is transient: Esc dismisses it and is swallowed;
+    // any other key dismisses it but still acts, so the same keystroke that
+    // closes it (e.g. j/k to scroll) also drives the page underneath.
+    if app.lookup.is_some() {
+        app.lookup = None;
+        if key.code == KeyCode::Esc {
+            return Ok(());
+        }
+    }
     // The conflict resolver is a full-screen modal — it captures all keys.
     if app.conflict.is_some() {
         return handle_conflict_key(app, key);
@@ -1555,6 +1564,33 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
     ) {
         app.status.clear();
     }
+    // Definition popover, while open. The wheel over it scrolls the entry; the
+    // wheel elsewhere dismisses it (then scrolls the page); clicks/drags inside
+    // are swallowed to keep it open; a click outside dismisses it but still
+    // acts (so a double-click on another word re-looks-up).
+    if let Some(l) = app.lookup.as_ref() {
+        let over_popup = point_in(l.rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollUp if over_popup => {
+                app.lookup_scroll(-1);
+                return Ok(());
+            }
+            MouseEventKind::ScrollDown if over_popup => {
+                app.lookup_scroll(1);
+                return Ok(());
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => app.lookup = None,
+            MouseEventKind::Down(MouseButton::Left)
+            | MouseEventKind::Drag(MouseButton::Left)
+            | MouseEventKind::Up(MouseButton::Left)
+                if over_popup =>
+            {
+                return Ok(());
+            }
+            MouseEventKind::Down(MouseButton::Left) => app.lookup = None,
+            _ => {}
+        }
+    }
 
     // An armed statusline-path drag owns the gesture until mouse-up, even if
     // the pointer wanders off the row mid-drag.
@@ -2057,12 +2093,25 @@ fn select_word_at(app: &mut App, col: u16, row: u16) {
     };
 
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let Some(word) = word_at_col(&text, local_col) else {
+    let Some((word, word_col, word_w)) = word_span_at_col(&text, local_col) else {
         return;
     };
 
     copy_to_clipboard(&word);
     app.status = format!("Copied: {}", word);
+
+    // Anchor a definition popover under the word and kick off the offline
+    // macOS dictionary lookup on a background thread. No-op off macOS.
+    if crate::tui::dict::SUPPORTED {
+        app.lookup = Some(crate::tui::app::LookupState {
+            word: word.clone(),
+            anchor: (inner_x + word_col as u16, row, word_w as u16),
+            status: crate::tui::app::LookupStatus::Loading,
+            scroll: 0,
+            rect: ratatui::layout::Rect::default(),
+        });
+        app.cloud.ctx.spawn_lookup(word);
+    }
 }
 
 /// Best-effort copy: native helper on macOS, OSC 52 otherwise (with tmux
@@ -2316,7 +2365,11 @@ mod scroll_damp_tests {
 
 #[cfg(test)]
 mod word_tests {
-    use super::word_at_col;
+    /// The word-only projection of `word_span_at_col`, the shape these tests
+    /// were written against.
+    fn word_at_col(line: &str, target_col: usize) -> Option<String> {
+        super::word_span_at_col(line, target_col).map(|(w, _, _)| w)
+    }
 
     #[test]
     fn picks_word_in_simple_line() {
@@ -2324,6 +2377,21 @@ mod word_tests {
         // 'q' lives at columns 4..5
         assert_eq!(word_at_col(line, 4).as_deref(), Some("quick"));
         assert_eq!(word_at_col(line, 6).as_deref(), Some("quick"));
+    }
+
+    #[test]
+    fn reports_word_span_for_popover_anchor() {
+        let line = "the quick brown fox";
+        // "quick" starts at display column 4 and is 5 wide.
+        let (word, start_col, width) = super::word_span_at_col(line, 6).expect("a word");
+        assert_eq!(word, "quick");
+        assert_eq!(start_col, 4);
+        assert_eq!(width, 5);
+        // Trailing punctuation is excluded from the span, not just the word.
+        let (w2, s2, wd2) = super::word_span_at_col("hi there,", 5).expect("a word");
+        assert_eq!(w2, "there");
+        assert_eq!(s2, 3);
+        assert_eq!(wd2, 5);
     }
 
     #[test]
@@ -2381,9 +2449,11 @@ fn xy_to_source_offset(
 }
 
 /// Walk left and right from `target_col` in `line` (using display widths) to
-/// find the run of non-whitespace characters covering that column.
-fn word_at_col(line: &str, target_col: usize) -> Option<String> {
-    use unicode_width::UnicodeWidthChar;
+/// find the run of non-whitespace characters covering that column, and report
+/// its display position: `(word, start_col, width)`. The position anchors the
+/// definition popover under the double-clicked word.
+fn word_span_at_col(line: &str, target_col: usize) -> Option<(String, usize, usize)> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
     let mut col = 0usize;
     let mut hit_byte: Option<usize> = None;
     for (i, ch) in line.char_indices() {
@@ -2395,14 +2465,10 @@ fn word_at_col(line: &str, target_col: usize) -> Option<String> {
         col += w;
     }
     let hit = hit_byte?;
-    let bytes = line.as_bytes();
-    if bytes
-        .get(hit)
-        .map(|b| (*b as char).is_whitespace())
-        .unwrap_or(true)
-    {
+    if line[hit..].chars().next()?.is_whitespace() {
         return None;
     }
+    // Expand to whitespace on both sides.
     let mut start = hit;
     while start > 0 {
         let prev = line[..start].chars().next_back()?;
@@ -2412,31 +2478,28 @@ fn word_at_col(line: &str, target_col: usize) -> Option<String> {
         start -= prev.len_utf8();
     }
     let mut end = hit;
-    let mut iter = line[hit..].char_indices();
-    iter.next(); // skip the hit char itself
-    let len = line.len();
-    let mut cursor = hit;
-    for (_, ch) in line[hit..].char_indices() {
+    for ch in line[hit..].chars() {
         if ch.is_whitespace() {
             break;
         }
-        cursor += ch.len_utf8();
-        end = cursor;
+        end += ch.len_utf8();
     }
-    let _ = iter;
-    let _ = len;
     if end <= start {
         return None;
     }
-    let word = line[start..end].trim_matches(|c: char| {
-        // Strip leading/trailing punctuation but keep internal characters.
+    // Strip leading/trailing punctuation but keep internal characters (so
+    // links/anchors like `src/foo_bar-baz.rs` stay whole).
+    let raw = &line[start..end];
+    let word = raw.trim_matches(|c: char| {
         c.is_ascii_punctuation() && !matches!(c, '_' | '-' | '/' | '.' | '#')
     });
     if word.is_empty() {
-        None
-    } else {
-        Some(word.to_string())
+        return None;
     }
+    // Byte offset of the trimmed word within the line → its display column.
+    let word_start = start + (word.as_ptr() as usize - raw.as_ptr() as usize);
+    let start_col = line[..word_start].width();
+    Some((word.to_string(), start_col, word.width()))
 }
 
 fn point_in(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
