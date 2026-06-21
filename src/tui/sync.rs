@@ -7,32 +7,64 @@
 //! sync. The base for note `<id>` is cached at `<root>/.hackmd/<id>.base`, the
 //! common ancestor fed to the three-way merge.
 
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Directory under the search root holding per-note base snapshots.
 const CACHE_DIR: &str = ".hackmd";
 
-/// Path of the base-content cache file for `id` under `root`.
-pub fn base_path(root: &Path, id: &str) -> PathBuf {
+/// Length of the conflict markers `merge3` asks diffy to emit. The marked-up
+/// text is internal (parsed into [`Segment`]s, never shown raw), so we pick a
+/// run far longer than git's default 7: a content line beginning with seven
+/// `<`/`=`/`>`/`|` (e.g. a `=======` setext underline) would otherwise be
+/// misread as a conflict marker.
+const CONFLICT_MARKER_LEN: usize = 12;
+
+fn safe_id(id: &str) -> String {
     // `id`s are HackMD note ids (URL-safe), so they're already filename-safe,
     // but guard against separators defensively.
-    let safe: String = id
-        .chars()
+    id.chars()
         .map(|c| if c == '/' || c == '\\' { '_' } else { c })
-        .collect();
-    root.join(CACHE_DIR).join(format!("{safe}.base"))
+        .collect()
 }
 
-/// Read the cached base content for `id`, if present.
-pub fn read_base(root: &Path, id: &str) -> Option<String> {
-    std::fs::read_to_string(base_path(root, id)).ok()
+/// A short, stable hash of `file`'s canonical path, so two local files linked
+/// to the *same* note id don't share (and clobber) one base snapshot.
+fn path_tag(file: &Path) -> String {
+    // Canonicalize so the same file reached via different relative paths maps
+    // to one base; fall back to the raw path before the file exists.
+    let canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    canon.hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
-/// Write `content` as the new base for `id`, creating the cache dir as needed.
-/// Best-effort: returns the IO error so the caller can surface it, but a
-/// failure doesn't corrupt anything (the merge already happened in memory).
-pub fn write_base(root: &Path, id: &str, content: &str) -> std::io::Result<()> {
-    let path = base_path(root, id);
+/// Path of the base-content cache file for note `id` linked at `file`.
+pub fn base_path(root: &Path, id: &str, file: &Path) -> PathBuf {
+    root.join(CACHE_DIR)
+        .join(format!("{}.{}.base", safe_id(id), path_tag(file)))
+}
+
+/// Pre-path-keying cache path (`<id>.base`). Read as a fallback so files linked
+/// by an earlier release aren't orphaned; they migrate on the next write.
+fn legacy_base_path(root: &Path, id: &str) -> PathBuf {
+    root.join(CACHE_DIR).join(format!("{}.base", safe_id(id)))
+}
+
+/// Read the cached base content for note `id` at `file`, if present. Falls back
+/// to the legacy single-slot cache so existing links keep working.
+pub fn read_base(root: &Path, id: &str, file: &Path) -> Option<String> {
+    std::fs::read_to_string(base_path(root, id, file))
+        .ok()
+        .or_else(|| std::fs::read_to_string(legacy_base_path(root, id)).ok())
+}
+
+/// Write `content` as the new base for note `id` at `file`, creating the cache
+/// dir as needed. Best-effort: returns the IO error so the caller can surface
+/// it, but a failure doesn't corrupt anything (the merge already happened in
+/// memory).
+pub fn write_base(root: &Path, id: &str, file: &Path, content: &str) -> std::io::Result<()> {
+    let path = base_path(root, id, file);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -85,7 +117,9 @@ pub fn merge3(base: &str, local: &str, remote: &str) -> MergeOutcome {
     if base == remote {
         return MergeOutcome::Clean(local.to_string());
     }
-    match diffy::merge(base, local, remote) {
+    let mut opts = diffy::MergeOptions::new();
+    opts.set_conflict_marker_length(CONFLICT_MARKER_LEN);
+    match opts.merge(base, local, remote) {
         Ok(merged) => MergeOutcome::Clean(merged),
         Err(conflicted) => MergeOutcome::Conflict {
             segments: parse_conflicts(&conflicted),
@@ -101,7 +135,17 @@ fn parse_conflicts(text: &str) -> Vec<Segment> {
     let mut stable = String::new();
     let mut lines = text.split_inclusive('\n').peekable();
 
-    let is_marker = |line: &str, ch: char| line.starts_with(&ch.to_string().repeat(7));
+    // A real diffy marker is exactly `CONFLICT_MARKER_LEN` of the char, alone
+    // on its line (the `|||||||`/`=======` separators) or followed by a space
+    // and a label (`<<<<<<< ours`). Requiring that boundary stops a content
+    // line that merely *starts* with a long run of the char from being eaten.
+    let is_marker = |line: &str, ch: char| {
+        let marker = ch.to_string().repeat(CONFLICT_MARKER_LEN);
+        match line.strip_prefix(&marker) {
+            Some(rest) => rest.is_empty() || rest.starts_with([' ', '\n', '\r']),
+            None => false,
+        }
+    };
 
     while let Some(line) = lines.next() {
         if is_marker(line, '<') {
@@ -217,9 +261,69 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hackmd-sync-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(read_base(&dir, "note1").is_none());
-        write_base(&dir, "note1", "hello\n").unwrap();
-        assert_eq!(read_base(&dir, "note1").as_deref(), Some("hello\n"));
+        let a = dir.join("a.md");
+        assert!(read_base(&dir, "note1", &a).is_none());
+        write_base(&dir, "note1", &a, "hello\n").unwrap();
+        assert_eq!(read_base(&dir, "note1", &a).as_deref(), Some("hello\n"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_id_two_files_keep_independent_bases() {
+        let dir = std::env::temp_dir().join(format!("hackmd-base2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.md");
+        let b = dir.join("b.md");
+        // Two local files linked to the same note id must not clobber each
+        // other's base snapshot.
+        write_base(&dir, "shared", &a, "base of a\n").unwrap();
+        write_base(&dir, "shared", &b, "base of b\n").unwrap();
+        assert_eq!(
+            read_base(&dir, "shared", &a).as_deref(),
+            Some("base of a\n")
+        );
+        assert_eq!(
+            read_base(&dir, "shared", &b).as_deref(),
+            Some("base of b\n")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_single_slot_base_is_read_as_fallback() {
+        let dir = std::env::temp_dir().join(format!("hackmd-baselegacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(CACHE_DIR)).unwrap();
+        // A pre-path-keying `<id>.base` left by an older release.
+        std::fs::write(legacy_base_path(&dir, "old"), "legacy base\n").unwrap();
+        let f = dir.join("old.md");
+        assert_eq!(read_base(&dir, "old", &f).as_deref(), Some("legacy base\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_char_line_inside_a_conflict_is_not_split() {
+        // Overlapping edits force a conflict whose local side contains a line
+        // of seven `=` (a setext underline). The old `starts_with(7×ch)` parse
+        // mistook that for a `=======` separator and truncated the hunk; the
+        // longer, boundary-checked marker keeps the content whole.
+        let base = "intro\nshared line\noutro\n";
+        let local = "intro\nlocal change\n=======\ntail\noutro\n";
+        let remote = "intro\nremote change\noutro\n";
+        let MergeOutcome::Conflict { segments } = merge3(base, local, remote) else {
+            panic!("expected a conflict");
+        };
+        let (local_side, _remote_side) = segments
+            .iter()
+            .find_map(|s| match s {
+                Segment::Conflict { local, remote } => Some((local.clone(), remote.clone())),
+                _ => None,
+            })
+            .expect("a conflict segment");
+        assert!(
+            local_side.contains("=======") && local_side.contains("tail"),
+            "the `=======` content line must stay inside the hunk, got {local_side:?}"
+        );
     }
 }

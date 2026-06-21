@@ -962,7 +962,7 @@ impl App {
             },
             CloudMsg::Saved {
                 id,
-                advance_base,
+                base_file,
                 result,
             } => {
                 self.cloud.saving.remove(&id);
@@ -980,13 +980,13 @@ impl App {
                         // this lands the base stays at the prior agreed state,
                         // so an interim re-sync against the not-yet-updated
                         // server still prefers our local content rather than
-                        // reverting it. Only for saves that carry the linked
-                        // file's content (`advance_base`): a cloud-only edit of
-                        // a note that also has a local file must NOT move the
-                        // base, or the next sync would push the stale local
-                        // file back and revert the cloud edit.
-                        if advance_base {
-                            let _ = crate::tui::sync::write_base(&self.root, &id, &content);
+                        // reverting it. Only for saves that carry a linked
+                        // file's content (`base_file` is `Some`): a cloud-only
+                        // edit of a note that also has a local file must NOT
+                        // move the base, or the next sync would push the stale
+                        // local file back and revert the cloud edit.
+                        if let Some(file) = &base_file {
+                            let _ = crate::tui::sync::write_base(&self.root, &id, file, &content);
                         }
                         // Pessimistic dirty: cleared only here, and only when
                         // the buffer still matches what the server accepted —
@@ -1065,7 +1065,8 @@ impl App {
                             match pushed {
                                 Some(body) => {
                                     self.write_synced_local(&path, &meta, &body);
-                                    let _ = crate::tui::sync::write_base(&self.root, &id, &body);
+                                    let _ =
+                                        crate::tui::sync::write_base(&self.root, &id, &path, &body);
                                 }
                                 None => self.stamp_local_file(&path, &meta),
                             }
@@ -1447,10 +1448,12 @@ impl App {
                     self.status = "Update already in flight…".into();
                     return;
                 }
-                if self
-                    .cloud
-                    .request_save(meta.id.clone(), meta.team_path.clone(), clean, true)
-                {
+                if self.cloud.request_save(
+                    meta.id.clone(),
+                    meta.team_path.clone(),
+                    clean,
+                    Some(path.clone()),
+                ) {
                     // Optimistically refresh the `synced:` stamp; the base
                     // advances when the `Saved` confirmation lands.
                     self.stamp_local_file(&path, &meta);
@@ -1621,7 +1624,7 @@ impl App {
         // Missing base → treat as empty so nothing is silently dropped: equal
         // sides still merge clean, differing sides surface as a conflict.
         let base = crate::tui::sync::normalize_newlines(
-            &crate::tui::sync::read_base(&self.root, &id).unwrap_or_default(),
+            &crate::tui::sync::read_base(&self.root, &id, &path).unwrap_or_default(),
         );
         match crate::tui::sync::merge3(&base, &local_clean, &remote) {
             crate::tui::sync::MergeOutcome::Clean(merged) => {
@@ -1638,7 +1641,7 @@ impl App {
                         id.clone(),
                         meta.team_path.clone(),
                         merged.clone(),
-                        true,
+                        Some(path.clone()),
                     ) {
                         self.status = "Synced with HackMD".into();
                     } else {
@@ -1647,7 +1650,7 @@ impl App {
                 } else {
                     // Already equal to upstream — server == merged is the new
                     // agreed base, with no push to wait on.
-                    let _ = crate::tui::sync::write_base(&self.root, &id, &merged);
+                    let _ = crate::tui::sync::write_base(&self.root, &id, &path, &merged);
                     self.status = "Synced with HackMD".into();
                 }
                 if let Some(c) = self.cloud.note_cache.get_mut(&id) {
@@ -1753,9 +1756,12 @@ impl App {
         // server) keeps our resolved local content rather than reverting it. A
         // skipped push (save already in flight) leaves the resolved content on
         // disk for the next sync to retry — don't claim it reached the server.
-        let pushed =
-            self.cloud
-                .request_save(id.clone(), meta.team_path.clone(), merged.clone(), true);
+        let pushed = self.cloud.request_save(
+            id.clone(),
+            meta.team_path.clone(),
+            merged.clone(),
+            Some(path.clone()),
+        );
         if let Some(c) = self.cloud.note_cache.get_mut(&id) {
             c.note.content = merged;
             c.etag = None;
@@ -2213,7 +2219,7 @@ impl App {
                 // background. On failure the error hits the statusline and
                 // the local flip stays (the next revalidation reconciles).
                 // Cloud-only edit → never advance a linked file's base.
-                if self.cloud.request_save(id, team_path, r.raw.clone(), false) {
+                if self.cloud.request_save(id, team_path, r.raw.clone(), None) {
                     self.status = if was_checked {
                         "Unchecked (syncing…)".into()
                     } else {
@@ -3124,7 +3130,7 @@ impl App {
                     return Ok(());
                 }
                 // Cloud-only edit → never advance a linked file's base.
-                if self.cloud.request_save(id, team_path, r.raw.clone(), false) {
+                if self.cloud.request_save(id, team_path, r.raw.clone(), None) {
                     if let Some(e) = r.edit.as_mut() {
                         e.command = None;
                     }
@@ -5940,7 +5946,7 @@ mod cloud_msg_tests {
 
         app.apply_cloud_msg(CloudMsg::Saved {
             id: "n1".into(),
-            advance_base: false,
+            base_file: None,
             result: Err("500".into()),
         });
 
@@ -5966,26 +5972,27 @@ mod cloud_msg_tests {
 
         let mut app = test_app();
         app.root = dir.clone();
+        let file = dir.join("note.md");
 
-        // Cloud-only save (advance_base: false) leaves the base absent.
+        // Cloud-only save (base_file: None) leaves the base absent.
         app.apply_cloud_msg(CloudMsg::Saved {
             id: "n1".into(),
-            advance_base: false,
+            base_file: None,
             result: Ok("cloud edit".to_string()),
         });
         assert!(
-            crate::tui::sync::read_base(&dir, "n1").is_none(),
+            crate::tui::sync::read_base(&dir, "n1", &file).is_none(),
             "cloud-only save must not write the base"
         );
 
-        // A linked-file save (advance_base: true) advances it to that content.
+        // A linked-file save (base_file: Some) advances that file's base.
         app.apply_cloud_msg(CloudMsg::Saved {
             id: "n1".into(),
-            advance_base: true,
+            base_file: Some(file.clone()),
             result: Ok("local content".to_string()),
         });
         assert_eq!(
-            crate::tui::sync::read_base(&dir, "n1").as_deref(),
+            crate::tui::sync::read_base(&dir, "n1", &file).as_deref(),
             Some("local content"),
             "linked-file save must advance the base"
         );
@@ -6003,7 +6010,7 @@ mod cloud_msg_tests {
 
         app.apply_cloud_msg(CloudMsg::Saved {
             id: "n1".into(),
-            advance_base: false,
+            base_file: None,
             result: Ok("body".to_string()),
         });
         let View::Reader(r) = &app.view else {
@@ -6020,7 +6027,7 @@ mod cloud_msg_tests {
         app.view = View::Reader(r);
         app.apply_cloud_msg(CloudMsg::Saved {
             id: "n1".into(),
-            advance_base: false,
+            base_file: None,
             result: Ok("body".to_string()),
         });
         let View::Reader(r) = &app.view else {

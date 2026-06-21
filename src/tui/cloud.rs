@@ -50,11 +50,13 @@ pub enum CloudMsg {
     /// (i.e. what we sent) for cache/dirty bookkeeping.
     Saved {
         id: String,
-        /// True when this save reflects a linked local file's content, so the
-        /// sync base should advance to it on success. False for cloud-only
-        /// edits (editor/checkbox toggles on a `CloudNote`) — those must never
-        /// touch a linked file's base, or they'd revert it on the next sync.
-        advance_base: bool,
+        /// `Some(path)` when this save reflects the linked local file at `path`,
+        /// so its sync base should advance to the saved content on success.
+        /// `None` for cloud-only edits (editor/checkbox toggles on a
+        /// `CloudNote`) — those must never touch a linked file's base, or
+        /// they'd revert it on the next sync. Path-keyed so two files linked to
+        /// the same note id keep independent bases.
+        base_file: Option<PathBuf>,
         result: Result<String, String>,
     },
     /// A `POST /notes` (or team variant) finished.
@@ -223,14 +225,14 @@ impl CloudContext {
     }
 
     /// PATCH a note's content (team variant when `team_path` is set) → `Saved`.
-    /// `advance_base` is echoed back so the handler knows whether to advance
-    /// the linked file's sync base on success.
+    /// `base_file` is echoed back so the handler knows which linked file's sync
+    /// base (if any) to advance on success.
     pub fn spawn_save(
         &self,
         id: String,
         team_path: Option<String>,
         content: String,
-        advance_base: bool,
+        base_file: Option<PathBuf>,
     ) -> bool {
         self.spawn_with(move |client, tx| async move {
             let res = match &team_path {
@@ -244,7 +246,7 @@ impl CloudContext {
             let result = res.map(|_| content).map_err(|e| e.to_string());
             let _ = tx.send(CloudMsg::Saved {
                 id,
-                advance_base,
+                base_file,
                 result,
             });
         })
@@ -369,21 +371,21 @@ impl CloudState {
 
     /// Request a content save; tracks the id in `saving`. Returns `false`
     /// when disconnected or when a save for this id is already in flight.
-    /// `advance_base` flows through to the `Saved` handler (see
+    /// `base_file` flows through to the `Saved` handler (see
     /// [`CloudMsg::Saved`]).
     pub fn request_save(
         &mut self,
         id: String,
         team_path: Option<String>,
         content: String,
-        advance_base: bool,
+        base_file: Option<PathBuf>,
     ) -> bool {
         if self.saving.contains(&id) {
             return false;
         }
         let spawned = self
             .ctx
-            .spawn_save(id.clone(), team_path, content, advance_base);
+            .spawn_save(id.clone(), team_path, content, base_file);
         if spawned {
             self.saving.insert(id);
         }

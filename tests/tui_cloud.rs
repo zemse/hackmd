@@ -90,7 +90,7 @@ async fn save_patches_content_and_delivers_saved() {
         .await;
 
     let mut ctx = ctx(&server.uri());
-    assert!(ctx.spawn_save("n1".into(), None, "new body".into(), false));
+    assert!(ctx.spawn_save("n1".into(), None, "new body".into(), None));
 
     match recv(&mut ctx).await {
         CloudMsg::Saved { id, result, .. } => {
@@ -114,7 +114,7 @@ async fn team_save_uses_team_route() {
         .await;
 
     let mut ctx = ctx(&server.uri());
-    assert!(ctx.spawn_save("n2".into(), Some("demo".into()), "team body".into(), false));
+    assert!(ctx.spawn_save("n2".into(), Some("demo".into()), "team body".into(), None));
 
     match recv(&mut ctx).await {
         CloudMsg::Saved { id, result, .. } => {
@@ -253,6 +253,6 @@ fn disconnected_context_spawns_nothing() {
     let ctx = CloudContext::disconnected();
     assert!(!ctx.is_connected());
     assert!(!ctx.spawn_fetch_lists());
-    assert!(!ctx.spawn_save("n1".into(), None, "x".into(), false));
+    assert!(!ctx.spawn_save("n1".into(), None, "x".into(), None));
     assert!(!ctx.spawn_fetch_note("n1".into(), FetchIntent::OpenReader { scroll: 0 }));
 }

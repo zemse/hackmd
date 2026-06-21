@@ -43,18 +43,18 @@ Needs a human terminal; headless PTY smoke check already passed.
 - [ ] No token: `H` shows the login instruction, app stays usable locally
 - [ ] `cargo run --features tui -- tui` opens the cloud view via the `hackmd` bin
 
-## Sync hardening — remaining edge cases (from a code review)
+## Sync — known limitations (accepted)
 
-The high-impact sync bugs are fixed (cloud-edit no longer reverts a linked
-file; a hand-written `<!-- hackmd-sync` marker is no longer eaten; a corrupted
-link block warns instead of duplicating; a team note recovers its `team:` from
-cache; CRLF remote no longer spuriously conflicts; skipped pushes report
-"deferred" rather than "synced"). These narrower ones are left:
+The sync review's findings are addressed: cloud edits no longer revert a linked
+file; a hand-written `<!-- hackmd-sync` marker isn't eaten; a corrupted link
+block warns instead of duplicating; a team note recovers its `team:` from cache;
+CRLF remote no longer spuriously conflicts; skipped pushes report "deferred";
+two files linked to one note id now keep independent (path-keyed) bases; and a
+content line of `=`/`<`/`>`/`|` runs is no longer mistaken for a conflict
+marker. Two items are left as accepted behavior, not open bugs:
 
-- [ ] Two local files linked to the same note id share one base (`<root>/.hackmd/<id>.base` is keyed by id, not path) — a second linked copy can clobber the first's base. Would need per-(id,path) base keying.
-- [ ] First-publish and conflict-resolve write a snapshot captured a moment earlier; an external on-disk edit in that sub-second window is lost. Narrow race; would need a re-read + recheck before the write.
-- [ ] Missing base cache (`.hackmd/<id>.base` deleted) turns any local≠remote difference into a whole-file conflict. Equal sides already merge clean and rebuild the base; only the genuinely-diverged case is noisy. A "no base" path could offer take-local / take-remote instead of a giant conflict.
-- [ ] `parse_conflicts` keys conflict markers off `starts_with(repeat(7))`, so a user line beginning with 7+ `<`/`=`/`>`/`|` chars could be misread as a marker. Exotic; would need fenced-code / exact-marker awareness.
+- A missing base cache (`.hackmd/*.base` deleted) with local≠remote surfaces a whole-file conflict. This is the *safe* outcome — with no common ancestor a 3-way merge is impossible, and rebuilding the base from either side would silently drop edits. Equal content still merges clean and rebuilds the base. A dedicated "no common ancestor → keep local / keep remote" two-way chooser would be a nicer UX, but it's a feature, not a fix.
+- First-publish / conflict-resolve write a snapshot captured a moment earlier, so an on-disk edit made in that sub-second window is lost. Inherent to the optimistic async flow; the window is tiny and not worth the re-read/recheck plumbing.
 
 ## HackMD comments (API gap)
 
