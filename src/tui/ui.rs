@@ -856,30 +856,64 @@ fn highlight_focused(
 
 /// Paint a match span. Non-current matches get the code-block background
 /// (subtle); the current match gets the link-focus color reversed.
-fn highlight_doc_match(
-    line: &mut Line<'_>,
+fn highlight_doc_match<'a>(
+    line: &mut Line<'a>,
     col_start: usize,
     col_end: usize,
     is_current: bool,
     theme: &crate::tui::theme::Theme,
 ) {
+    let match_style = |base: Style| {
+        if is_current {
+            base.fg(theme.link_focused)
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            base.add_modifier(Modifier::REVERSED)
+        }
+    };
+
+    // A match is usually a substring of a wider span, so we split the span at
+    // the match's display-column boundaries and restyle only the middle slice.
+    let mut new_spans: Vec<Span<'a>> = Vec::with_capacity(line.spans.len());
     let mut col = 0usize;
-    for span in &mut line.spans {
+    for span in line.spans.drain(..) {
         let w = unicode_width::UnicodeWidthStr::width(span.content.as_ref());
         let span_start = col;
         let span_end = col + w;
-        if span_start >= col_start && span_end <= col_end {
-            span.style = if is_current {
-                span.style
-                    .fg(theme.link_focused)
-                    .add_modifier(Modifier::REVERSED)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                span.style.add_modifier(Modifier::REVERSED)
-            };
-        }
         col = span_end;
+
+        // No overlap with the match range: keep the span untouched.
+        if span_end <= col_start || span_start >= col_end {
+            new_spans.push(span);
+            continue;
+        }
+
+        let style = span.style;
+        let (mut before, mut middle, mut after) = (String::new(), String::new(), String::new());
+        let mut c = span_start;
+        for ch in span.content.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            if c < col_start {
+                before.push(ch);
+            } else if c < col_end {
+                middle.push(ch);
+            } else {
+                after.push(ch);
+            }
+            c += cw;
+        }
+        if !before.is_empty() {
+            new_spans.push(Span::styled(before, style));
+        }
+        if !middle.is_empty() {
+            new_spans.push(Span::styled(middle, match_style(style)));
+        }
+        if !after.is_empty() {
+            new_spans.push(Span::styled(after, style));
+        }
     }
+    line.spans = new_spans;
 }
 
 /// Paint reverse-video over spans that fall within `[col_start, col_end)` to
