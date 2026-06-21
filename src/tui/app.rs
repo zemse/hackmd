@@ -137,6 +137,137 @@ pub struct App {
     /// Paste prefers the system clipboard (so external copies work) but falls
     /// back to this when the clipboard can't be read (no `pbpaste`, headless).
     pub yank: Option<String>,
+    /// True while a local↔HackMD sync fetch is in flight, so the periodic
+    /// poll doesn't stack duplicate requests for the same file.
+    pub pending_sync: bool,
+    /// `(path, when)` of the last sync trigger for the open linked file. A
+    /// different path syncs immediately (on open); the same path re-syncs once
+    /// `SYNC_INTERVAL` elapses (background upstream polling).
+    pub last_sync: Option<(PathBuf, std::time::Instant)>,
+    /// Active conflict-resolution session (local vs upstream), shown as a
+    /// full-screen resolver. `None` when there's no unresolved conflict.
+    pub conflict: Option<ConflictState>,
+}
+
+/// How often a still-open linked file re-syncs with upstream in the
+/// background (catching edits made on hackmd.io).
+pub const SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// A full-screen conflict-resolution session: the three-way merge found
+/// regions local and upstream both changed, and the user picks a side per
+/// hunk before the merged result is written back and pushed.
+pub struct ConflictState {
+    pub path: PathBuf,
+    pub id: String,
+    /// Link metadata, carried through so the resolved file is re-stamped.
+    pub meta: crate::tui::hackmd_meta::HackmdMeta,
+    /// The document in order: stable text interleaved with conflict hunks.
+    pub items: Vec<ConflictItem>,
+    /// Index of the focused conflict hunk among the conflict items only.
+    pub selected: usize,
+    /// Scroll offset into the rendered resolver view.
+    pub scroll: u16,
+}
+
+/// One piece of the conflicted document.
+pub enum ConflictItem {
+    /// Agreed text, shown dimmed and uneditable.
+    Stable(String),
+    /// A region both sides changed; the user resolves it via `choice`.
+    Conflict {
+        local: String,
+        remote: String,
+        choice: ConflictChoice,
+    },
+}
+
+/// Which side of a conflict hunk the user picked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConflictChoice {
+    /// Not yet decided — blocks finishing the resolution.
+    Unresolved,
+    Local,
+    Remote,
+    /// Keep both, local first.
+    Both,
+    /// Drop the hunk entirely.
+    Neither,
+}
+
+impl ConflictState {
+    /// Total number of conflict hunks.
+    pub fn conflict_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| matches!(i, ConflictItem::Conflict { .. }))
+            .count()
+    }
+
+    /// Number of hunks still `Unresolved`.
+    pub fn unresolved_count(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|i| {
+                matches!(
+                    i,
+                    ConflictItem::Conflict {
+                        choice: ConflictChoice::Unresolved,
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    /// Set the choice on the currently-selected conflict hunk.
+    pub fn set_choice(&mut self, choice: ConflictChoice) {
+        if let Some(item) = self
+            .items
+            .iter_mut()
+            .filter(|i| matches!(i, ConflictItem::Conflict { .. }))
+            .nth(self.selected)
+        {
+            if let ConflictItem::Conflict { choice: c, .. } = item {
+                *c = choice;
+            }
+        }
+    }
+
+    /// Move the selected-hunk cursor by `delta`, clamped.
+    pub fn step(&mut self, delta: i32) {
+        let n = self.conflict_count();
+        if n == 0 {
+            return;
+        }
+        let next = (self.selected as i32 + delta).clamp(0, n as i32 - 1) as usize;
+        self.selected = next;
+    }
+
+    /// Assemble the resolved document from the current choices. Returns `None`
+    /// if any hunk is still unresolved.
+    pub fn assemble(&self) -> Option<String> {
+        let mut out = String::new();
+        for item in &self.items {
+            match item {
+                ConflictItem::Stable(s) => out.push_str(s),
+                ConflictItem::Conflict {
+                    local,
+                    remote,
+                    choice,
+                } => match choice {
+                    ConflictChoice::Unresolved => return None,
+                    ConflictChoice::Local => out.push_str(local),
+                    ConflictChoice::Remote => out.push_str(remote),
+                    ConflictChoice::Both => {
+                        out.push_str(local);
+                        out.push_str(remote);
+                    }
+                    ConflictChoice::Neither => {}
+                },
+            }
+        }
+        Some(out)
+    }
 }
 
 /// Modal one-line prompt. Input handling mirrors the doc-search prompt:
@@ -675,6 +806,9 @@ impl App {
             last_local: None,
             prompt: None,
             yank: None,
+            pending_sync: false,
+            last_sync: None,
+            conflict: None,
         })
     }
 
@@ -730,6 +864,14 @@ impl App {
                             etag,
                         },
                     );
+                    // A sync fetch three-way merges the upstream content into
+                    // the linked local file and is done — it owns its own
+                    // local/reader updates.
+                    if let crate::tui::cloud::FetchIntent::SyncLocal { path } = &intent {
+                        let remote = note.content.clone();
+                        self.apply_sync(path.clone(), remote);
+                        return;
+                    }
                     // A download fetch writes the file and is done — it never
                     // navigates or touches the open reader.
                     if let crate::tui::cloud::FetchIntent::DownloadTo(path) = &intent {
@@ -786,8 +928,19 @@ impl App {
                         }
                     }
                 }
-                Ok(FetchedNote::NotModified) => {}
+                Ok(FetchedNote::NotModified) => {
+                    if matches!(intent, crate::tui::cloud::FetchIntent::SyncLocal { .. }) {
+                        self.pending_sync = false;
+                    }
+                }
                 Err(e) => {
+                    // A sync fetch that failed just clears its in-flight flag
+                    // and retries on the next interval; no navigation to undo.
+                    if matches!(intent, crate::tui::cloud::FetchIntent::SyncLocal { .. }) {
+                        self.pending_sync = false;
+                        self.status = format!("Sync failed: {e}");
+                        return;
+                    }
                     // A failed fetch abandons any navigation waiting on it —
                     // history was never pushed, so the user simply stays put.
                     if self
@@ -811,6 +964,17 @@ impl App {
                         if let Some(cached) = self.cloud.note_cache.get_mut(&id) {
                             cached.note.content = content.clone();
                             cached.etag = None;
+                        }
+                        // Advance the sync base only once the server has
+                        // accepted the content — never optimistically. Until
+                        // this lands the base stays at the prior agreed state,
+                        // so an interim re-sync against the not-yet-updated
+                        // server still prefers our local content rather than
+                        // reverting it. Guarded to linked notes (a base file
+                        // already exists) so cloud-only saves don't litter
+                        // `.hackmd/`.
+                        if crate::tui::sync::base_path(&self.root, &id).exists() {
+                            let _ = crate::tui::sync::write_base(&self.root, &id, &content);
                         }
                         // Pessimistic dirty: cleared only here, and only when
                         // the buffer still matches what the server accepted —
@@ -876,6 +1040,16 @@ impl App {
                                     .unwrap_or_default(),
                             };
                             self.stamp_local_file(&path, &meta);
+                            // Seed the sync base with the content we just
+                            // pushed (== the note's content), so future syncs
+                            // have a correct common ancestor from the start.
+                            let base = self
+                                .cloud
+                                .note_cache
+                                .get(&id)
+                                .map(|c| c.note.content.clone())
+                                .unwrap_or_default();
+                            let _ = crate::tui::sync::write_base(&self.root, &id, &base);
                             self.status = format!("Pushed {name} → \"{title}\" (linked)");
                         }
                     }
@@ -1248,8 +1422,8 @@ impl App {
                     .cloud
                     .request_save(meta.id.clone(), meta.team_path.clone(), clean)
                 {
-                    // Optimistically refresh the `synced:` stamp; the PATCH
-                    // almost always succeeds and the id/links don't change.
+                    // Optimistically refresh the `synced:` stamp; the base
+                    // advances when the `Saved` confirmation lands.
                     self.stamp_local_file(&path, &meta);
                     self.status = format!("⟳ updating \"{}\"…", meta.id);
                 } else {
@@ -1319,6 +1493,209 @@ impl App {
                 r.last_meta = file_meta(path);
             }
         }
+    }
+
+    /// Background-driven sync check, called every event-loop tick. When a
+    /// linked local file is open in the reader (and not being edited), kick off
+    /// a sync on first sight and then every [`SYNC_INTERVAL`]. Cheap: the file
+    /// read + parse only runs when a sync is actually due.
+    pub fn maybe_sync(&mut self) {
+        if self.pending_sync || self.conflict.is_some() || !self.cloud.is_connected() {
+            return;
+        }
+        // Only auto-sync a plain (non-edit) reader over a real file.
+        let path = match &self.view {
+            View::Reader(r) if r.edit.is_none() => match &r.origin {
+                ReaderOrigin::File(p) => p.clone(),
+                _ => return,
+            },
+            _ => return,
+        };
+        let due = match &self.last_sync {
+            Some((p, t)) if *p == path => t.elapsed() >= SYNC_INTERVAL,
+            _ => true, // newly-opened file (or never synced) → sync now
+        };
+        if due {
+            self.sync_local_file(path);
+        }
+    }
+
+    /// Kick off a three-way sync for the linked file at `path`: fetch upstream,
+    /// then merge when it lands (see [`Self::apply_sync`]). No-op for an
+    /// unlinked file or when disconnected. Records the trigger time so the
+    /// periodic poll backs off until [`SYNC_INTERVAL`] passes.
+    pub fn sync_local_file(&mut self, path: PathBuf) {
+        if self.pending_sync || !self.cloud.is_connected() {
+            return;
+        }
+        // Record the attempt up front so an unlinked (or unreadable) file backs
+        // off for the interval instead of being re-read every tick.
+        self.last_sync = Some((path.clone(), std::time::Instant::now()));
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Some(meta) = crate::tui::hackmd_meta::parse(&content) else {
+            // Not linked yet — nothing to sync.
+            return;
+        };
+        if self
+            .cloud
+            .request_note(meta.id, crate::tui::cloud::FetchIntent::SyncLocal { path })
+        {
+            self.pending_sync = true;
+        }
+    }
+
+    /// Apply a landed sync fetch: three-way merge the upstream `remote` content
+    /// against the linked local file and its cached base. A clean merge writes
+    /// both sides and updates the base; a conflict opens the resolver. Dropped
+    /// (retried later) if the file is mid-edit and dirty, so in-progress
+    /// keystrokes are never clobbered.
+    pub fn apply_sync(&mut self, path: PathBuf, remote: String) {
+        self.pending_sync = false;
+        // Never overwrite an unsaved edit buffer — defer to the next trigger.
+        let dirty_edit = matches!(
+            &self.view,
+            View::Reader(r) if matches!(&r.origin, ReaderOrigin::File(p) if *p == path)
+                && r.edit.as_ref().map(|e| e.dirty).unwrap_or(false)
+        );
+        if dirty_edit {
+            return;
+        }
+        let Ok(local_raw) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let Some(meta) = crate::tui::hackmd_meta::parse(&local_raw) else {
+            return;
+        };
+        let id = meta.id.clone();
+        let local_clean = crate::tui::hackmd_meta::strip(&local_raw);
+        // Missing base → treat as empty so nothing is silently dropped: equal
+        // sides still merge clean, differing sides surface as a conflict.
+        let base = crate::tui::sync::read_base(&self.root, &id).unwrap_or_default();
+        match crate::tui::sync::merge3(&base, &local_clean, &remote) {
+            crate::tui::sync::MergeOutcome::Clean(merged) => {
+                self.write_synced_local(&path, &meta, &merged);
+                if merged != remote {
+                    // Push the merged result; the base advances when the
+                    // `Saved` confirmation lands (not optimistically), so a
+                    // re-sync before the server updates can't revert us.
+                    self.cloud
+                        .request_save(id.clone(), meta.team_path.clone(), merged.clone());
+                } else {
+                    // Already equal to upstream — server == merged is the new
+                    // agreed base, with no push to wait on.
+                    let _ = crate::tui::sync::write_base(&self.root, &id, &merged);
+                }
+                if let Some(c) = self.cloud.note_cache.get_mut(&id) {
+                    c.note.content = merged;
+                    c.etag = None;
+                }
+                self.status = "Synced with HackMD".into();
+            }
+            crate::tui::sync::MergeOutcome::Conflict { segments } => {
+                self.open_conflict(path, id, meta, segments);
+            }
+        }
+    }
+
+    /// Write the synced `body` (already block-free) to the local file with a
+    /// refreshed managed block, updating the open reader buffer if it's the
+    /// same file and not being edited.
+    fn write_synced_local(
+        &mut self,
+        path: &Path,
+        meta: &crate::tui::hackmd_meta::HackmdMeta,
+        body: &str,
+    ) {
+        let synced = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let stamped = crate::tui::hackmd_meta::upsert(body, meta, &synced);
+        if let Err(e) = std::fs::write(path, &stamped) {
+            self.status = format!("write {}: {e}", path.display());
+            return;
+        }
+        if let View::Reader(r) = &mut self.view {
+            if matches!(&r.origin, ReaderOrigin::File(p) if p == path) {
+                // A *dirty* edit is never overwritten (the caller already bails
+                // in that case); a clean edit buffer adopts the merged content
+                // with the cursor clamped back into range.
+                let dirty = r.edit.as_ref().map(|e| e.dirty).unwrap_or(false);
+                if !dirty && r.raw != stamped {
+                    r.raw = stamped;
+                    r.rendered = None;
+                    r.focus = None;
+                    r.hover_link = None;
+                    r.hover_checkbox = None;
+                    if let Some(e) = r.edit.as_mut() {
+                        e.cursor = floor_char_boundary(&r.raw, e.cursor.min(r.raw.len()));
+                    }
+                }
+                r.last_meta = file_meta(path);
+            }
+        }
+    }
+
+    /// Build a [`ConflictState`] from merge segments and switch to the resolver.
+    fn open_conflict(
+        &mut self,
+        path: PathBuf,
+        id: String,
+        meta: crate::tui::hackmd_meta::HackmdMeta,
+        segments: Vec<crate::tui::sync::Segment>,
+    ) {
+        let items = segments
+            .into_iter()
+            .map(|s| match s {
+                crate::tui::sync::Segment::Stable(t) => ConflictItem::Stable(t),
+                crate::tui::sync::Segment::Conflict { local, remote } => ConflictItem::Conflict {
+                    local,
+                    remote,
+                    choice: ConflictChoice::Unresolved,
+                },
+            })
+            .collect();
+        let count = {
+            let st = ConflictState {
+                path,
+                id,
+                meta,
+                items,
+                selected: 0,
+                scroll: 0,
+            };
+            let c = st.conflict_count();
+            self.conflict = Some(st);
+            c
+        };
+        self.status = format!("Sync conflict — {count} hunk(s) to resolve");
+    }
+
+    /// Finish the active conflict resolution: assemble the chosen content,
+    /// write it locally and push it upstream, update the base, and close the
+    /// resolver. No-op while any hunk is still unresolved.
+    pub fn resolve_conflict(&mut self) {
+        let Some(st) = self.conflict.as_ref() else {
+            return;
+        };
+        let Some(merged) = st.assemble() else {
+            self.status = format!("{} hunk(s) still unresolved", st.unresolved_count());
+            return;
+        };
+        let path = st.path.clone();
+        let id = st.id.clone();
+        let meta = st.meta.clone();
+        self.conflict = None;
+        self.write_synced_local(&path, &meta, &merged);
+        // Push the resolution; the base advances on the `Saved` confirmation,
+        // not here, so the periodic re-sync (which still sees the pre-push
+        // server) keeps our resolved local content rather than reverting it.
+        self.cloud
+            .request_save(id.clone(), meta.team_path.clone(), merged.clone());
+        if let Some(c) = self.cloud.note_cache.get_mut(&id) {
+            c.note.content = merged;
+            c.etag = None;
+        }
+        self.status = "Conflict resolved — syncing…".into();
     }
 
     /// `U` on a local file: prompt for the pushed note's title (defaults to
@@ -2389,7 +2766,8 @@ impl App {
                 floor_char_boundary(&r.raw, b.min(r.raw.len())),
             ),
             None => {
-                let c = floor_char_boundary(&r.raw, r.edit.as_ref().unwrap().cursor.min(r.raw.len()));
+                let c =
+                    floor_char_boundary(&r.raw, r.edit.as_ref().unwrap().cursor.min(r.raw.len()));
                 (c, c)
             }
         };
@@ -2546,6 +2924,9 @@ impl App {
         if r.edit.is_none() {
             return Ok(());
         }
+        // Set when a saved local file is linked, so we can kick off a sync
+        // after the `view`/`r` borrow is released.
+        let mut sync_after: Option<PathBuf> = None;
         match r.origin.clone() {
             ReaderOrigin::File(path) => {
                 std::fs::write(&path, &r.raw)
@@ -2556,6 +2937,10 @@ impl App {
                     e.command = None;
                 }
                 self.status = format!("Saved {}", path.display());
+                // Linked file → merge with upstream right after saving.
+                if crate::tui::hackmd_meta::parse(&r.raw).is_some() {
+                    sync_after = Some(path);
+                }
             }
             ReaderOrigin::CloudNote { id, team_path, .. } => {
                 // Pessimistic: `dirty` stays set until `Saved{Ok}` lands, so
@@ -2574,6 +2959,13 @@ impl App {
                 }
             }
             ReaderOrigin::Stdin => {}
+        }
+        // Trigger an immediate sync now the borrow on `self.view` is gone. A
+        // fresh trigger (clear `last_sync`) so it fires this cycle regardless
+        // of the background interval.
+        if let Some(path) = sync_after {
+            self.last_sync = None;
+            self.sync_local_file(path);
         }
         Ok(())
     }
@@ -2680,8 +3072,7 @@ impl App {
                     // would strand `scroll` near the old end and show an empty
                     // screen with only the final line at the top.
                     if !in_split {
-                        let page_max =
-                            rd.lines.len().saturating_sub(viewport_h.max(1)) as u16;
+                        let page_max = rd.lines.len().saturating_sub(viewport_h.max(1)) as u16;
                         if r.scroll > page_max {
                             r.scroll = page_max;
                         }
@@ -4020,8 +4411,88 @@ fn score_substring(text: &str, pattern: &str) -> Option<i32> {
 }
 
 #[cfg(test)]
+mod conflict_state_tests {
+    use super::{ConflictChoice, ConflictItem, ConflictState};
+    use crate::tui::hackmd_meta::HackmdMeta;
+    use std::path::PathBuf;
+
+    fn state(items: Vec<ConflictItem>) -> ConflictState {
+        ConflictState {
+            path: PathBuf::from("/tmp/x.md"),
+            id: "id1".into(),
+            meta: HackmdMeta {
+                id: "id1".into(),
+                team_path: None,
+                url: String::new(),
+                publish_link: String::new(),
+            },
+            items,
+            selected: 0,
+            scroll: 0,
+        }
+    }
+
+    fn conflict() -> ConflictItem {
+        ConflictItem::Conflict {
+            local: "LOCAL\n".into(),
+            remote: "REMOTE\n".into(),
+            choice: ConflictChoice::Unresolved,
+        }
+    }
+
+    #[test]
+    fn assemble_blocks_until_all_resolved() {
+        let mut st = state(vec![
+            ConflictItem::Stable("top\n".into()),
+            conflict(),
+            ConflictItem::Stable("bottom\n".into()),
+        ]);
+        assert_eq!(st.conflict_count(), 1);
+        assert_eq!(st.unresolved_count(), 1);
+        // Unresolved → no output.
+        assert!(st.assemble().is_none());
+        st.set_choice(ConflictChoice::Local);
+        assert_eq!(st.unresolved_count(), 0);
+        assert_eq!(st.assemble().as_deref(), Some("top\nLOCAL\nbottom\n"));
+    }
+
+    #[test]
+    fn each_choice_assembles_its_side() {
+        let cases = [
+            (ConflictChoice::Local, "LOCAL\n"),
+            (ConflictChoice::Remote, "REMOTE\n"),
+            (ConflictChoice::Both, "LOCAL\nREMOTE\n"),
+            (ConflictChoice::Neither, ""),
+        ];
+        for (choice, expected) in cases {
+            let mut st = state(vec![conflict()]);
+            st.set_choice(choice);
+            assert_eq!(st.assemble().as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn set_choice_and_step_target_the_selected_hunk() {
+        let mut st = state(vec![conflict(), ConflictItem::Stable("mid\n".into()), conflict()]);
+        assert_eq!(st.conflict_count(), 2);
+        // Resolve first, advance, resolve second.
+        st.set_choice(ConflictChoice::Local);
+        st.step(1);
+        assert_eq!(st.selected, 1);
+        st.set_choice(ConflictChoice::Remote);
+        assert_eq!(st.unresolved_count(), 0);
+        assert_eq!(st.assemble().as_deref(), Some("LOCAL\nmid\nREMOTE\n"));
+        // Step clamps at the ends.
+        st.step(5);
+        assert_eq!(st.selected, 1);
+        st.step(-5);
+        assert_eq!(st.selected, 0);
+    }
+}
+
+#[cfg(test)]
 mod list_continuation_tests {
-    use super::{list_continuation, ListContinue};
+    use super::{ListContinue, list_continuation};
 
     fn marker(line: &str) -> Option<String> {
         match list_continuation(line, true) {
@@ -5386,7 +5857,10 @@ mod cloud_msg_tests {
 
     #[test]
     fn first_h1_extracts_title_or_none() {
-        assert_eq!(first_h1("# Hello World\n\nbody").as_deref(), Some("Hello World"));
+        assert_eq!(
+            first_h1("# Hello World\n\nbody").as_deref(),
+            Some("Hello World")
+        );
         // Leading prose then an H1 still counts.
         assert_eq!(
             first_h1("intro line\n# Real Title\n").as_deref(),

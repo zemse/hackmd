@@ -33,6 +33,9 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
         app.poll_browser_change();
         // Apply any cloud operations that finished since the last tick.
         app.drain_cloud_msgs();
+        // Bidirectional HackMD sync for a linked, open local file: fires on
+        // open and then every SYNC_INTERVAL to pull upstream edits.
+        app.maybe_sync();
         term.draw(|f| ui::draw(f, app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -71,6 +74,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             _ => {}
         }
         return Ok(());
+    }
+    // The conflict resolver is a full-screen modal — it captures all keys.
+    if app.conflict.is_some() {
+        return handle_conflict_key(app, key);
     }
     // Modal prompt (new note / push / download / delete confirm) captures
     // all keys while open.
@@ -1030,6 +1037,48 @@ fn close_edit_preview(app: &mut App) {
 /// Keystrokes while a modal prompt is open. Text prompts mirror the
 /// doc-search input handling; the delete confirmation accepts only
 /// `y`/Enter and treats everything else as a cancel.
+/// Keystrokes while the full-screen conflict resolver is open. `j`/`k` (and
+/// arrows) move between hunks; `l`/`u`/`b`/`n` (and `1`/`2`) pick a side for
+/// the focused hunk and auto-advance; Enter applies the resolution; Esc
+/// cancels (leaving both files untouched).
+fn handle_conflict_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    use crate::tui::app::ConflictChoice;
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        app.should_quit = true;
+        return Ok(());
+    }
+    let Some(st) = app.conflict.as_mut() else {
+        return Ok(());
+    };
+    // After choosing a side, jump to the next still-unresolved hunk so the
+    // user can rip through conflicts without manual navigation.
+    let mut choose = |choice: ConflictChoice| {
+        st.set_choice(choice);
+        st.step(1);
+    };
+    match key.code {
+        KeyCode::Char('j') | KeyCode::Down => st.step(1),
+        KeyCode::Char('k') | KeyCode::Up => st.step(-1),
+        KeyCode::Char('l') | KeyCode::Char('1') => choose(ConflictChoice::Local),
+        KeyCode::Char('u') | KeyCode::Char('2') => choose(ConflictChoice::Remote),
+        KeyCode::Char('b') => choose(ConflictChoice::Both),
+        KeyCode::Char('n') => choose(ConflictChoice::Neither),
+        KeyCode::Enter => app.resolve_conflict(),
+        KeyCode::Esc => {
+            app.conflict = None;
+            // Back off the periodic poll so we don't immediately re-detect the
+            // same conflict; the user can edit/save to retrigger sooner.
+            app.last_sync = app
+                .last_sync
+                .take()
+                .map(|(p, _)| (p, std::time::Instant::now()));
+            app.status = "Conflict resolution cancelled".into();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn handle_prompt_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.should_quit = true;

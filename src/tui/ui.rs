@@ -10,7 +10,7 @@ use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
@@ -61,6 +61,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let status = chunks[1];
     app.viewport = body;
     app.statusline_area = status;
+
+    // The conflict resolver is a full-screen modal — draw it over everything
+    // and skip the normal reader/browser pipeline.
+    if app.conflict.is_some() {
+        draw_conflict(f, app, area);
+        return;
+    }
 
     // Reserve 1 column on the right for the reader scrollbar so layout stays
     // stable whether or not content overflows. Browser ignores this width.
@@ -1701,6 +1708,184 @@ fn describe_target(t: &LinkTarget) -> String {
     }
 }
 
+/// Truncate `s` to at most `w` display columns (by char count — good enough
+/// for the resolver) and right-pad with spaces to exactly `w`.
+fn pad_truncate(s: &str, w: usize) -> String {
+    let mut out: String = s.chars().take(w).collect();
+    let len = out.chars().count();
+    if len < w {
+        out.push_str(&" ".repeat(w - len));
+    }
+    out
+}
+
+/// `(local_style, remote_style)` for a conflict hunk given the user's choice:
+/// the kept side is bright green, the dropped side dim; an unresolved hunk
+/// shows both in distinct inviting colours.
+fn conflict_side_styles(choice: app::ConflictChoice) -> (Style, Style) {
+    use app::ConflictChoice::*;
+    let chosen = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let dim = Style::default().fg(Color::DarkGray);
+    match choice {
+        Unresolved => (
+            Style::default().fg(Color::Yellow),
+            Style::default().fg(Color::Cyan),
+        ),
+        Local => (chosen, dim),
+        Remote => (dim, chosen),
+        Both => (chosen, chosen),
+        Neither => (dim, dim),
+    }
+}
+
+/// Full-screen three-way conflict resolver: stable context dimmed, each
+/// conflict hunk shown as side-by-side local/upstream columns with the
+/// focused hunk highlighted. Driven by [`crate::tui::events`]'s conflict key
+/// handler.
+fn draw_conflict(f: &mut Frame, app: &App, area: Rect) {
+    let Some(st) = app.conflict.as_ref() else {
+        return;
+    };
+    let theme = &app.opts.theme;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Min(1),    // body
+            Constraint::Length(1), // hint
+        ])
+        .split(area);
+    let (title_area, body_area, hint_area) = (chunks[0], chunks[1], chunks[2]);
+
+    let total = st.conflict_count();
+    let unresolved = st.unresolved_count();
+    let title = format!(
+        " Resolve conflicts — {total} hunk(s), {unresolved} unresolved  ({}) ",
+        st.path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("file")
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.heading[0])
+                .add_modifier(Modifier::BOLD),
+        ))),
+        title_area,
+    );
+
+    let full_w = body_area.width as usize;
+    let col_w = (full_w.saturating_sub(3) / 2).max(4);
+    let ctx_style = Style::default().fg(Color::DarkGray);
+    let mut lines: Vec<Line> = Vec::new();
+    let mut conflict_idx = 0usize;
+    let mut selected_line = 0usize;
+
+    let push_stable = |lines: &mut Vec<Line>, s: &str| {
+        let all: Vec<&str> = s.lines().collect();
+        let emit = |lines: &mut Vec<Line>, t: &str| {
+            let shown: String = t.chars().take(full_w.saturating_sub(2)).collect();
+            lines.push(Line::from(Span::styled(format!("  {shown}"), ctx_style)));
+        };
+        // Collapse long unchanged runs so conflicts stay in view.
+        if all.len() <= 6 {
+            for t in &all {
+                emit(lines, t);
+            }
+        } else {
+            for t in &all[..3] {
+                emit(lines, t);
+            }
+            lines.push(Line::from(Span::styled(
+                format!("  ⋯ {} unchanged lines ⋯", all.len() - 6),
+                ctx_style,
+            )));
+            for t in &all[all.len() - 3..] {
+                emit(lines, t);
+            }
+        }
+    };
+
+    for item in &st.items {
+        match item {
+            app::ConflictItem::Stable(s) => push_stable(&mut lines, s),
+            app::ConflictItem::Conflict {
+                local,
+                remote,
+                choice,
+            } => {
+                let is_sel = conflict_idx == st.selected;
+                if is_sel {
+                    selected_line = lines.len();
+                }
+                let chosen = match choice {
+                    app::ConflictChoice::Unresolved => "unresolved",
+                    app::ConflictChoice::Local => "local",
+                    app::ConflictChoice::Remote => "upstream",
+                    app::ConflictChoice::Both => "both",
+                    app::ConflictChoice::Neither => "drop",
+                };
+                let marker = if is_sel { "▶" } else { " " };
+                let header_style = if is_sel {
+                    Style::default()
+                        .fg(theme.heading[1])
+                        .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+                } else {
+                    Style::default()
+                        .fg(theme.heading[1])
+                        .add_modifier(Modifier::BOLD)
+                };
+                lines.push(Line::from(Span::styled(
+                    format!("{marker} conflict {}/{total}  [{chosen}]", conflict_idx + 1),
+                    header_style,
+                )));
+                // Column captions aligned over the side-by-side body.
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        pad_truncate("  local", col_w),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(" │ ", ctx_style),
+                    Span::styled("upstream", Style::default().fg(Color::DarkGray)),
+                ]));
+                let llines: Vec<&str> = local.split('\n').collect();
+                let rlines: Vec<&str> = remote.split('\n').collect();
+                let rows = llines.len().max(rlines.len());
+                let (lstyle, rstyle) = conflict_side_styles(*choice);
+                for i in 0..rows {
+                    let l = pad_truncate(llines.get(i).copied().unwrap_or(""), col_w);
+                    let r = pad_truncate(rlines.get(i).copied().unwrap_or(""), col_w);
+                    lines.push(Line::from(vec![
+                        Span::styled(l, lstyle),
+                        Span::styled(" │ ", ctx_style),
+                        Span::styled(r, rstyle),
+                    ]));
+                }
+                conflict_idx += 1;
+            }
+        }
+    }
+
+    // Keep the focused hunk in view: scroll it into the upper third.
+    let h = body_area.height as usize;
+    let max_scroll = lines.len().saturating_sub(h.max(1));
+    let scroll = selected_line.saturating_sub(h / 3).min(max_scroll);
+    f.render_widget(Paragraph::new(lines).scroll((scroll as u16, 0)), body_area);
+
+    let hint = " j/k move   l:local  u:upstream  b:both  n:drop   Enter:apply   Esc:cancel ";
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(theme.heading[1]),
+        ))),
+        hint_area,
+    );
+}
+
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let w = 66.min(area.width.saturating_sub(4));
     let h = 42.min(area.height.saturating_sub(4));
@@ -1755,7 +1940,9 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         section(" Local files"),
         Line::from("  n                new file (browser)   c / F2  rename"),
-        Line::from("  U                publish to HackMD (re-push updates the note)"),
+        Line::from("  U                publish to HackMD — links the file, then"),
+        Line::from("                   auto-syncs both ways (on open, save & poll)"),
+        Line::from("  conflicts        l:local u:upstream b:both n:drop Enter:apply"),
         Line::from("  Ctrl-G           git lens (diff vs HEAD; staged + unstaged)"),
         Line::from("  r                mark read (browser; dirs recurse)"),
         Line::from(""),

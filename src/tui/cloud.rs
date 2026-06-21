@@ -81,6 +81,9 @@ pub enum FetchIntent {
     DownloadTo(PathBuf),
     /// Conditional GET against a cached copy; 304 means "still current".
     Revalidate { etag: String },
+    /// Bidirectional sync: the fetched upstream content is three-way merged
+    /// against the linked local file at `path` and its cached base.
+    SyncLocal { path: PathBuf },
 }
 
 /// What to do with a freshly created note.
