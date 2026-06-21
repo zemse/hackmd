@@ -227,15 +227,13 @@ impl ConflictState {
 
     /// Set the choice on the currently-selected conflict hunk.
     pub fn set_choice(&mut self, choice: ConflictChoice) {
-        if let Some(item) = self
+        if let Some(ConflictItem::Conflict { choice: c, .. }) = self
             .items
             .iter_mut()
             .filter(|i| matches!(i, ConflictItem::Conflict { .. }))
             .nth(self.selected)
         {
-            if let ConflictItem::Conflict { choice: c, .. } = item {
-                *c = choice;
-            }
+            *c = choice;
         }
     }
 
