@@ -688,6 +688,76 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return handle_edit_command_key(app, key);
     }
 
+    // Shift + cursor motion grows the selection, macOS-style. Handled before
+    // the active-selection key capture below so repeated Shift+arrow keeps
+    // extending the selection instead of dropping it. Word-wise needs Alt/Ctrl
+    // too (Shift+Option/Ctrl+arrow, plus the macOS Esc-b/Esc-f forms); Cmd adds
+    // line-edge motion.
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    if shift {
+        if alt || ctrl {
+            match key.code {
+                KeyCode::Left => {
+                    app.edit_extend_word(-1);
+                    return Ok(());
+                }
+                KeyCode::Right => {
+                    app.edit_extend_word(1);
+                    return Ok(());
+                }
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    app.edit_extend_word(-1);
+                    return Ok(());
+                }
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    app.edit_extend_word(1);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        if key.modifiers.contains(KeyModifiers::SUPER) {
+            match key.code {
+                KeyCode::Left => {
+                    app.edit_extend_line_edge(false);
+                    return Ok(());
+                }
+                KeyCode::Right => {
+                    app.edit_extend_line_edge(true);
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+        match key.code {
+            KeyCode::Left => {
+                app.edit_extend_horizontal(-1);
+                return Ok(());
+            }
+            KeyCode::Right => {
+                app.edit_extend_horizontal(1);
+                return Ok(());
+            }
+            KeyCode::Up => {
+                app.edit_extend_vertical(-1);
+                return Ok(());
+            }
+            KeyCode::Down => {
+                app.edit_extend_vertical(1);
+                return Ok(());
+            }
+            KeyCode::Home => {
+                app.edit_extend_line_edge(false);
+                return Ok(());
+            }
+            KeyCode::End => {
+                app.edit_extend_line_edge(true);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     // An active drag-selection captures the next key: y copies, Backspace/
     // Delete deletes, Esc cancels. Any other key drops the selection and is
     // then handled normally (it does NOT replace the selected text).
@@ -1831,7 +1901,31 @@ fn handle_split_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if in_raw {
+            if in_raw && m.modifiers.contains(KeyModifiers::SHIFT) {
+                // Shift-click extends the selection from the existing anchor
+                // (or the current cursor) to the clicked char, inclusive of
+                // both end chars.
+                let anchor = match &app.view {
+                    View::Reader(r) => r.edit.as_ref().map(|e| {
+                        e.selection
+                            .as_ref()
+                            .filter(|s| s.dragged)
+                            .map(|s| s.anchor)
+                            .unwrap_or(e.cursor)
+                    }),
+                    _ => None,
+                };
+                split_click_raw(app, m.column, m.row);
+                if let Some(anchor) = anchor {
+                    let focus = match &app.view {
+                        View::Reader(r) => r.edit.as_ref().map(|e| e.cursor),
+                        _ => None,
+                    };
+                    if let Some(focus) = focus {
+                        app.edit_select_inclusive(anchor, focus);
+                    }
+                }
+            } else if in_raw {
                 split_click_raw(app, m.column, m.row);
                 // Arm a selection at the click position; it only activates
                 // if a drag moves the focus off this anchor.
@@ -2220,14 +2314,50 @@ fn clipboard_or_yank(app: &App) -> Option<String> {
 /// Paste the clipboard/register over the active editor selection, or at the
 /// cursor when nothing is selected. Clears the selection either way and
 /// reports the result on the statusline.
+///
+/// Special case: pasting a bare URL over an active selection turns the
+/// selection into a markdown link `[selected](url)` rather than replacing it.
+/// Anything that isn't a single link (after trimming surrounding whitespace)
+/// falls back to a plain paste-over.
 fn paste_over_selection(app: &mut App) {
     if let Some(text) = clipboard_or_yank(app) {
+        if let Some(url) = pasted_link_href(text.trim())
+            && app.edit_link_selection(&url)
+        {
+            app.status = format!("Linked selection → {url}");
+            return;
+        }
         app.edit_replace_selection(&text);
         app.status = format!("Pasted {} chars", text.chars().count());
     } else {
         app.edit_clear_selection();
         app.status = "Clipboard empty".into();
     }
+}
+
+/// If `s` is a single bare URL (no internal whitespace, a `scheme://host`
+/// form or a `www.` host), return the link target to use, normalising a
+/// `www.` host to an `https://` URL. `None` for anything that isn't a link.
+fn pasted_link_href(s: &str) -> Option<String> {
+    if s.is_empty() || s.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if let Some((scheme, rest)) = s.split_once("://") {
+        let scheme_ok = !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+        if scheme_ok && !rest.is_empty() {
+            return Some(s.to_string());
+        }
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix("www.") {
+        if !rest.is_empty() {
+            return Some(format!("https://{s}"));
+        }
+    }
+    None
 }
 
 fn osc52_copy(text: &str) {
@@ -2243,6 +2373,46 @@ fn osc52_copy(text: &str) {
         let _ = write!(out, "\x1b]52;c;{}\x1b\\", encoded);
     }
     let _ = out.flush();
+}
+
+#[cfg(test)]
+mod paste_link_tests {
+    use super::pasted_link_href;
+
+    #[test]
+    fn accepts_bare_urls() {
+        assert_eq!(
+            pasted_link_href("https://hackmd.io").as_deref(),
+            Some("https://hackmd.io")
+        );
+        assert_eq!(
+            pasted_link_href("http://example.com/a?b=c").as_deref(),
+            Some("http://example.com/a?b=c")
+        );
+        // www. host is normalised to an https URL.
+        assert_eq!(
+            pasted_link_href("www.example.com").as_deref(),
+            Some("https://www.example.com")
+        );
+        // Other schemes are fine too.
+        assert_eq!(
+            pasted_link_href("ftp://host/file").as_deref(),
+            Some("ftp://host/file")
+        );
+    }
+
+    #[test]
+    fn rejects_non_links() {
+        assert!(pasted_link_href("just some text").is_none());
+        assert!(pasted_link_href("hello world").is_none());
+        // Whitespace inside means it isn't a single link.
+        assert!(pasted_link_href("https://a b").is_none());
+        // Degenerate scheme/host.
+        assert!(pasted_link_href("https://").is_none());
+        assert!(pasted_link_href("://nohost").is_none());
+        assert!(pasted_link_href("www.").is_none());
+        assert!(pasted_link_href("").is_none());
+    }
 }
 
 #[cfg(test)]

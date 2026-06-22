@@ -3017,6 +3017,102 @@ impl App {
         }
     }
 
+    /// Run a cursor motion while growing the keyboard selection (Shift+arrow
+    /// family, macOS-style). Anchors at the pre-move cursor when no selection
+    /// is active, then drags the focus to wherever the motion lands. Drops the
+    /// selection if the motion didn't move (focus collapses onto the anchor).
+    fn edit_extend(&mut self, motion: impl FnOnce(&mut Self)) {
+        let before = match &self.view {
+            View::Reader(r) => match r.edit.as_ref() {
+                Some(e) => e.cursor,
+                None => return,
+            },
+            _ => return,
+        };
+        if let View::Reader(r) = &mut self.view {
+            if let Some(e) = r.edit.as_mut() {
+                // Keep an existing active selection's anchor so repeated
+                // Shift+arrow keeps extending from the same origin.
+                let anchor = e
+                    .selection
+                    .as_ref()
+                    .filter(|s| s.dragged)
+                    .map(|s| s.anchor)
+                    .unwrap_or(before);
+                e.selection = Some(EditSelection {
+                    anchor,
+                    focus: before,
+                    dragged: true,
+                });
+            }
+        }
+        motion(self);
+        if let View::Reader(r) = &mut self.view {
+            if let Some(e) = r.edit.as_mut() {
+                let cur = e.cursor;
+                if let Some(s) = e.selection.as_mut() {
+                    s.focus = cur;
+                    if s.anchor == s.focus {
+                        e.selection = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Extend the keyboard selection by one char left/right (Shift+arrow).
+    pub fn edit_extend_horizontal(&mut self, delta: i32) {
+        self.edit_extend(|s| s.edit_move_horizontal(delta));
+    }
+
+    /// Extend the keyboard selection by one word left/right (Shift+Option/
+    /// Ctrl+arrow), matching the word motion of `edit_move_word`.
+    pub fn edit_extend_word(&mut self, delta: i32) {
+        self.edit_extend(|s| s.edit_move_word(delta));
+    }
+
+    /// Extend the keyboard selection up/down one display row (Shift+arrow).
+    pub fn edit_extend_vertical(&mut self, delta: i32) {
+        self.edit_extend(|s| s.edit_move_vertical(delta));
+    }
+
+    /// Extend the keyboard selection to the start/end of the line (Shift+Home/
+    /// End, or Shift+Cmd+arrow).
+    pub fn edit_extend_line_edge(&mut self, eol: bool) {
+        self.edit_extend(|s| s.edit_move_line_edge(eol));
+    }
+
+    /// Set the editor selection to span inclusively between two click points
+    /// (byte offsets at char starts) for shift-click range select. The char
+    /// at each end is fully covered, regardless of click order. Lands the
+    /// cursor at the right edge of the selection.
+    pub fn edit_select_inclusive(&mut self, a: usize, b: usize) {
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        if r.edit.is_none() {
+            return;
+        }
+        let a = floor_char_boundary(&r.raw, a.min(r.raw.len()));
+        let b = floor_char_boundary(&r.raw, b.min(r.raw.len()));
+        let lo = a.min(b);
+        // Cover the char under the rightmost click by reaching its far edge.
+        let hi = next_char_boundary(&r.raw, a.max(b));
+        let e = r.edit.as_mut().unwrap();
+        e.selection = if lo >= hi {
+            None
+        } else {
+            Some(EditSelection {
+                anchor: lo,
+                focus: hi,
+                dragged: true,
+            })
+        };
+        e.cursor = hi;
+        e.command = None;
+        r.rendered = None;
+    }
+
     /// Replace the active editor drag-selection with `text` (paste-over), or
     /// insert `text` at the cursor when no selection is active. One undo
     /// snapshot; the cursor lands just past the inserted text. No-op outside
@@ -3085,6 +3181,43 @@ impl App {
         r.raw.insert(from, open);
         let e = r.edit.as_mut().unwrap();
         e.cursor = to + open.len_utf8() + close.len_utf8();
+        e.dirty = true;
+        e.command = None;
+        e.selection = None;
+        r.rendered = None;
+        true
+    }
+
+    /// Wrap the active selection as a markdown link `[selected](url)`, using
+    /// the selected text as the link label and `url` as the target. Returns
+    /// `true` when a selection was linked; a no-op (`false`) when nothing is
+    /// selected. One undo step; the cursor lands just past the closing paren
+    /// and the selection is cleared.
+    pub fn edit_link_selection(&mut self, url: &str) -> bool {
+        let View::Reader(r) = &mut self.view else {
+            return false;
+        };
+        let range = r
+            .edit
+            .as_ref()
+            .and_then(|e| e.selection.as_ref())
+            .filter(|s| s.is_active())
+            .map(|s| s.range());
+        let Some((from, to)) = range else {
+            return false;
+        };
+        let from = floor_char_boundary(&r.raw, from.min(r.raw.len()));
+        let to = floor_char_boundary(&r.raw, to.min(r.raw.len()));
+        if from >= to {
+            return false;
+        }
+        push_undo(r);
+        // Insert the `](url)` tail first so `from` stays valid for the `[`.
+        let tail = format!("]({url})");
+        r.raw.insert_str(to, &tail);
+        r.raw.insert(from, '[');
+        let e = r.edit.as_mut().unwrap();
+        e.cursor = to + '['.len_utf8() + tail.len();
         e.dirty = true;
         e.command = None;
         e.selection = None;
@@ -6202,6 +6335,81 @@ mod cloud_msg_tests {
         };
         assert_eq!(r.raw, "hello world");
         assert!(!r.edit.as_ref().expect("editing").dirty);
+    }
+
+    #[test]
+    fn edit_link_selection_wraps_in_markdown_link() {
+        // "see hackmd here" — select "hackmd" (bytes 4..10).
+        let mut app = test_app();
+        let n = note("n1", "T", "see hackmd here");
+        let mut r = Reader::from_cloud(&n, None);
+        let mut e = edit_state(false);
+        e.selection = Some(EditSelection {
+            anchor: 4,
+            focus: 10,
+            dragged: true,
+        });
+        r.edit = Some(e);
+        app.view = View::Reader(r);
+
+        assert!(app.edit_link_selection("https://hackmd.io"));
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        assert_eq!(r.raw, "see [hackmd](https://hackmd.io) here");
+        let e = r.edit.as_ref().expect("editing");
+        // Cursor sits just past the closing paren.
+        assert_eq!(e.cursor, "see [hackmd](https://hackmd.io)".len());
+        assert!(e.selection.is_none());
+        assert_eq!(e.undo.len(), 1);
+
+        // No active selection → no-op.
+        let mut app = test_app();
+        let mut r = Reader::from_cloud(&n, None);
+        r.edit = Some(edit_state(false));
+        app.view = View::Reader(r);
+        assert!(!app.edit_link_selection("https://x.io"));
+    }
+
+    #[test]
+    fn edit_select_inclusive_covers_both_end_chars() {
+        // "hello world": click char 'e' (byte 1), shift-click 'r' (byte 8).
+        let mut app = test_app();
+        let n = note("n1", "T", "hello world");
+        let mut r = Reader::from_cloud(&n, None);
+        r.edit = Some(edit_state(false));
+        app.view = View::Reader(r);
+
+        app.edit_select_inclusive(1, 8);
+        // Inclusive of both 'e' and 'r' → bytes 1..9 == "ello wor".
+        assert_eq!(app.edit_selection_text().as_deref(), Some("ello wor"));
+
+        // Order-independent: same span regardless of click order.
+        app.edit_select_inclusive(8, 1);
+        assert_eq!(app.edit_selection_text().as_deref(), Some("ello wor"));
+    }
+
+    #[test]
+    fn edit_extend_grows_and_collapses_selection() {
+        // "hello world", cursor at 0; Shift+word-right then back.
+        let mut app = test_app();
+        let n = note("n1", "T", "hello world");
+        let mut r = Reader::from_cloud(&n, None);
+        let mut e = edit_state(false);
+        e.cursor = 0;
+        r.edit = Some(e);
+        app.view = View::Reader(r);
+
+        app.edit_extend_word(1); // select "hello"
+        assert_eq!(app.edit_selection_text().as_deref(), Some("hello"));
+
+        app.edit_extend_word(1); // extend to "hello world"
+        assert_eq!(app.edit_selection_text().as_deref(), Some("hello world"));
+
+        // Collapsing back onto the anchor drops the selection.
+        app.edit_extend_word(-1);
+        app.edit_extend_word(-1);
+        assert!(app.edit_selection_text().is_none());
     }
 
     #[test]
