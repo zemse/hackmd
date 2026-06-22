@@ -426,15 +426,53 @@ impl Builder {
         }
         let style = self.cur_style();
         let inline_range = self.cur_inline_range();
-        self.cur_runs.push(Run {
-            text: text.to_string(),
-            style,
-            link: self.open_link,
-            checkbox: None,
-            image: None,
-            inline_range,
-            cursor_at: None,
-        });
+        // Inside an explicit markdown/angle-bracket link the whole run is
+        // already a click target — emit verbatim, don't autolink within it.
+        if self.open_link.is_some() {
+            self.cur_runs.push(Run {
+                text: text.to_string(),
+                style,
+                link: self.open_link,
+                checkbox: None,
+                image: None,
+                inline_range,
+                cursor_at: None,
+            });
+            return;
+        }
+        // Bare URLs (`https://…`, `www.…`) in plain text aren't links to
+        // pulldown-cmark, so split them into their own clickable runs.
+        for seg in autolink_segments(text) {
+            match seg {
+                Segment::Text(t) => self.cur_runs.push(Run {
+                    text: t.to_string(),
+                    style,
+                    link: None,
+                    checkbox: None,
+                    image: None,
+                    inline_range: inline_range.clone(),
+                    cursor_at: None,
+                }),
+                Segment::Url { display, href } => {
+                    let idx = self.links.len();
+                    self.links.push(PendingLink {
+                        target: LinkTarget::Url(href),
+                    });
+                    let link_style = style
+                        .fg(self.theme.link)
+                        .add_modifier(self.theme.link_modifier);
+                    self.cur_runs.push(Run {
+                        text: display.to_string(),
+                        style: link_style,
+                        link: Some(idx),
+                        checkbox: None,
+                        image: None,
+                        inline_range: inline_range.clone(),
+                        cursor_at: None,
+                    });
+                }
+            }
+        }
     }
 
     fn event(&mut self, ev: Event<'_>, range: std::ops::Range<usize>) {
@@ -1041,6 +1079,118 @@ fn make_raw_block(
         flat: true,
         line_sources,
     }
+}
+
+/// One piece of a plain-text run after bare-URL scanning: either inert text
+/// or a detected hyperlink (`display` = the text shown, `href` = where it
+/// points; they differ only for `www.` matches, which gain an `https://`).
+enum Segment<'a> {
+    Text(&'a str),
+    Url { display: &'a str, href: String },
+}
+
+/// Split `text` into inert spans and bare URL spans. Recognises `http://`,
+/// `https://`, and `www.` starts at a non-alphanumeric boundary, mirroring the
+/// common subset of GFM autolinking. Trailing sentence punctuation and
+/// unbalanced closing parens are excluded from the link.
+fn autolink_segments(text: &str) -> Vec<Segment<'_>> {
+    let mut segs = Vec::new();
+    let mut plain_start = 0;
+    let mut i = 0;
+    while i < text.len() {
+        // A URL may only start at the document start or after a non-
+        // alphanumeric char, so `foohttp://x` isn't matched mid-word.
+        let boundary_ok = i == 0
+            || !text[..i]
+                .chars()
+                .next_back()
+                .map(|c| c.is_alphanumeric())
+                .unwrap_or(false);
+        if boundary_ok {
+            if let Some((display, href)) = match_url_at(text, i) {
+                if plain_start < i {
+                    segs.push(Segment::Text(&text[plain_start..i]));
+                }
+                segs.push(Segment::Url { display, href });
+                i += display.len();
+                plain_start = i;
+                continue;
+            }
+        }
+        i += text[i..].chars().next().map(char::len_utf8).unwrap_or(1);
+    }
+    if plain_start < text.len() {
+        segs.push(Segment::Text(&text[plain_start..]));
+    }
+    segs
+}
+
+/// If a bare URL begins exactly at byte `i`, return its `(display, href)`.
+fn match_url_at(text: &str, i: usize) -> Option<(&str, String)> {
+    let rest = &text[i..];
+    let (prefix_len, is_www) = if let Some(r) = rest.strip_prefix("https://") {
+        (rest.len() - r.len(), false)
+    } else if let Some(r) = rest.strip_prefix("http://") {
+        (rest.len() - r.len(), false)
+    } else if rest.starts_with("www.") {
+        (0, true)
+    } else {
+        return None;
+    };
+    // Consume URL characters: everything up to whitespace or a delimiter that
+    // can't appear in a URL.
+    let mut end = i + prefix_len;
+    for (off, ch) in rest[prefix_len..].char_indices() {
+        if ch.is_whitespace() || matches!(ch, '<' | '>' | '"' | '`' | '|' | '\\') {
+            break;
+        }
+        end = i + prefix_len + off + ch.len_utf8();
+    }
+    let url = trim_url_end(&text[i..end]);
+    // Reject a scheme/host with no real content (e.g. a lone `https://`).
+    if is_www {
+        if url.len() <= "www.".len() {
+            return None;
+        }
+        Some((url, format!("https://{url}")))
+    } else {
+        if url.ends_with("://") {
+            return None;
+        }
+        Some((url, url.to_string()))
+    }
+}
+
+/// Strip trailing characters that read as sentence punctuation rather than
+/// part of the URL: `.`, `,`, `!`, `?`, etc., plus a closing paren/bracket
+/// that isn't balanced by an opener inside the URL.
+fn trim_url_end(mut url: &str) -> &str {
+    loop {
+        let last = match url.chars().next_back() {
+            Some(c) => c,
+            None => break,
+        };
+        if matches!(
+            last,
+            '.' | ',' | ';' | ':' | '!' | '?' | '*' | '_' | '~' | '\'' | '"'
+        ) {
+            url = &url[..url.len() - last.len_utf8()];
+            continue;
+        }
+        if matches!(last, ')' | ']' | '}') {
+            let (open, close) = match last {
+                ')' => ('(', ')'),
+                ']' => ('[', ']'),
+                _ => ('{', '}'),
+            };
+            if url.matches(close).count() > url.matches(open).count() {
+                url = &url[..url.len() - last.len_utf8()];
+                continue;
+            }
+        }
+        break;
+    }
+    url
 }
 
 fn heading_idx(l: HeadingLevel) -> usize {
@@ -2271,6 +2421,57 @@ mod tests {
             LinkTarget::Url("https://example.com".to_string())
         );
         assert!(link.col_end > link.col_start);
+    }
+
+    #[test]
+    fn autolinks_bare_url_in_text() {
+        let src = "see https://example.com/foo for details";
+        let r = render(src, None, 80, &Theme::dark());
+        assert_eq!(r.link_map.links.len(), 1);
+        let link = &r.link_map.links[0];
+        assert_eq!(
+            link.target,
+            LinkTarget::Url("https://example.com/foo".to_string())
+        );
+        assert!(link.col_end > link.col_start);
+    }
+
+    #[test]
+    fn autolink_trims_trailing_punctuation() {
+        // Sentence period and the wrapping parens must stay out of the URL.
+        let src = "visit https://example.com. (also https://a.test)";
+        let r = render(src, None, 80, &Theme::dark());
+        let targets: Vec<_> = r.link_map.links.iter().map(|l| &l.target).collect();
+        assert_eq!(
+            targets,
+            vec![
+                &LinkTarget::Url("https://example.com".to_string()),
+                &LinkTarget::Url("https://a.test".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn autolinks_www_with_https_scheme() {
+        let src = "go to www.example.com now";
+        let r = render(src, None, 80, &Theme::dark());
+        assert_eq!(r.link_map.links.len(), 1);
+        assert_eq!(
+            r.link_map.links[0].target,
+            LinkTarget::Url("https://www.example.com".to_string())
+        );
+    }
+
+    #[test]
+    fn does_not_double_link_markdown_or_code() {
+        // Explicit link keeps its dest; URL inside inline code is not linked.
+        let src = "[x](https://md.test) and `https://code.test`";
+        let r = render(src, None, 80, &Theme::dark());
+        assert_eq!(r.link_map.links.len(), 1);
+        assert_eq!(
+            r.link_map.links[0].target,
+            LinkTarget::Url("https://md.test".to_string())
+        );
     }
 
     #[test]
