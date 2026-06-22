@@ -2059,7 +2059,10 @@ fn extract_selection_text(app: &App, sel: &crate::tui::app::Selection) -> Option
             for ch in span.content.chars() {
                 let w = ch.width().unwrap_or(0);
                 let next = col + w;
-                if col >= from && next <= to {
+                // Overlap test (matches `col_slice`): include a glyph whose
+                // display cells intersect `[from, to)`, so a wide char
+                // straddling either edge of the selection is still copied.
+                if next > from && col < to {
                     out.push(ch);
                 }
                 col = next;
