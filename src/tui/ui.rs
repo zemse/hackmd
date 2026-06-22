@@ -12,7 +12,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::tui::app::{self, App, BrowserEntryKind, DiffRowKind, Focus, ReaderOrigin, View};
 use crate::tui::links::LinkTarget;
@@ -135,6 +135,109 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.lookup.is_some() {
         draw_lookup(f, app);
     }
+
+    // A blocking error modal trumps the popover.
+    if app.error.is_some() {
+        draw_error(f, app, area);
+    }
+}
+
+/// Centered, word-wrapped error modal (e.g. a file that isn't valid UTF-8).
+/// Dismissed by the next keypress; the footer says so.
+fn draw_error(f: &mut Frame, app: &App, area: Rect) {
+    let Some(msg) = &app.error else {
+        return;
+    };
+    let theme = &app.opts.theme;
+    let w = 60.min(area.width.saturating_sub(4)).max(20);
+    let inner_w = w.saturating_sub(2).max(1) as usize;
+    // Lay out the message into lines, then a blank, then the dismiss hint, so
+    // the box height fits the wrapped content.
+    let mut lines: Vec<Line> = Vec::new();
+    for para in msg.split('\n') {
+        if para.is_empty() {
+            lines.push(Line::raw(""));
+            continue;
+        }
+        for chunk in wrap_words(para, inner_w) {
+            lines.push(Line::raw(chunk));
+        }
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::from(Span::styled(
+        "Press any key to dismiss",
+        Style::default()
+            .fg(theme.heading[3])
+            .add_modifier(Modifier::BOLD),
+    )));
+    let h = (lines.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(3);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Can't open file ")
+        .border_style(Style::default().fg(theme.heading[3]));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+/// Greedy word-wrap of `text` to `width` display columns. Used only to size the
+/// error modal; the `Paragraph` widget re-wraps for the actual render. Falls
+/// back to hard-splitting any single word longer than `width`.
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    for word in text.split_whitespace() {
+        let ww = word.chars().count();
+        if ww > width {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            // Hard-split an over-long word into width-sized pieces.
+            let mut piece = String::new();
+            for ch in word.chars() {
+                if piece.chars().count() == width {
+                    lines.push(std::mem::take(&mut piece));
+                }
+                piece.push(ch);
+            }
+            cur = piece;
+            cur_w = cur.chars().count();
+            continue;
+        }
+        let need = if cur.is_empty() { ww } else { cur_w + 1 + ww };
+        if need > width {
+            lines.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+            cur_w = ww;
+        } else {
+            if !cur.is_empty() {
+                cur.push(' ');
+                cur_w += 1;
+            }
+            cur.push_str(word);
+            cur_w += ww;
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 /// Centered table-of-contents popup (`t` in the Reader). One row per
@@ -1828,8 +1931,9 @@ fn default_hint(app: &App) -> String {
             }
             _ => "j/k:scroll  /:find  e:edit  U:publish  Tab:links  ?:help  q:quit".into(),
         },
-        View::Browser(_) => {
-            "j/k  Enter:open  n:new  U:publish  c:rename  f:find  H:hackmd  ?:help".into()
+        View::Browser(b) => {
+            let all = if b.show_all { "A:filtered" } else { "A:all" };
+            format!("j/k  Enter:open  n:new  c:rename  f:find  {all}  H:hackmd  ?:help")
         }
         View::Cloud(c) => {
             if c.show_tab_bar() {
@@ -2152,6 +2256,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         section(" Local files"),
         Line::from("  n                new file (browser)   c / F2  rename"),
+        Line::from("  A                browser: toggle showing all files & hidden"),
         Line::from("  U                publish to HackMD — links the file, then"),
         Line::from("                   auto-syncs both ways (on open, save & poll)"),
         Line::from("  conflicts        l:local u:upstream b:both n:drop Enter:apply"),

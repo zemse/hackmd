@@ -68,6 +68,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         app.should_quit = true;
         return Ok(());
     }
+    // A blocking error modal (e.g. "file isn't valid UTF-8") swallows the next
+    // keypress to dismiss itself, so the user explicitly acknowledges it.
+    if app.error.is_some() {
+        app.error = None;
+        return Ok(());
+    }
     if app.help_open {
         match key.code {
             KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => app.help_open = false,
@@ -319,6 +325,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // `A` opens the editor at the end of the document (append); `O` opens
         // it with a fresh blank line at the top. (`o` is taken by open-link.)
         KeyCode::Char('A') if matches!(app.view, View::Reader(_)) => app.enter_edit_append(),
+        // `A` in the browser toggles "show everything" — every file regardless
+        // of type, plus hidden and gitignored entries.
+        KeyCode::Char('A') if matches!(app.view, View::Browser(_)) => {
+            if let View::Browser(b) = &mut app.view {
+                b.toggle_show_all();
+            }
+            keep_browser_selection_visible(app);
+        }
         KeyCode::Char('O') if matches!(app.view, View::Reader(_)) => app.enter_edit_open_above(),
 
         // HackMD note actions — active wherever a cloud note is targeted
@@ -1145,7 +1159,12 @@ fn edit_substitute(app: &mut App, cmd: &str) {
 /// Literal substitution over `region`. With `global`, every occurrence is
 /// replaced; otherwise only the first on each line. Returns the rewritten
 /// text and the number of replacements made.
-fn substitute_region(region: &str, pattern: &str, replacement: &str, global: bool) -> (String, usize) {
+fn substitute_region(
+    region: &str,
+    pattern: &str,
+    replacement: &str,
+    global: bool,
+) -> (String, usize) {
     if global {
         (
             region.replace(pattern, replacement),
@@ -3136,6 +3155,17 @@ fn activate_browser_entry(app: &mut App, entry: BrowserEntry) -> Result<()> {
             app.navigate_to(EntryKind::Directory(entry.path), 0)?;
         }
         BrowserEntryKind::Markdown => {
+            // The reader needs UTF-8 text. Refuse non-UTF-8 files up front (a
+            // binary reachable via "show all", or a mislabelled .txt/.md) with
+            // a modal rather than letting the open fail opaquely. Checking here
+            // also keeps a bogus entry off the history stack.
+            if !crate::tui::app::file_is_valid_utf8(&entry.path) {
+                app.error = Some(format!(
+                    "Can't open {}\n\nThe file isn't valid UTF-8, so it can't be displayed.",
+                    entry.display
+                ));
+                return Ok(());
+            }
             app.navigate_to(EntryKind::File(entry.path), 0)?;
         }
     }

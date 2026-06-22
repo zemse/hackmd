@@ -160,6 +160,9 @@ pub struct App {
     pub edit_cmd_nav: Option<usize>,
     /// Dictionary-definition popover (double-click a word). `None` when closed.
     pub lookup: Option<LookupState>,
+    /// `Some(message)` while a blocking error modal is shown (e.g. trying to
+    /// open a file that isn't valid UTF-8). Dismissed by the next keypress.
+    pub error: Option<String>,
 }
 
 /// How often a still-open linked file re-syncs with upstream in the
@@ -769,6 +772,11 @@ pub struct Browser {
     /// is on: typed characters extend the query and the selection live-jumps to
     /// the first anchored, smartcase match. `None` when not finding.
     pub find: Option<String>,
+    /// When `true` (toggled with `A`), the listing shows *everything* — every
+    /// file regardless of type, plus hidden and gitignored entries. The default
+    /// (`false`) shows only browsable text files and the directories that
+    /// contain them.
+    pub show_all: bool,
 }
 
 #[derive(Clone)]
@@ -875,6 +883,7 @@ impl App {
             edit_cmd_history: Vec::new(),
             edit_cmd_nav: None,
             lookup: None,
+            error: None,
         })
     }
 
@@ -3506,36 +3515,81 @@ pub fn is_markdown_file(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Any file we know how to render in the reader: markdown plus the curated
-/// set of text/code extensions handled by `lang_token_for_path`. The browser
-/// uses this to decide which files to list; the link-click path uses it to
-/// decide whether to open inside the TUI or hand off to `open::that_detached`.
+/// Files the browser will list and open: markdown (`.md` and friends), plain
+/// `.txt`, or an extension-less file whose bytes look like UTF-8 text. The
+/// link-click path uses the same predicate to decide whether to open inside
+/// the TUI or hand off to `open::that_detached`.
 pub fn is_text_file(p: &Path) -> bool {
-    is_markdown_file(p) || known_text_extension(p)
+    if is_markdown_file(p) {
+        return true;
+    }
+    match p.extension().and_then(|e| e.to_str()) {
+        Some(ext) => ext.eq_ignore_ascii_case("txt"),
+        // No extension: include it only if it actually reads as text, so we
+        // surface notes/READMEs without dragging in binaries.
+        None => file_looks_like_text(p),
+    }
 }
 
-fn known_text_extension(p: &Path) -> bool {
-    let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
-        // Allow common extension-less text filenames (Makefile, Dockerfile,
-        // LICENSE, README, etc.) so they show up in the browser too.
-        let name = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.to_ascii_lowercase());
-        return matches!(
-            name.as_deref(),
-            Some("dockerfile")
-                | Some("makefile")
-                | Some("gnumakefile")
-                | Some("license")
-                | Some("readme")
-                | Some("authors")
-                | Some("changelog")
-                | Some("todo")
-                | Some("notice")
-        );
+/// Heuristic for "this extension-less file is text": read a bounded prefix and
+/// accept it when there's no NUL byte and the bytes decode as UTF-8. A
+/// multi-byte char truncated by the read boundary is tolerated. Cheap enough to
+/// call while listing a directory.
+fn file_looks_like_text(p: &Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(p) else {
+        return false;
     };
-    !matches!(lang_token_for_ext(&ext.to_ascii_lowercase()), None)
+    let mut buf = [0u8; 65536];
+    let n = match f.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let sample = &buf[..n];
+    if sample.contains(&0) {
+        return false;
+    }
+    match std::str::from_utf8(sample) {
+        Ok(_) => true,
+        // `error_len() == None` means the only problem is an incomplete
+        // multi-byte sequence at the very end — an artifact of the prefix cut,
+        // not actual binary data.
+        Err(e) => e.error_len().is_none() && e.valid_up_to() > 0,
+    }
+}
+
+/// Whether `path`'s full contents decode as UTF-8. Used to refuse opening a
+/// file we can't render (the reader needs a `String`). Read errors return
+/// `true` so the normal open path surfaces the I/O error instead.
+pub fn file_is_valid_utf8(path: &Path) -> bool {
+    match std::fs::read(path) {
+        Ok(bytes) => std::str::from_utf8(&bytes).is_ok(),
+        Err(_) => true,
+    }
+}
+
+/// Does `dir` hold at least one browsable text file at any depth? Directories
+/// with nothing we can open are hidden from the default listing. Honours the
+/// same gitignore/hidden rules as the listing and short-circuits on the first
+/// hit.
+fn dir_has_listable(dir: &Path) -> bool {
+    let walker = ignore::WalkBuilder::new(dir)
+        .hidden(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .git_global(true)
+        .require_git(false)
+        .build();
+    for result in walker {
+        let Ok(entry) = result else { continue };
+        if entry.path() == dir {
+            continue;
+        }
+        if entry.file_type().map(|t| t.is_file()).unwrap_or(false) && is_text_file(entry.path()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Map a path to a syntect language token. Returns an empty string for
@@ -3634,17 +3688,20 @@ fn canonicalize_or(p: PathBuf) -> PathBuf {
     std::fs::canonicalize(&p).unwrap_or(p)
 }
 
-/// Flat one-level listing of `dir`: dirs-first, then markdown files, both
-/// sorted case-insensitively. Honours .gitignore via the `ignore` crate.
-fn push_children(dir: &Path, out: &mut Vec<BrowserEntry>) {
+/// Flat one-level listing of `dir`: dirs-first, then files, both sorted
+/// case-insensitively. By default only browsable text files (and directories
+/// that contain them) are listed, and .gitignored/hidden entries are skipped.
+/// With `show_all`, every file and directory is listed, including hidden and
+/// ignored ones.
+fn push_children(dir: &Path, out: &mut Vec<BrowserEntry>, show_all: bool) {
     let mut dirs: Vec<(String, PathBuf)> = Vec::new();
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     let walker = ignore::WalkBuilder::new(dir)
         .max_depth(Some(1))
-        .hidden(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        .git_global(true)
+        .hidden(!show_all)
+        .git_ignore(!show_all)
+        .git_exclude(!show_all)
+        .git_global(!show_all)
         .require_git(false)
         .build();
     for result in walker {
@@ -3665,8 +3722,10 @@ fn push_children(dir: &Path, out: &mut Vec<BrowserEntry>) {
             None => continue,
         };
         if ft.is_dir() {
-            dirs.push((name, path));
-        } else if ft.is_file() && is_text_file(&path) {
+            if show_all || dir_has_listable(&path) {
+                dirs.push((name, path));
+            }
+        } else if ft.is_file() && (show_all || is_text_file(&path)) {
             files.push((name, path));
         }
     }
@@ -4538,6 +4597,7 @@ impl Browser {
             scroll: 0,
             last_meta: None,
             find: None,
+            show_all: false,
         };
         b.rebuild()?;
         Ok(b)
@@ -4557,7 +4617,7 @@ impl Browser {
                 });
             }
         }
-        push_children(&self.dir, &mut entries);
+        push_children(&self.dir, &mut entries, self.show_all);
         self.entries = entries;
         // Skip past `../` on a fresh listing so the cursor lands on the first
         // real entry — `Esc`/`h`/`Backspace` already covers "go up", and
@@ -4581,6 +4641,13 @@ impl Browser {
         // tick-driven poll only rebuilds when the dir actually changes.
         self.last_meta = file_meta(&self.dir);
         Ok(())
+    }
+
+    /// Toggle "show everything" mode (`A`) and re-list. Preserves the
+    /// highlighted entry across the rebuild when it survives the filter change.
+    pub fn toggle_show_all(&mut self) {
+        self.show_all = !self.show_all;
+        let _ = self.rebuild();
     }
 
     #[allow(dead_code)]
@@ -5053,55 +5120,92 @@ mod tests {
     }
 
     #[test]
-    fn browser_lists_dirs_and_text_files_filters_binary_and_hidden() {
+    fn browser_lists_only_text_md_txt_and_dirs_holding_them() {
         let dir = fresh_temp("browser-filter");
-        std::fs::create_dir_all(dir.join("subdir")).unwrap();
+        // A subdir that holds a markdown file (should show) and one that holds
+        // nothing openable (should be hidden).
+        std::fs::create_dir_all(dir.join("withmd")).unwrap();
+        std::fs::write(dir.join("withmd").join("inner.md"), "# inner").unwrap();
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::create_dir_all(dir.join("binonly")).unwrap();
+        std::fs::write(dir.join("binonly").join("blob.bin"), &[0u8, 1, 2][..]).unwrap();
+
         std::fs::write(dir.join("a.md"), "# a").unwrap();
         std::fs::write(dir.join("b.markdown"), "# b").unwrap();
         std::fs::write(dir.join("note.txt"), "plain text").unwrap();
+        std::fs::write(dir.join("NOTES"), "extension-less but text").unwrap();
+        // Not txt/md/no-ext → filtered out even though it's text.
         std::fs::write(dir.join("data.json"), "{}").unwrap();
         std::fs::write(dir.join("Cargo.toml"), "ignored").unwrap();
-        std::fs::write(dir.join("blob.bin"), &[0u8, 1, 2][..]).unwrap();
+        // No extension but binary → filtered out.
+        std::fs::write(dir.join("blob"), &[0u8, 1, 2][..]).unwrap();
+        std::fs::write(dir.join("pic.bin"), &[0u8, 1, 2][..]).unwrap();
         std::fs::write(dir.join(".hidden.md"), "hidden").unwrap();
 
         let b = Browser::scan(&dir).unwrap();
         let names: Vec<&str> = b.entries.iter().map(|e| e.display.as_str()).collect();
 
+        for want in ["withmd/", "a.md", "b.markdown", "note.txt", "NOTES"] {
+            assert!(names.contains(&want), "missing {want}, got {names:?}");
+        }
+        // A directory with nothing openable, or only binaries, is hidden.
+        assert!(!names.contains(&"empty/"), "empty/ shown, got {names:?}");
         assert!(
-            names.contains(&"subdir/"),
-            "missing subdir, got {:?}",
-            names
+            !names.contains(&"binonly/"),
+            "binonly/ shown, got {names:?}"
         );
-        assert!(names.contains(&"a.md"), "missing a.md, got {:?}", names);
-        assert!(
-            names.contains(&"b.markdown"),
-            "missing b.markdown, got {:?}",
-            names
-        );
-        // Text-like files are now listed too so the user can open them with
-        // syntax highlighting.
-        assert!(
-            names.contains(&"note.txt"),
-            "missing note.txt, got {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"data.json"),
-            "missing data.json, got {:?}",
-            names
-        );
-        assert!(
-            names.contains(&"Cargo.toml"),
-            "missing Cargo.toml, got {:?}",
-            names
-        );
-        // Truly unknown / binary extensions stay hidden.
-        assert!(
-            !names.contains(&"blob.bin"),
-            "blob.bin should be filtered out, got {:?}",
-            names
-        );
+        // Non-(txt|md|no-ext) files, binaries, and hidden files are excluded.
+        for unwanted in ["data.json", "Cargo.toml", "blob", "pic.bin"] {
+            assert!(
+                !names.contains(&unwanted),
+                "{unwanted} should be filtered out, got {names:?}"
+            );
+        }
         assert!(names.iter().all(|n| !n.contains(".hidden")));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn browser_show_all_reveals_everything_including_hidden() {
+        let dir = fresh_temp("browser-show-all");
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::write(dir.join("a.md"), "# a").unwrap();
+        std::fs::write(dir.join("data.json"), "{}").unwrap();
+        std::fs::write(dir.join("blob"), &[0u8, 1, 2][..]).unwrap();
+        std::fs::write(dir.join(".hidden.md"), "hidden").unwrap();
+
+        let mut b = Browser::scan(&dir).unwrap();
+        b.toggle_show_all();
+        let names: Vec<&str> = b.entries.iter().map(|e| e.display.as_str()).collect();
+
+        for want in ["empty/", "a.md", "data.json", "blob", ".hidden.md"] {
+            assert!(
+                names.contains(&want),
+                "show-all missing {want}, got {names:?}"
+            );
+        }
+        assert!(b.show_all);
+
+        // Toggling back restores the filtered listing.
+        b.toggle_show_all();
+        let names: Vec<&str> = b.entries.iter().map(|e| e.display.as_str()).collect();
+        assert!(!names.contains(&"blob"), "blob still shown, got {names:?}");
+        assert!(!b.show_all);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalid_utf8_files_are_detected() {
+        let dir = fresh_temp("utf8-check");
+        let bad = dir.join("bad.txt");
+        std::fs::write(&bad, &[0xff, 0xfe, 0x00][..]).unwrap();
+        let good = dir.join("good.txt");
+        std::fs::write(&good, "héllo").unwrap();
+
+        assert!(!file_is_valid_utf8(&bad));
+        assert!(file_is_valid_utf8(&good));
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -5668,6 +5772,7 @@ index abc..def 100644\n\
             scroll: 0,
             last_meta: None,
             find: None,
+            show_all: false,
         };
         // Re-scan (rebuild discovers `..` if the dir has a parent — fine, just
         // assert the fallback never out-of-bounds).
@@ -5692,6 +5797,7 @@ index abc..def 100644\n\
             scroll: 0,
             last_meta: None,
             find: None,
+            show_all: false,
         }
     }
 
