@@ -46,8 +46,9 @@ where
     }))
 }
 
-/// Like [`de_date`] but also tolerates an explicit `null` (→ empty string),
-/// for fields the live API sometimes omits or nulls.
+/// Like [`de_date`] but also tolerates an explicit `null` or an absent field
+/// (→ empty string), for fields the live API sometimes omits or sends as null.
+/// Pair with `#[serde(default)]` so a missing key also yields `""`.
 pub(crate) fn de_date_default<'de, D>(d: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,

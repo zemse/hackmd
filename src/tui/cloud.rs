@@ -3,8 +3,7 @@
 //! Every cloud operation is spawned onto a tokio runtime [`Handle`]; the
 //! result comes back over an unbounded mpsc channel as a [`CloudMsg`] and is
 //! drained once per event-loop tick (`App::drain_cloud_msgs`, ≤4×/sec). The
-//! TUI thread never blocks on the network. This is the same spawn + mpsc +
-//! `try_recv` pattern the pre-merge minimal TUI shipped with.
+//! TUI thread never blocks on the network.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;

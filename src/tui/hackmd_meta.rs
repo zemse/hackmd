@@ -81,7 +81,7 @@ fn block_span(content: &str) -> Option<(usize, usize)> {
     None
 }
 
-/// Parse the managed block at the top of `content`, if any.
+/// Parse the managed block in `content` (anywhere in the file), if any.
 pub fn parse(content: &str) -> Option<HackmdMeta> {
     let (start, end) = block_span(content)?;
     let mut id = String::new();

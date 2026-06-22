@@ -3,7 +3,7 @@
 //! Each submodule adds an `impl Client` block grouping the endpoints for a
 //! given resource. End users invoke them as plain methods on
 //! [`Client`](crate::Client) — the split is purely for code organization and
-//! mirrors the layout described in `PLAN.md` section 0.1.
+//! mirrors the HackMD API resource layout.
 
 pub mod folders;
 pub mod notes;

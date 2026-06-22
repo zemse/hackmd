@@ -172,7 +172,7 @@ impl LinkMap {
             .position(|l| l.line == line && col >= l.col_start && col < l.col_end)
     }
 
-    /// First link on or after `line`.
+    /// First link strictly after `(line, col)` — skips any link at exactly `col`.
     pub fn next_from(&self, line: usize, col: usize) -> Option<usize> {
         self.links
             .iter()

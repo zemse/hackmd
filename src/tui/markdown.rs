@@ -44,10 +44,6 @@ pub struct Rendered {
     pub row_source: Vec<Option<std::ops::Range<usize>>>,
 }
 
-/// Source-byte range + display-line range for one block. `display_start`/
-/// `display_end` are line indices into `Rendered::lines` (half-open). Edit
-/// mode uses these to map (cursor_offset → block) and to scroll a freshly
-/// raw-substituted block back into view.
 /// One heading in the document outline.
 #[derive(Clone, Debug)]
 pub struct HeadingInfo {
@@ -59,6 +55,10 @@ pub struct HeadingInfo {
     pub line: usize,
 }
 
+/// Source-byte range + display-line range for one block. `display_start`/
+/// `display_end` are line indices into `Rendered::lines` (half-open). Edit
+/// mode uses these to map (cursor_offset → block) and to scroll a freshly
+/// raw-substituted block back into view.
 #[derive(Clone, Debug)]
 pub struct BlockInfo {
     pub source_range: std::ops::Range<usize>,
@@ -421,7 +421,7 @@ impl Builder {
             self.code_content.push_str(text);
             return;
         }
-        if let Some(_) = self.in_heading {
+        if self.in_heading.is_some() {
             self.heading_buf.push_str(text);
         }
         let style = self.cur_style();
@@ -897,8 +897,6 @@ fn wrap_to_width(s: &str, max_w: usize) -> Vec<(std::ops::Range<usize>, String)>
     }
     if line_start < s.len() {
         out.push((line_start..s.len(), s[line_start..].to_string()));
-    } else if out.is_empty() {
-        out.push((0..0, String::new()));
     }
     out
 }
@@ -1063,12 +1061,12 @@ fn heading_idx(l: HeadingLevel) -> usize {
 fn layout(
     theme: &Theme,
     width: usize,
-    source: String,
+    _source: String,
     blocks: Vec<BlockEntry>,
     links: Vec<PendingLink>,
     checkboxes: Vec<PendingCheckbox>,
     images: Vec<PathBuf>,
-    edit: Option<EditCtx>,
+    _edit: Option<EditCtx>,
     tables: &TableExpansions,
 ) -> Rendered {
     let mut out_lines: Vec<Line<'static>> = Vec::new();
@@ -1257,8 +1255,6 @@ fn layout(
     // when emitting a Run with `cursor_at` set. Edit mode produces such a
     // Run (either via inline-element substitution or block-level raw fall-
     // back); view mode never does.
-    let _ = (&source, &edit);
-
     let link_map = LinkMap {
         links: out_links,
         anchors,
@@ -1326,24 +1322,7 @@ fn wrap_runs(
     let mut at_line_start = true;
     let mut active_inner_width = inner_width;
 
-    let line_idx = |out: &Vec<Line<'static>>| out.len();
-    let _ = line_idx;
-
     let mut current_link: Option<usize> = None;
-
-    let push_run_chunk = |cur_spans: &mut Vec<Span<'static>>,
-                          cur_col: &mut usize,
-                          cur_inner: &mut usize,
-                          run: &Run,
-                          chunk: &str| {
-        if chunk.is_empty() {
-            return;
-        }
-        let w = chunk.width();
-        cur_spans.push(Span::styled(chunk.to_string(), run.style));
-        *cur_col += w;
-        *cur_inner += w;
-    };
 
     let break_line = |out_lines: &mut Vec<Line<'static>>,
                       cur_spans: &mut Vec<Span<'static>>,
@@ -1499,8 +1478,6 @@ fn wrap_runs(
                 text = "";
             }
         }
-        let _ = push_run_chunk;
-
         // Record the checkbox span now that the run has been emitted. If a
         // line break occurred during emission, the span lives on the new line.
         if let Some((ci, start_line, start_col)) = cb_start {

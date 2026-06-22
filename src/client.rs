@@ -1,7 +1,6 @@
 //! HTTP client + retry + ETag + rate-limit plumbing.
 //!
-//! Mirrors `_ref/api-client/nodejs/src/index.ts` behavior contract documented
-//! in `PLAN.md` section 0.5.
+//! Mirrors the behavior contract of `_ref/api-client/nodejs/src/index.ts`.
 
 use std::time::Duration;
 

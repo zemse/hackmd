@@ -1278,9 +1278,6 @@ fn close_edit_preview(app: &mut App) {
     }
 }
 
-/// Keystrokes while a modal prompt is open. Text prompts mirror the
-/// doc-search input handling; the delete confirmation accepts only
-/// `y`/Enter and treats everything else as a cancel.
 /// Keystrokes while the full-screen conflict resolver is open. `j`/`k` (and
 /// arrows) move between hunks; `l`/`u`/`b`/`n` (and `1`/`2`) pick a side for
 /// the focused hunk and auto-advance; Enter applies the resolution; Esc
@@ -1323,6 +1320,9 @@ fn handle_conflict_key(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
+/// Keystrokes while a modal prompt is open. Text prompts mirror the
+/// doc-search input handling; the delete confirmation accepts only
+/// `y`/Enter and treats everything else as a cancel.
 fn handle_prompt_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.should_quit = true;
@@ -2055,14 +2055,12 @@ fn extract_selection_text(app: &App, sel: &crate::tui::app::Selection) -> Option
             usize::MAX
         };
         let mut col = 0usize;
-        let mut wrote_any = false;
         for span in &line.spans {
             for ch in span.content.chars() {
                 let w = ch.width().unwrap_or(0);
                 let next = col + w;
                 if col >= from && next <= to {
                     out.push(ch);
-                    wrote_any = true;
                 }
                 col = next;
                 if col >= to {
@@ -2073,7 +2071,6 @@ fn extract_selection_text(app: &App, sel: &crate::tui::app::Selection) -> Option
                 break;
             }
         }
-        let _ = wrote_any;
         if li < e_line.min(last) {
             out.push('\n');
         }
@@ -2133,9 +2130,6 @@ fn select_word_at(app: &mut App, col: u16, row: u16) {
     }
 }
 
-/// Best-effort copy: native helper on macOS, OSC 52 otherwise (with tmux
-/// passthrough wrapping when applicable). Both paths are silent on failure —
-/// the status line already reports what we attempted to copy.
 /// Resolve a finished statusline-path gesture: a plain click copies the full
 /// (untruncated) path, a drag copies the column-selected slice of the
 /// displayed text.
@@ -2178,6 +2172,9 @@ fn col_slice(s: &str, from: usize, to: usize) -> String {
     out
 }
 
+/// Best-effort copy: native helper on macOS, OSC 52 otherwise (with tmux
+/// passthrough wrapping when applicable). Both paths are silent on failure;
+/// the status line already reports what we attempted to copy.
 pub(crate) fn copy_to_clipboard(text: &str) {
     #[cfg(target_os = "macos")]
     {

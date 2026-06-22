@@ -30,7 +30,6 @@ impl ReadState {
         match std::fs::read_to_string(state_path()) {
             Ok(text) => {
                 for line in text.lines() {
-                    let line = line.trim_end_matches(['\r', '\n']);
                     if line.is_empty() {
                         continue;
                     }
@@ -129,8 +128,9 @@ impl ReadState {
 }
 
 /// Absolute path of the state file: `<state-or-data-dir>/md/read.state`.
-/// `dirs::state_dir()` is `Some` only on Linux (XDG_STATE_HOME); elsewhere we
-/// fall back to the platform data dir (e.g. `~/Library/Application Support`).
+/// `dirs::state_dir()` follows XDG (`XDG_STATE_HOME`); on macOS/Windows it
+/// returns `None`, so we fall back to the platform data dir (e.g.
+/// `~/Library/Application Support`).
 fn state_path() -> PathBuf {
     match dirs::state_dir().or_else(dirs::data_dir) {
         Some(d) => d.join("md").join("read.state"),

@@ -695,7 +695,7 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Layout choice: side-by-side at >= 100 cols, vertical stack below.
     let horizontal = area.width >= 100;
-    let (raw_area, preview_area, _split_dir) = if horizontal {
+    let (raw_area, preview_area) = if horizontal {
         let half = area.width / 2;
         let raw = Rect {
             x: area.x,
@@ -721,7 +721,7 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
             .map(|_| Line::from(Span::styled("│", sep_style)))
             .collect();
         f.render_widget(Paragraph::new(sep_lines), sep);
-        (raw, prev, "h")
+        (raw, prev)
     } else {
         let half = area.height / 2;
         let raw = Rect {
@@ -748,7 +748,7 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
             Paragraph::new(Line::from(Span::styled(bar, sep_style))),
             sep,
         );
-        (raw, prev, "v")
+        (raw, prev)
     };
 
     app.edit_raw_area = raw_area;
@@ -923,7 +923,6 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
 /// added rows on a green background, removed on red, hunk headers muted.
 /// The viewport scrolls via `git_lens.scroll`.
 fn draw_git_lens(f: &mut Frame, app: &App, area: Rect) {
-    use ratatui::style::Color;
     let Some(g) = app.git_lens.as_ref() else {
         return;
     };
@@ -1095,8 +1094,8 @@ fn highlight_focused(
     }
 }
 
-/// Paint a match span. Non-current matches get the code-block background
-/// (subtle); the current match gets the link-focus color reversed.
+/// Paint a match span. Non-current matches get reverse-video (subtle);
+/// the current match gets the link-focus color reversed and bold.
 fn highlight_doc_match<'a>(
     line: &mut Line<'a>,
     col_start: usize,
@@ -1499,9 +1498,8 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
 
     let bg = Style::default().bg(theme.status_bg).fg(theme.status_fg);
     let path_style = Style::default().add_modifier(Modifier::BOLD);
-    let muted = Style::default().fg(theme.muted);
 
-    // Path (or browser dir) — same display logic as before.
+    // Short display path: relative to launch root, or home-prefixed, or absolute.
     let path = match &app.view {
         View::Reader(r) => match &r.origin {
             crate::tui::app::ReaderOrigin::File(p) => display_path(p, &app.root),
@@ -1715,7 +1713,6 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    let _ = muted;
     f.render_widget(Paragraph::new(Line::from(line_spans)), area);
 
     // In-progress drag over the path: reverse-video the selected columns so

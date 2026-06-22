@@ -46,7 +46,8 @@ pub fn base_path(root: &Path, id: &str, file: &Path) -> PathBuf {
 }
 
 /// Pre-path-keying cache path (`<id>.base`). Read as a fallback so files linked
-/// by an earlier release aren't orphaned; they migrate on the next write.
+/// by an earlier release aren't orphaned. The new path-keyed format is written
+/// going forward; the legacy file is left in place and not deleted.
 fn legacy_base_path(root: &Path, id: &str) -> PathBuf {
     root.join(CACHE_DIR).join(format!("{}.base", safe_id(id)))
 }

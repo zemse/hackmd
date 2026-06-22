@@ -72,11 +72,12 @@ fn default_editor() -> &'static str {
 mod tests {
     use super::*;
 
-    // SAFETY: tests in this module manipulate process env and so must NOT run
-    // concurrently with anything else that reads VISUAL/EDITOR. They're kept
-    // narrow + serial by Rust's per-module test ordering for a single test
-    // function. We avoid coupling to other tests by not touching env outside
-    // these tests.
+    // SAFETY: tests in this module manipulate process env (VISUAL/EDITOR) and
+    // must NOT run concurrently with other threads that read those variables.
+    // There is currently only one test in this module, so no parallelism issue
+    // arises in practice. If more tests are added, they must either run
+    // single-threaded (`RUST_TEST_THREADS=1`) or use a mutex to serialize
+    // env access.
 
     #[test]
     fn resolve_falls_back_to_platform_default() {

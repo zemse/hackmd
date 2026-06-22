@@ -3216,7 +3216,7 @@ impl App {
         }
     }
 
-    /// Move cursor to start (`bol=false`) or end (`eol=true`) of the current
+    /// Move cursor to start (`eol=false`) or end (`eol=true`) of the current
     /// display row in the raw pane (split mode) or current source line
     /// (legacy in-place mode).
     pub fn edit_move_line_edge(&mut self, eol: bool) {

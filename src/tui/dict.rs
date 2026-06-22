@@ -4,8 +4,9 @@
 //! `DCSCopyTextDefinition` is a plain C function in DictionaryServices (a
 //! sub-framework of CoreServices), so this is a thin FFI over CoreFoundation
 //! string types, not anything Objective-C — no `objc2` runtime is involved.
-//! The CF types come from `core-foundation-sys`, already in the tree via
-//! `chrono`. On non-macOS platforms [`lookup`] is a stub returning `None`.
+//! The CF types come from `core-foundation-sys` (a direct dep; transitively
+//! also via `chrono → iana-time-zone` on macOS). On non-macOS platforms
+//! [`lookup`] is a stub returning `None`.
 
 /// Whether word lookup is available on this platform (macOS only).
 #[cfg(target_os = "macos")]
