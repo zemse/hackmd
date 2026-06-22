@@ -28,11 +28,14 @@ pub fn highlight(
 ) {
     let ss = syntaxes();
     let ts = themes();
-    let theme = ts
-        .themes
-        .get(theme_name)
-        .or_else(|| ts.themes.values().next())
-        .unwrap();
+    let Some(theme) = ts.themes.get(theme_name).or_else(|| ts.themes.values().next()) else {
+        // No themes at all (should never happen with `load_defaults`): fall
+        // back to unstyled text rather than panicking.
+        for line in code.lines() {
+            out.push(vec![Span::raw(line.to_string())]);
+        }
+        return;
+    };
     let syntax = lang_token
         .and_then(|t| ss.find_syntax_by_token(t))
         .or_else(|| ss.find_syntax_by_first_line(code))
