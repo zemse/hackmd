@@ -7,7 +7,6 @@
 //! sync. The base for note `<id>` is cached at `<root>/.hackmd/<id>.base`, the
 //! common ancestor fed to the three-way merge.
 
-use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 /// Directory under the search root holding per-note base snapshots.
@@ -34,9 +33,18 @@ fn path_tag(file: &Path) -> String {
     // Canonicalize so the same file reached via different relative paths maps
     // to one base; fall back to the raw path before the file exists.
     let canon = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    canon.hash(&mut h);
-    format!("{:016x}", h.finish())
+    // FNV-1a over the canonical path bytes. We deliberately avoid
+    // `DefaultHasher`, whose output is not stable across Rust releases: a
+    // toolchain upgrade would change every tag and orphan existing
+    // `<id>.<tag>.base` caches, silently dropping the three-way merge's common
+    // ancestor. FNV-1a is fixed by its own definition, so a given path always
+    // maps to the same tag regardless of compiler version.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in canon.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// Path of the base-content cache file for note `id` linked at `file`.
