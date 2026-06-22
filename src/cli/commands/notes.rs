@@ -9,7 +9,10 @@ use crate::cli::output::{OutputOpts, print_table};
 use crate::error::{Error, Result};
 use crate::types::{CreateNoteOptions, UpdateNoteOptions};
 
-const NOTES_LIST_COLUMNS: &[&str] = &["id", "title", "owner", "visibility", "lastChangedAt"];
+/// Shared with `team_notes` — the list/create column sets are identical for
+/// user and team notes, so there's one source of truth.
+pub(crate) const NOTES_LIST_COLUMNS: &[&str] =
+    &["id", "title", "owner", "visibility", "lastChangedAt"];
 const NOTES_GET_COLUMNS: &[&str] = &[
     "id",
     "title",
@@ -18,7 +21,7 @@ const NOTES_GET_COLUMNS: &[&str] = &[
     "readPermission",
     "writePermission",
 ];
-const NOTES_CREATE_COLUMNS: &[&str] = &["id", "title", "userPath", "teamPath"];
+pub(crate) const NOTES_CREATE_COLUMNS: &[&str] = &["id", "title", "userPath", "teamPath"];
 
 pub async fn list(
     config_dir: Option<&Path>,

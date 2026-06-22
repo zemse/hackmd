@@ -3,19 +3,11 @@
 //! Ports from `_ref/api-client/nodejs/src/index.ts:181-214`.
 
 use reqwest::Method;
-use serde::Serialize;
 
+use crate::api::UpdateContentBody;
 use crate::client::{CachedResponse, Client};
 use crate::error::Result;
 use crate::types::{CreateNoteOptions, Note, SingleNote, UpdateNoteOptions};
-
-/// PATCH body used by `update_note_content` — keeps the wire shape
-/// `{ "content": "…" }` (or `{}` if `None`) consistent with upstream.
-#[derive(Debug, Serialize)]
-struct UpdateContentBody<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<&'a str>,
-}
 
 impl Client {
     /// `GET /notes` — list all notes owned by the authenticated user.

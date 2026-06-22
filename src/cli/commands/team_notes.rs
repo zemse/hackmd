@@ -2,13 +2,10 @@
 
 use std::path::Path;
 
-use crate::cli::commands::notes::resolve_content;
+use crate::cli::commands::notes::{NOTES_CREATE_COLUMNS, NOTES_LIST_COLUMNS, resolve_content};
 use crate::cli::output::{OutputOpts, print_table};
 use crate::error::Result;
 use crate::types::{CreateNoteOptions, UpdateNoteOptions};
-
-const TEAM_NOTES_LIST_COLUMNS: &[&str] = &["id", "title", "owner", "visibility", "lastChangedAt"];
-const TEAM_NOTES_CREATE_COLUMNS: &[&str] = &["id", "title", "userPath", "teamPath"];
 
 pub async fn list(
     config_dir: Option<&Path>,
@@ -20,7 +17,7 @@ pub async fn list(
     let (client, _eff) = super::build_client(config_dir, cli_endpoint, cli_token)?;
     let notes = client.team_notes(team_path).await?;
     let rows = super::note_rows(&notes)?;
-    print_table(&rows, TEAM_NOTES_LIST_COLUMNS, opts)
+    print_table(&rows, NOTES_LIST_COLUMNS, opts)
 }
 
 pub async fn create(
@@ -35,7 +32,7 @@ pub async fn create(
     let (client, _eff) = super::build_client(config_dir, cli_endpoint, cli_token)?;
     payload.content = resolve_content(payload.content, use_editor)?;
     let note = client.create_team_note(team_path, payload).await?;
-    print_table(&[note], TEAM_NOTES_CREATE_COLUMNS, opts)
+    print_table(&[note], NOTES_CREATE_COLUMNS, opts)
 }
 
 pub async fn update(

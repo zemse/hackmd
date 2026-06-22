@@ -8,19 +8,11 @@
 //! returns the same [`SingleNote`] / `Vec<Note>` shape as the user methods.
 
 use reqwest::Method;
-use serde::Serialize;
 
+use crate::api::UpdateContentBody;
 use crate::client::Client;
 use crate::error::Result;
 use crate::types::{CreateNoteOptions, Note, SingleNote, UpdateNoteOptions};
-
-/// PATCH body for `update_team_note_content`. Identical wire shape to the
-/// user-note variant — kept private to mirror the upstream surface.
-#[derive(Debug, Serialize)]
-struct UpdateContentBody<'a> {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<&'a str>,
-}
 
 impl Client {
     /// `GET /teams/{teamPath}/notes` — list notes owned by a team.
