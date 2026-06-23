@@ -468,6 +468,13 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
                 .fg(theme.heading[3])
                 .add_modifier(Modifier::BOLD),
         ))
+    } else if matches!(p.kind, app::PromptKind::RecoverEdit { .. }) {
+        Line::from(Span::styled(
+            "r / Enter recover · d discard · Esc later",
+            Style::default()
+                .fg(theme.heading[3])
+                .add_modifier(Modifier::BOLD),
+        ))
     } else {
         Line::from(vec![
             Span::styled(
@@ -1885,11 +1892,12 @@ fn compute_middle(app: &App) -> Mid {
             // An active drag-selection swaps in its action menu.
             if e.selection.as_ref().map(|s| s.is_active()).unwrap_or(false) {
                 return Mid::Hint(
-                    "selection  y copy  x cut  p paste  Del delete  Esc cancel".into(),
+                    "selection  Ctrl-C/X copy/cut  Ctrl-V paste  Del delete  Esc cancel".into(),
                 );
             }
             return Mid::Hint(
-                "type to edit  Ctrl-S save  Alt-←/→ word  Ctrl-Z undo  Esc command".into(),
+                "type to edit  Ctrl-S save  Ctrl-C/X/V copy/cut/paste  Ctrl-Z undo  Esc command"
+                    .into(),
             );
         }
         if let Some(s) = r.doc_search.as_ref() {
@@ -2250,10 +2258,12 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         section(" Edit  (e/i open · A append · O open-above · split preview)"),
         Line::from("  Ctrl-S           save  (Ctrl-W fallback for XOFF terminals)"),
+        Line::from("  Ctrl-C / Ctrl-X  copy / cut  (selection, else whole line)"),
+        Line::from("  Ctrl-V           paste at cursor (Ctrl-C never quits in edit mode)"),
         Line::from("  Ctrl-Z / Ctrl-Y  undo / redo       Esc Esc  leave (asks to save)"),
         Line::from("  Alt-←/→          word jump    Alt-Bksp/Del  word delete"),
-        Line::from("  drag select      y copy  x cut  p paste  Del delete  Esc cancel"),
-        Line::from("  ( [ {            auto-close;  select + ( * _ ` [  wraps it"),
+        Line::from("  drag select      Ctrl-C copy  Ctrl-X cut  Ctrl-V paste  Del delete"),
+        Line::from("  ( [ {            auto-close (only before a space/EOL); wraps a selection"),
         Line::from("  Enter            continue list (-, 1., - [ ]); empty item ends it"),
         Line::from("  Esc              command — :w :wq :q :preview  :s/old/new/[g]"),
         Line::from("                   :%s/…/…/g all lines · ↑/↓ command history"),

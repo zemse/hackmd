@@ -142,6 +142,10 @@ pub struct App {
     /// Paste prefers the system clipboard (so external copies work) but falls
     /// back to this when the clipboard can't be read (no `pbpaste`, headless).
     pub yank: Option<String>,
+    /// Throttle state for mirroring the dirty edit buffer to its crash-
+    /// recovery file: `(when, content_hash)` of the last write, so an
+    /// unchanged buffer or a too-recent write is skipped.
+    pub recovery_throttle: Option<(std::time::Instant, u64)>,
     /// True while a local↔HackMD sync fetch is in flight, so the periodic
     /// poll doesn't stack duplicate requests for the same file.
     pub pending_sync: bool,
@@ -346,6 +350,11 @@ pub enum PromptKind {
     /// Rather than silently dropping the buffer, ask first: `s` saves, `d`
     /// discards, Esc keeps editing. `after` is what to do once resolved.
     ConfirmDiscardEdit { after: AfterEdit },
+    /// A file was opened that has unsaved edits mirrored to a crash-recovery
+    /// file. Offer to restore them: `r`/Enter recovers into the editor, `d`
+    /// discards the recovery file, Esc leaves it for next time. Carries the
+    /// recovered buffer and cursor.
+    RecoverEdit { content: String, cursor: usize },
 }
 
 /// What to do once a dirty editor has been resolved through the
@@ -849,7 +858,7 @@ impl App {
             Source::Directory(d) => View::Browser(Browser::scan(&d)?),
             Source::Stdin(text) => View::Reader(Reader::from_string(text)),
         };
-        Ok(Self {
+        let mut app = Self {
             view,
             root,
             history: Vec::new(),
@@ -891,6 +900,7 @@ impl App {
             last_local: None,
             prompt: None,
             yank: None,
+            recovery_throttle: None,
             pending_sync: false,
             last_sync: None,
             conflict: None,
@@ -898,7 +908,9 @@ impl App {
             edit_cmd_nav: None,
             lookup: None,
             error: None,
-        })
+        };
+        app.offer_recovery_for_current();
+        Ok(app)
     }
 
     /// Drain every finished cloud operation, applying each to app state.
@@ -1405,6 +1417,7 @@ impl App {
                 }
             }
         };
+        self.offer_recovery_for_current();
         Ok(())
     }
 
@@ -2174,9 +2187,10 @@ impl App {
                 self.enter_edit();
                 self.status = format!("New file {}", path.display());
             }
-            // Resolved directly in `handle_prompt_key` (s/d/Esc), never via
-            // the generic Enter→commit path.
+            // Resolved directly in `handle_prompt_key` (s/d/Esc / r/d), never
+            // via the generic Enter→commit path.
             PromptKind::ConfirmDiscardEdit { .. } => {}
+            PromptKind::RecoverEdit { .. } => {}
             PromptKind::RenameFile { from } => {
                 let name = p.input.trim();
                 if name.is_empty() {
@@ -2718,9 +2732,108 @@ impl App {
         }
     }
 
+    /// True while the open reader is in edit mode (buffer dirty or not).
+    pub fn is_editing(&self) -> bool {
+        matches!(&self.view, View::Reader(r) if r.edit.is_some())
+    }
+
     /// True while the open reader has an unsaved (dirty) edit buffer.
     pub fn editing_dirty(&self) -> bool {
         matches!(&self.view, View::Reader(r) if r.edit.as_ref().map(|e| e.dirty).unwrap_or(false))
+    }
+
+    /// Mirror the dirty edit buffer to its crash-recovery file so an unsaved
+    /// document survives Ctrl-C / a crash / a kill. Throttled to avoid a disk
+    /// write per keystroke; `force` (used right before quitting) bypasses the
+    /// throttle so the very last edits are captured. No-op when not editing a
+    /// dirty on-disk file.
+    pub fn autosave_recovery(&mut self, force: bool) {
+        let now = std::time::Instant::now();
+        let hash = {
+            if !self.editing_dirty() {
+                return;
+            }
+            let View::Reader(r) = &self.view else {
+                return;
+            };
+            let ReaderOrigin::File(path) = &r.origin else {
+                return;
+            };
+            let hash = crate::tui::recovery::content_hash(&r.raw);
+            let due = force
+                || match self.recovery_throttle {
+                    Some((t, h)) => {
+                        h != hash && now.duration_since(t) >= std::time::Duration::from_millis(700)
+                    }
+                    None => true,
+                };
+            if !due {
+                return;
+            }
+            let cursor = r.edit.as_ref().map(|e| e.cursor).unwrap_or(0);
+            crate::tui::recovery::save(path, &r.raw, cursor);
+            hash
+        };
+        self.recovery_throttle = Some((now, hash));
+    }
+
+    /// Discard a pending recovery the user declined at the recover prompt.
+    pub fn discard_recovery_for_current(&mut self) {
+        self.clear_recovery();
+    }
+
+    /// Drop the recovery mirror for the open file (after a save or an explicit
+    /// discard) and reset the autosave throttle.
+    fn clear_recovery(&mut self) {
+        if let View::Reader(r) = &self.view {
+            if let ReaderOrigin::File(p) = &r.origin {
+                crate::tui::recovery::clear(p);
+            }
+        }
+        self.recovery_throttle = None;
+    }
+
+    /// If the open reader is an on-disk file with a pending recovery (a
+    /// mirrored buffer that differs from the file), raise the recover/discard
+    /// prompt. Called whenever a file is opened.
+    fn offer_recovery_for_current(&mut self) {
+        if self.prompt.is_some() {
+            return;
+        }
+        let (path, disk) = match &self.view {
+            View::Reader(r) => match &r.origin {
+                ReaderOrigin::File(p) => (p.clone(), r.raw.clone()),
+                _ => return,
+            },
+            _ => return,
+        };
+        if let Some(rec) = crate::tui::recovery::pending(&path, &disk) {
+            self.prompt = Some(Prompt {
+                title: " Recover unsaved edits? ".into(),
+                input: String::new(),
+                kind: PromptKind::RecoverEdit {
+                    content: rec.content,
+                    cursor: rec.cursor,
+                },
+            });
+        }
+    }
+
+    /// Apply a chosen recovery: replace the buffer with the recovered text and
+    /// drop into the editor at the saved cursor, marked dirty so it's clearly
+    /// unsaved (and re-mirrored to the recovery file).
+    pub fn apply_recovery(&mut self, content: String, cursor: usize) {
+        self.enter_edit();
+        if let View::Reader(r) = &mut self.view {
+            if let Some(e) = r.edit.as_mut() {
+                r.raw = content;
+                e.cursor = floor_char_boundary(&r.raw, cursor.min(r.raw.len()));
+                e.dirty = true;
+                r.rendered = None;
+                self.status = "Recovered unsaved edits — save to keep them".into();
+            }
+        }
+        self.recovery_throttle = None;
     }
 
     /// Begin leaving the editor. A clean buffer (or no edit at all) performs
@@ -2762,7 +2875,20 @@ impl App {
                     self.exit_edit();
                 }
             }
-            AfterEdit::Quit => self.should_quit = true,
+            AfterEdit::Quit => {
+                if discard {
+                    // Quitting and throwing the edit away: drop the recovery
+                    // mirror and mark the buffer clean so the event loop's
+                    // final autosave doesn't write it back out.
+                    self.clear_recovery();
+                    if let View::Reader(r) = &mut self.view {
+                        if let Some(e) = r.edit.as_mut() {
+                            e.dirty = false;
+                        }
+                    }
+                }
+                self.should_quit = true;
+            }
         }
     }
 
@@ -2791,6 +2917,8 @@ impl App {
                         r.raw = disk;
                         r.last_meta = file_meta(&path);
                     }
+                    // Explicit discard → drop the crash-recovery mirror.
+                    crate::tui::recovery::clear(&path);
                 }
                 ReaderOrigin::CloudNote { .. } => {
                     if let Some(raw) = cached_raw {
@@ -2801,6 +2929,7 @@ impl App {
             }
             r.edit = None;
             r.rendered = None;
+            self.recovery_throttle = None;
             self.status = "Edit discarded".into();
         }
     }
@@ -3027,6 +3156,42 @@ impl App {
         e.dirty = true;
         e.command = None;
         r.rendered = None;
+    }
+
+    /// The current source line (the one the cursor sits on), including its
+    /// trailing newline. Backs whole-line copy/cut when nothing is selected,
+    /// mirroring the common editor behaviour where Ctrl+C/Ctrl+X with no
+    /// selection acts on the line.
+    pub fn edit_current_line_text(&self) -> Option<String> {
+        let View::Reader(r) = &self.view else {
+            return None;
+        };
+        let e = r.edit.as_ref()?;
+        let (start, end) = line_bounds_with_newline(&r.raw, e.cursor);
+        r.raw.get(start..end).map(str::to_string)
+    }
+
+    /// Remove the current source line (with its trailing newline) and return
+    /// it. One undo snapshot; the cursor lands at the start of what is now the
+    /// line that followed.
+    pub fn edit_cut_current_line(&mut self) -> Option<String> {
+        let View::Reader(r) = &mut self.view else {
+            return None;
+        };
+        let cursor = r.edit.as_ref()?.cursor;
+        let (start, end) = line_bounds_with_newline(&r.raw, cursor);
+        if start == end {
+            return None;
+        }
+        push_undo(r);
+        let removed = r.raw[start..end].to_string();
+        r.raw.replace_range(start..end, "");
+        let e = r.edit.as_mut().unwrap();
+        e.cursor = floor_char_boundary(&r.raw, start.min(r.raw.len()));
+        e.dirty = true;
+        e.command = None;
+        r.rendered = None;
+        Some(removed)
     }
 
     /// Text covered by the active editor drag-selection, if any.
@@ -3292,6 +3457,24 @@ impl App {
 
     /// Insert an `open``close` pair at the cursor and place the cursor between
     /// them (bracket auto-close). One undo step.
+    /// Whether an opening bracket should auto-insert its closer: only when the
+    /// cursor is at the end of the buffer or the next character is whitespace
+    /// (space / tab / newline). Typing `(` directly left of other text inserts
+    /// a lone `(` so wrapping existing text doesn't strand a `)` mid-word.
+    pub fn edit_autoclose_ok(&self) -> bool {
+        let View::Reader(r) = &self.view else {
+            return true;
+        };
+        let Some(e) = r.edit.as_ref() else {
+            return true;
+        };
+        let pos = e.cursor.min(r.raw.len());
+        match r.raw[pos..].chars().next() {
+            None => true,
+            Some(c) => c.is_whitespace(),
+        }
+    }
+
     pub fn edit_insert_pair(&mut self, open: char, close: char) {
         let View::Reader(r) = &mut self.view else {
             return;
@@ -3486,6 +3669,9 @@ impl App {
                     e.dirty = false;
                     e.command = None;
                 }
+                // Saved to disk → the crash-recovery mirror is obsolete.
+                crate::tui::recovery::clear(&path);
+                self.recovery_throttle = None;
                 self.status = format!("Saved {}", path.display());
                 // Linked file → merge with upstream right after saving.
                 if crate::tui::hackmd_meta::parse(&r.raw).is_some() {
@@ -4425,6 +4611,19 @@ pub(crate) fn push_undo(r: &mut Reader) {
         e.undo.remove(0);
     }
     e.redo.clear();
+}
+
+/// Byte range of the source line containing `pos`: from just after the
+/// previous newline (or the start) to just after the next newline (or the
+/// end), so the trailing `\n` is included when there is one.
+fn line_bounds_with_newline(s: &str, pos: usize) -> (usize, usize) {
+    let pos = pos.min(s.len());
+    let start = s[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let end = s[start..]
+        .find('\n')
+        .map(|i| start + i + 1)
+        .unwrap_or(s.len());
+    (start, end)
 }
 
 /// Snap `pos` down to the nearest UTF-8 char boundary <= pos.
@@ -5749,6 +5948,94 @@ mod tests {
             }
             _ => panic!(),
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn autoclose_only_before_space_or_eol() {
+        let dir = fresh_temp("edit-autoclose");
+        let path = dir.join("a.md");
+        std::fs::write(&path, "foo\n").unwrap();
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        app.enter_edit();
+
+        // Cursor at start (before `f`): next char is text → no auto-close.
+        assert!(!app.edit_autoclose_ok());
+
+        // Cursor at end of buffer → auto-close ok.
+        if let View::Reader(r) = &mut app.view {
+            r.edit.as_mut().unwrap().cursor = r.raw.len();
+        }
+        assert!(app.edit_autoclose_ok());
+
+        // Cursor right before the newline → next char is whitespace → ok.
+        if let View::Reader(r) = &mut app.view {
+            r.edit.as_mut().unwrap().cursor = 3; // "foo|\n"
+        }
+        assert!(app.edit_autoclose_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn cut_current_line_removes_line_and_returns_it() {
+        let dir = fresh_temp("edit-cutline");
+        let path = dir.join("c.md");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        app.enter_edit();
+        // Put the cursor on the "two" line.
+        if let View::Reader(r) = &mut app.view {
+            r.edit.as_mut().unwrap().cursor = 5; // inside "two"
+        }
+        let cut = app.edit_cut_current_line();
+        assert_eq!(cut.as_deref(), Some("two\n"));
+        let View::Reader(r) = &app.view else { panic!() };
+        assert_eq!(r.raw, "one\nthree\n");
+        assert!(r.edit.as_ref().unwrap().dirty);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recovery_round_trips_and_prompts_on_reopen() {
+        use crate::tui::recovery;
+        let dir = fresh_temp("edit-recovery");
+        let path = dir.join("r.md");
+        std::fs::write(&path, "saved\n").unwrap();
+
+        // Edit without saving, then autosave to the recovery mirror.
+        {
+            let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+            app.ensure_rendered(80);
+            app.enter_edit();
+            app.edit_insert("UNSAVED ");
+            app.autosave_recovery(true);
+        }
+        // The mirror differs from disk → a fresh open offers recovery.
+        assert!(recovery::pending(&path, "saved\n").is_some());
+        let app = App::new(Source::File(path.clone()), opts()).unwrap();
+        assert!(
+            matches!(
+                app.prompt.as_ref().map(|p| &p.kind),
+                Some(PromptKind::RecoverEdit { .. })
+            ),
+            "reopen should raise the recover prompt"
+        );
+
+        // Saving clears the mirror.
+        {
+            let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+            app.prompt = None; // dismiss recover prompt
+            app.enter_edit();
+            app.edit_insert("X");
+            app.autosave_recovery(true);
+            app.save_edit().unwrap();
+        }
+        assert!(recovery::load(&path).is_none(), "save clears recovery");
 
         std::fs::remove_dir_all(&dir).ok();
     }

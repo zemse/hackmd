@@ -16,6 +16,7 @@ mod markdown;
 mod md_config;
 mod palette;
 mod read_state;
+pub mod recovery;
 pub mod sync;
 mod syntax;
 pub mod theme;

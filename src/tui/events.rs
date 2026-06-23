@@ -37,6 +37,10 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
         // open and then every SYNC_INTERVAL to pull upstream edits.
         app.maybe_sync();
         term.draw(|f| ui::draw(f, app))?;
+        // Flush trailing unsaved edits to the recovery mirror on idle ticks,
+        // so edits made just before the user stops typing aren't left only in
+        // memory past the autosave throttle window.
+        app.autosave_recovery(false);
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
@@ -50,6 +54,10 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
             }
             _ => {}
         }
+        // Mirror unsaved edits to the crash-recovery file. `force` on the way
+        // out so the last keystrokes before a quit are captured despite the
+        // throttle.
+        app.autosave_recovery(app.should_quit);
     }
     Ok(())
 }
@@ -63,13 +71,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // Handlers that produce a new message set it after this clear.
     app.status.clear();
 
-    // Ctrl+C quits. A dirty editor gets one chance to save first (the
-    // save/discard/cancel prompt); a second Ctrl-C — the prompt is then open,
-    // so this branch sees `prompt.is_some()` — hard-quits. Every other state
-    // quits immediately.
+    // Ctrl+C. In the editor it COPIES (the selection, else the current line)
+    // and never quits — quitting here is how unsaved work used to be lost.
+    // Leave the editor with Esc then `:q` (or Esc Esc), which asks to save.
+    // Outside the editor (or with a modal already up) Ctrl+C quits.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if app.prompt.is_none() && app.editing_dirty() {
-            app.request_leave_edit(crate::tui::app::AfterEdit::Quit);
+        if app.prompt.is_none() && app.is_editing() {
+            edit_copy(app);
         } else {
             app.should_quit = true;
         }
@@ -659,10 +667,11 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-    // Ctrl-C is the hard escape hatch (handled above before we get here in
-    // practice, but kept defensively in case dispatch shifts).
+    // Ctrl-C copies here (handled at the top of `handle_key` in practice, but
+    // kept defensively in case dispatch shifts) — it must never quit and lose
+    // the buffer.
     if ctrl && matches!(key.code, KeyCode::Char('c')) {
-        app.should_quit = true;
+        edit_copy(app);
         return Ok(());
     }
 
@@ -765,6 +774,29 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
     }
 
+    // Clipboard, GUI-style: Ctrl (or macOS Cmd) + C/X/V. Copy and cut act on
+    // the selection if there is one, else the whole current line; paste drops
+    // the clipboard at the cursor (replacing the selection if any). Handled
+    // before the selection branch and before plain insertion so the letter is
+    // never typed. (Ctrl+C is also caught at the top of `handle_key`.)
+    if ctrl || key.modifiers.contains(KeyModifiers::SUPER) {
+        match key.code {
+            KeyCode::Char('c') => {
+                edit_copy(app);
+                return Ok(());
+            }
+            KeyCode::Char('x') => {
+                edit_cut(app);
+                return Ok(());
+            }
+            KeyCode::Char('v') => {
+                paste_over_selection(app);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     // An active drag-selection captures the next key: y copies, Backspace/
     // Delete deletes, Esc cancels. Any other key drops the selection and is
     // then handled normally (it does NOT replace the selected text).
@@ -799,14 +831,9 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.edit_delete_selection();
                 return Ok(());
             }
-            // Paste over the selection: overwrite the selected text with the
-            // clipboard/register contents. `p` mirrors copy/cut; Ctrl-V is the
-            // GUI binding.
+            // Paste over the selection with the bare `p` (vim-style); the GUI
+            // Ctrl/Cmd-V paste-over is handled by the clipboard block above.
             KeyCode::Char('p') if !ctrl && !alt => {
-                paste_over_selection(app);
-                return Ok(());
-            }
-            KeyCode::Char('v') if ctrl => {
                 paste_over_selection(app);
                 return Ok(());
             }
@@ -827,14 +854,6 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
             _ => app.edit_clear_selection(),
         }
-    }
-
-    // Paste at the cursor (no selection). Ctrl-V is the universal GUI binding;
-    // it works whether or not text is selected (the selection branch above
-    // handles the paste-over case).
-    if ctrl && matches!(key.code, KeyCode::Char('v')) {
-        paste_over_selection(app);
-        return Ok(());
     }
 
     // GUI line-edge motion: Cmd-←/→ on macOS (reported as the SUPER modifier
@@ -945,13 +964,19 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Tab => app.edit_insert("  "),
         KeyCode::Char(c) if !ctrl && !alt => {
             // Bracket auto-close: `(`/`[`/`{` insert the matching closer and
-            // sit the cursor between. Typing the closer when it's already
-            // under the cursor steps over it instead of duplicating. Emphasis
-            // (`*`/`_`/`` ` ``) is NOT auto-closed here — that would break
-            // bullet/maths entry — but it does wrap a selection (handled
-            // above).
+            // sit the cursor between — but only when the cursor is at the end
+            // of the line/buffer or a space follows. Typing `(` on the left of
+            // existing text (e.g. before `foo`) inserts a lone `(`, so you can
+            // wrap text without a stray `)` landing mid-word. Typing the closer
+            // when it's already under the cursor steps over it instead of
+            // duplicating. Emphasis (`*`/`_`/`` ` ``) is never auto-closed.
             if let Some((open, close)) = bracket_open_pair(c) {
-                app.edit_insert_pair(open, close);
+                if app.edit_autoclose_ok() {
+                    app.edit_insert_pair(open, close);
+                } else {
+                    let mut buf = [0u8; 4];
+                    app.edit_insert(open.encode_utf8(&mut buf));
+                }
             } else if is_bracket_closer(c) && app.edit_try_type_over(c) {
                 // Stepped over an existing closer — nothing more to do.
             } else {
@@ -1421,6 +1446,34 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) -> Result<()> {
             KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {
                 app.prompt = None;
                 app.status = "Kept editing".into();
+            }
+            _ => {}
+        }
+        return Ok(());
+    }
+    // Recover-unsaved-edits prompt: `r`/Enter restores the buffer into the
+    // editor, `d` discards the recovery file, Esc leaves it for next time.
+    let recover = matches!(
+        app.prompt.as_ref().map(|p| &p.kind),
+        Some(crate::tui::app::PromptKind::RecoverEdit { .. })
+    );
+    if recover {
+        match key.code {
+            KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Enter => {
+                if let Some(p) = app.prompt.take() {
+                    if let crate::tui::app::PromptKind::RecoverEdit { content, cursor } = p.kind {
+                        app.apply_recovery(content, cursor);
+                    }
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                app.prompt = None;
+                app.discard_recovery_for_current();
+                app.status = "Discarded recovered edits".into();
+            }
+            KeyCode::Esc => {
+                app.prompt = None;
+                app.status = "Recovery kept — will ask again next time".into();
             }
             _ => {}
         }
@@ -2537,6 +2590,40 @@ fn clipboard_or_yank(app: &App) -> Option<String> {
 /// selection into a markdown link `[selected](url)` rather than replacing it.
 /// Anything that isn't a single link (after trimming surrounding whitespace)
 /// falls back to a plain paste-over.
+/// Copy in the editor: the active selection if there is one, otherwise the
+/// whole current line. Goes to both the system clipboard and the in-app yank
+/// register, and reports on the statusline. Clears the selection.
+fn edit_copy(app: &mut App) {
+    let (text, what) = match app.edit_selection_text() {
+        Some(t) => (t, "Copied"),
+        None => match app.edit_current_line_text() {
+            Some(t) => (t, "Copied line"),
+            None => return,
+        },
+    };
+    copy_to_clipboard(&text);
+    app.yank = Some(text.clone());
+    app.status = format!("{what} ({} chars)", text.chars().count());
+    app.edit_clear_selection();
+}
+
+/// Cut in the editor: the active selection if there is one, otherwise the
+/// whole current line. Mirrors `edit_copy`, then deletes what was copied.
+fn edit_cut(app: &mut App) {
+    if let Some(text) = app.edit_selection_text() {
+        copy_to_clipboard(&text);
+        app.yank = Some(text.clone());
+        app.status = format!("Cut {} chars", text.chars().count());
+        app.edit_delete_selection();
+        return;
+    }
+    if let Some(text) = app.edit_cut_current_line() {
+        copy_to_clipboard(&text);
+        app.yank = Some(text.clone());
+        app.status = format!("Cut line ({} chars)", text.chars().count());
+    }
+}
+
 fn paste_over_selection(app: &mut App) {
     if let Some(text) = clipboard_or_yank(app) {
         if let Some(url) = pasted_link_href(text.trim())
