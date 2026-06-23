@@ -63,9 +63,16 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // Handlers that produce a new message set it after this clear.
     app.status.clear();
 
-    // Ctrl+C is a hard exit no matter what overlay is on screen.
+    // Ctrl+C quits. A dirty editor gets one chance to save first (the
+    // save/discard/cancel prompt); a second Ctrl-C — the prompt is then open,
+    // so this branch sees `prompt.is_some()` — hard-quits. Every other state
+    // quits immediately.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.should_quit = true;
+        if app.prompt.is_none() && app.editing_dirty() {
+            app.request_leave_edit(crate::tui::app::AfterEdit::Quit);
+        } else {
+            app.should_quit = true;
+        }
         return Ok(());
     }
     // A blocking error modal (e.g. "file isn't valid UTF-8") swallows the next
@@ -645,9 +652,9 @@ fn keep_browser_selection_visible(app: &mut App) {
 /// goes into the buffer (insert mode is the default); arrows/home/end/etc.
 /// move the source cursor; Ctrl-S (or Ctrl-W backup) saves. The first Esc
 /// opens the vim-style command line on the statusline (`:w`, `:wq`, `:q`,
-/// `:preview`, …); a second Esc there discards changes and exits. Mouse
-/// handling stays in `handle_mouse` and updates the cursor from click
-/// position there.
+/// `:preview`, …); a second Esc there leaves the editor, asking save/discard
+/// first if the buffer is dirty. Mouse handling stays in `handle_mouse` and
+/// updates the cursor from click position there.
 fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -682,7 +689,7 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
 
     // Command line open ("first Esc"): keys edit the command, Tab accepts
     // the grey suggestion, Enter executes, Esc is the non-vim escape hatch
-    // (discard changes + exit the editor).
+    // (leave the editor, asking save/discard first if dirty).
     if matches!(&app.view, View::Reader(r) if r.edit.as_ref().map(|e| e.command.is_some()).unwrap_or(false))
     {
         return handle_edit_command_key(app, key);
@@ -915,8 +922,8 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Esc => {
             // First Esc moves the cursor to the statusline command place
             // (vim-style). From there the user types a command (`:wq`,
-            // `:q`, `:preview`, …) or presses Esc again to discard changes
-            // and leave the editor.
+            // `:q`, `:preview`, …) or presses Esc again to leave the editor
+            // (asking save/discard first if there are unsaved changes).
             if let View::Reader(r) = &mut app.view {
                 if let Some(e) = r.edit.as_mut() {
                     e.command = Some(String::new());
@@ -1007,17 +1014,10 @@ pub(crate) fn complete_edit_command(input: &str) -> Option<&'static str> {
 
 /// Keystrokes while the editor command line is open.
 fn handle_edit_command_key(app: &mut App, key: KeyEvent) -> Result<()> {
-    let dirty =
-        matches!(&app.view, View::Reader(r) if r.edit.as_ref().map(|e| e.dirty).unwrap_or(false));
     match key.code {
-        // Second Esc: the non-vim exit — discard changes, back to preview.
-        KeyCode::Esc => {
-            if dirty {
-                app.exit_edit_discard();
-            } else {
-                app.exit_edit();
-            }
-        }
+        // Second Esc: the non-vim exit. A dirty buffer raises the
+        // save/discard/cancel prompt; a clean one just leaves.
+        KeyCode::Esc => app.request_leave_edit(crate::tui::app::AfterEdit::Exit),
         KeyCode::Enter => {
             let input = match &mut app.view {
                 View::Reader(r) => r.edit.as_mut().and_then(|e| e.command.take()),
@@ -1089,9 +1089,12 @@ fn exec_edit_command(app: &mut App, cmd: &str) -> Result<()> {
             app.save_edit()?;
             app.exit_edit();
         }
-        // Per the project's UX (a viewer-first app), `:q` leaves the editor
-        // and drops unsaved changes — the statusline hint says so.
-        "q" | "q!" => {
+        // `:q` leaves the editor, asking save/discard/cancel first if the
+        // buffer is dirty so edits are never dropped silently.
+        "q" => app.request_leave_edit(crate::tui::app::AfterEdit::Exit),
+        // `:q!` is the explicit force-discard escape hatch (vim's bang):
+        // drop unsaved changes and leave, no questions asked.
+        "q!" => {
             if dirty {
                 app.exit_edit_discard();
             } else {
@@ -1396,6 +1399,31 @@ fn handle_conflict_key(app: &mut App, key: KeyEvent) -> Result<()> {
 fn handle_prompt_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.should_quit = true;
+        return Ok(());
+    }
+    // Unsaved-changes prompt: explicit keys only, so a stray keypress can't
+    // lose the buffer. `s` saves then leaves, `d` discards, Esc/`c` keeps
+    // editing; anything else is ignored.
+    let discard_after = match app.prompt.as_ref().map(|p| &p.kind) {
+        Some(crate::tui::app::PromptKind::ConfirmDiscardEdit { after }) => Some(*after),
+        _ => None,
+    };
+    if let Some(after) = discard_after {
+        match key.code {
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                app.prompt = None;
+                app.resolve_discard_edit(after, true)?;
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                app.prompt = None;
+                app.resolve_discard_edit(after, false)?;
+            }
+            KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => {
+                app.prompt = None;
+                app.status = "Kept editing".into();
+            }
+            _ => {}
+        }
         return Ok(());
     }
     let confirm = matches!(
@@ -2899,19 +2927,90 @@ mod keybind_tests {
         assert!(disk.starts_with("XYZ"), ":wq wrote the buffer to disk");
     }
 
-    #[test]
-    fn q_discards_changes_and_exits() {
-        let mut app = app_with_headings("q-discard");
+    /// Drive a dirty editor to the `:q` command (which now asks before
+    /// dropping the buffer rather than discarding silently).
+    fn dirty_then_q(tag: &str) -> App {
+        let mut app = app_with_headings(tag);
         press(&mut app, KeyCode::Char('e'));
         type_str(&mut app, "XYZ");
         press(&mut app, KeyCode::Esc);
         type_str(&mut app, "q");
         press(&mut app, KeyCode::Enter);
-        assert!(edit_state_of(&app).is_none(), ":q exits the editor");
+        app
+    }
+
+    #[test]
+    fn q_on_dirty_buffer_asks_before_discarding() {
+        let app = dirty_then_q("q-prompt");
+        assert!(
+            edit_state_of(&app).is_some(),
+            ":q keeps editing until resolved"
+        );
+        assert!(
+            matches!(
+                app.prompt.as_ref().map(|p| &p.kind),
+                Some(crate::tui::app::PromptKind::ConfirmDiscardEdit { .. })
+            ),
+            ":q on a dirty buffer raises the save/discard prompt",
+        );
+    }
+
+    #[test]
+    fn discard_prompt_d_drops_the_edit_and_exits() {
+        let mut app = dirty_then_q("q-discard");
+        press(&mut app, KeyCode::Char('d'));
+        assert!(app.prompt.is_none());
+        assert!(edit_state_of(&app).is_none(), "d exits the editor");
         let View::Reader(r) = &app.view else {
             panic!("expected reader");
         };
-        assert!(!r.raw.starts_with("XYZ"), ":q dropped the unsaved edit");
+        assert!(!r.raw.starts_with("XYZ"), "d dropped the unsaved edit");
+    }
+
+    #[test]
+    fn discard_prompt_s_saves_then_exits() {
+        let mut app = dirty_then_q("q-save");
+        let path = match &app.view {
+            View::Reader(r) => match &r.origin {
+                crate::tui::app::ReaderOrigin::File(p) => p.clone(),
+                _ => panic!("expected file origin"),
+            },
+            _ => panic!("expected reader"),
+        };
+        press(&mut app, KeyCode::Char('s'));
+        assert!(app.prompt.is_none());
+        assert!(edit_state_of(&app).is_none(), "s exits the editor");
+        let disk = std::fs::read_to_string(&path).unwrap();
+        assert!(disk.starts_with("XYZ"), "s wrote the buffer to disk");
+    }
+
+    #[test]
+    fn discard_prompt_esc_keeps_editing() {
+        let mut app = dirty_then_q("q-cancel");
+        press(&mut app, KeyCode::Esc);
+        assert!(app.prompt.is_none());
+        let e = edit_state_of(&app).expect("Esc keeps the editor open");
+        assert!(e.dirty, "the unsaved edit is still there");
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        assert!(r.raw.starts_with("XYZ"), "buffer untouched after cancel");
+    }
+
+    #[test]
+    fn q_bang_force_discards_without_asking() {
+        let mut app = app_with_headings("q-bang");
+        press(&mut app, KeyCode::Char('e'));
+        type_str(&mut app, "XYZ");
+        press(&mut app, KeyCode::Esc);
+        type_str(&mut app, "q!");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.prompt.is_none(), ":q! never prompts");
+        assert!(edit_state_of(&app).is_none(), ":q! exits the editor");
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader");
+        };
+        assert!(!r.raw.starts_with("XYZ"), ":q! dropped the unsaved edit");
     }
 
     #[test]

@@ -342,6 +342,20 @@ pub enum PromptKind {
     /// `c` / F2 in the local browser — rename the entry at `from` to the
     /// typed name (kept in the same parent directory).
     RenameFile { from: PathBuf },
+    /// A dirty editor is about to be abandoned (second Esc / `:q` / Ctrl-C).
+    /// Rather than silently dropping the buffer, ask first: `s` saves, `d`
+    /// discards, Esc keeps editing. `after` is what to do once resolved.
+    ConfirmDiscardEdit { after: AfterEdit },
+}
+
+/// What to do once a dirty editor has been resolved through the
+/// [`PromptKind::ConfirmDiscardEdit`] prompt.
+#[derive(Clone, Copy)]
+pub enum AfterEdit {
+    /// Leave edit mode, back to the reader (second Esc / `:q`).
+    Exit,
+    /// Quit the whole app (Ctrl-C while editing).
+    Quit,
 }
 
 /// The cloud note a context-sensitive action (`P`/`D`/`S`/`y`/`o`) applies
@@ -469,9 +483,9 @@ pub struct EditState {
     pub dirty: bool,
     /// Vim-style command line. `Some(input)` after the first Esc moves the
     /// cursor to the statusline; the user types a command (`:wq`, `:q`,
-    /// `:preview`, …) there, Enter executes it, and a second Esc discards
-    /// changes and exits the editor. Any buffer interaction (click, typing
-    /// after it's dismissed) clears it back to insert mode.
+    /// `:preview`, …) there, Enter executes it, and a second Esc leaves the
+    /// editor (asking save/discard first if dirty). Any buffer interaction
+    /// (click, typing after it's dismissed) clears it back to insert mode.
     pub command: Option<String>,
     /// `:preview` overlay — render the unsaved buffer full-screen like the
     /// reader; a single Esc drops back to the editor.
@@ -2160,6 +2174,9 @@ impl App {
                 self.enter_edit();
                 self.status = format!("New file {}", path.display());
             }
+            // Resolved directly in `handle_prompt_key` (s/d/Esc), never via
+            // the generic Enter→commit path.
+            PromptKind::ConfirmDiscardEdit { .. } => {}
             PromptKind::RenameFile { from } => {
                 let name = p.input.trim();
                 if name.is_empty() {
@@ -2698,6 +2715,54 @@ impl App {
                 e.cursor = 0;
                 r.rendered = None;
             }
+        }
+    }
+
+    /// True while the open reader has an unsaved (dirty) edit buffer.
+    pub fn editing_dirty(&self) -> bool {
+        matches!(&self.view, View::Reader(r) if r.edit.as_ref().map(|e| e.dirty).unwrap_or(false))
+    }
+
+    /// Begin leaving the editor. A clean buffer (or no edit at all) performs
+    /// `after` straight away; a dirty buffer raises the save/discard/cancel
+    /// prompt so a pending edit is never thrown away without asking.
+    pub fn request_leave_edit(&mut self, after: AfterEdit) {
+        if self.editing_dirty() {
+            self.prompt = Some(Prompt {
+                title: " Unsaved changes ".into(),
+                input: String::new(),
+                kind: PromptKind::ConfirmDiscardEdit { after },
+            });
+            return;
+        }
+        self.apply_after_edit(after, false);
+    }
+
+    /// Resolve a [`PromptKind::ConfirmDiscardEdit`] prompt. `save` writes the
+    /// buffer first (keeping the editor open if the write fails so nothing is
+    /// lost); otherwise the edit is discarded.
+    pub fn resolve_discard_edit(&mut self, after: AfterEdit, save: bool) -> Result<()> {
+        if save {
+            self.save_edit()?;
+            self.apply_after_edit(after, false);
+        } else {
+            self.apply_after_edit(after, true);
+        }
+        Ok(())
+    }
+
+    /// Carry out the post-resolution action: leave edit mode (reloading from
+    /// the origin when `discard`) or quit the app.
+    fn apply_after_edit(&mut self, after: AfterEdit, discard: bool) {
+        match after {
+            AfterEdit::Exit => {
+                if discard {
+                    self.exit_edit_discard();
+                } else {
+                    self.exit_edit();
+                }
+            }
+            AfterEdit::Quit => self.should_quit = true,
         }
     }
 

@@ -461,6 +461,13 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
                 .fg(theme.heading[3])
                 .add_modifier(Modifier::BOLD),
         ))
+    } else if matches!(p.kind, app::PromptKind::ConfirmDiscardEdit { .. }) {
+        Line::from(Span::styled(
+            "s save · d discard · Esc keep editing",
+            Style::default()
+                .fg(theme.heading[3])
+                .add_modifier(Modifier::BOLD),
+        ))
     } else {
         Line::from(vec![
             Span::styled(
@@ -1755,9 +1762,9 @@ fn draw_edit_command_line(
         spans.push(Span::styled("  (Tab to complete)", grey));
     }
     let right = if input.is_empty() {
-        "type a vim command — :wq save+quit · :q discard · :preview · Esc again discards "
+        "type a vim command — :wq save+quit · :q leave (asks to save) · :preview · :q! force-discard "
     } else {
-        "Enter:run  Esc:discard+exit "
+        "Enter:run  Esc:leave (asks to save) "
     };
     let right_w = UnicodeWidthStr::width(right);
     let used = span_width(&spans);
@@ -2243,7 +2250,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         section(" Edit  (e/i open · A append · O open-above · split preview)"),
         Line::from("  Ctrl-S           save  (Ctrl-W fallback for XOFF terminals)"),
-        Line::from("  Ctrl-Z / Ctrl-Y  undo / redo          Esc Esc  discard"),
+        Line::from("  Ctrl-Z / Ctrl-Y  undo / redo       Esc Esc  leave (asks to save)"),
         Line::from("  Alt-←/→          word jump    Alt-Bksp/Del  word delete"),
         Line::from("  drag select      y copy  x cut  p paste  Del delete  Esc cancel"),
         Line::from("  ( [ {            auto-close;  select + ( * _ ` [  wraps it"),
