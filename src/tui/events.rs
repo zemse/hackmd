@@ -348,6 +348,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             }
             keep_browser_selection_visible(app);
         }
+        // `s` in the browser toggles recency sort (newest first) vs. name sort.
+        KeyCode::Char('s') if matches!(app.view, View::Browser(_)) => {
+            if let View::Browser(b) = &mut app.view {
+                b.toggle_sort_by_modified();
+            }
+            keep_browser_selection_visible(app);
+        }
         KeyCode::Char('O') if matches!(app.view, View::Reader(_)) => app.enter_edit_open_above(),
 
         // HackMD note actions — active wherever a cloud note is targeted

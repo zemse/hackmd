@@ -14,6 +14,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::tui::app::{self, App, BrowserEntryKind, DiffRowKind, Focus, ReaderOrigin, View};
 use crate::tui::links::LinkTarget;
 
@@ -1216,6 +1218,34 @@ fn list_row(mut spans: Vec<Span<'static>>, selected: bool, hl: Style) -> ListIte
     if selected { item.style(hl) } else { item }
 }
 
+/// Compact relative age (`now`, `3m`, `2h`, `5d`, `3w`, `8mo`, `2y`) for the
+/// browser's right-aligned modified column. A timestamp in the future (clock
+/// skew) reads as `now`.
+fn fmt_relative_age(t: std::time::SystemTime, now: std::time::SystemTime) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    const WEEK: u64 = 7 * DAY;
+    const MONTH: u64 = 30 * DAY;
+    const YEAR: u64 = 365 * DAY;
+    let secs = now.duration_since(t).map(|d| d.as_secs()).unwrap_or(0);
+    if secs < MIN {
+        "now".to_string()
+    } else if secs < HOUR {
+        format!("{}m", secs / MIN)
+    } else if secs < DAY {
+        format!("{}h", secs / HOUR)
+    } else if secs < WEEK {
+        format!("{}d", secs / DAY)
+    } else if secs < MONTH {
+        format!("{}w", secs / WEEK)
+    } else if secs < YEAR {
+        format!("{}mo", secs / MONTH)
+    } else {
+        format!("{}y", secs / YEAR)
+    }
+}
+
 fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     let View::Browser(b) = &app.view else {
         return;
@@ -1239,6 +1269,8 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
         .bg(theme.status_bg)
         .fg(theme.status_fg)
         .add_modifier(Modifier::BOLD);
+    let now = std::time::SystemTime::now();
+    let inner_w = inner.width as usize;
     let items: Vec<ListItem> = b
         .entries
         .iter()
@@ -1257,6 +1289,21 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
             };
             if unread {
                 spans.push(Span::styled(" [unread]", badge_style));
+            }
+            // Right-aligned last-modified column. Skipped for `../` (no mtime)
+            // and when the name leaves no room, so a long filename is never
+            // clipped by the timestamp.
+            if let Some(m) = e.modified {
+                let age = fmt_relative_age(m, now);
+                let left_w: usize = spans
+                    .iter()
+                    .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                    .sum();
+                let age_w = UnicodeWidthStr::width(age.as_str());
+                if left_w + 1 + age_w <= inner_w {
+                    spans.push(Span::raw(" ".repeat(inner_w - left_w - age_w)));
+                    spans.push(Span::styled(age, Style::default().fg(theme.muted)));
+                }
             }
             list_row(spans, selected, hl)
         })
@@ -1962,7 +2009,12 @@ fn default_hint(app: &App) -> String {
         },
         View::Browser(b) => {
             let all = if b.show_all { "A:filtered" } else { "A:all" };
-            format!("j/k  Enter:open  n:new  c:rename  f:find  {all}  H:hackmd  ?:help")
+            let sort = if b.sort_by_modified {
+                "s:by-name"
+            } else {
+                "s:by-recent"
+            };
+            format!("j/k  Enter:open  n:new  c:rename  f:find  {sort}  {all}  H:hackmd  ?:help")
         }
         View::Cloud(c) => {
             if c.show_tab_bar() {

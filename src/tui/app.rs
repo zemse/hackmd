@@ -800,6 +800,10 @@ pub struct Browser {
     /// (`false`) shows only browsable text files and the directories that
     /// contain them.
     pub show_all: bool,
+    /// When `true` (toggled with `s`), entries are ordered by last-modified
+    /// time, newest first, instead of the default name sort. `../` stays
+    /// pinned at the top either way.
+    pub sort_by_modified: bool,
 }
 
 #[derive(Clone)]
@@ -807,6 +811,10 @@ pub struct BrowserEntry {
     pub path: PathBuf,
     pub display: String,
     pub kind: BrowserEntryKind,
+    /// Last-modified time of the entry, shown right-aligned in the listing and
+    /// used as the sort key when `Browser::sort_by_modified` is on. `None` when
+    /// unstatable, or for the synthetic `../` row.
+    pub modified: Option<std::time::SystemTime>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4133,8 +4141,9 @@ fn canonicalize_or(p: PathBuf) -> PathBuf {
 /// With `show_all`, every file and directory is listed, including hidden and
 /// ignored ones.
 fn push_children(dir: &Path, out: &mut Vec<BrowserEntry>, show_all: bool) {
-    let mut dirs: Vec<(String, PathBuf)> = Vec::new();
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
+    type Row = (String, PathBuf, Option<std::time::SystemTime>);
+    let mut dirs: Vec<Row> = Vec::new();
+    let mut files: Vec<Row> = Vec::new();
     let walker = ignore::WalkBuilder::new(dir)
         .max_depth(Some(1))
         .hidden(!show_all)
@@ -4160,31 +4169,32 @@ fn push_children(dir: &Path, out: &mut Vec<BrowserEntry>, show_all: bool) {
             Some(f) => f,
             None => continue,
         };
+        let modified = entry.metadata().ok().and_then(|m| m.modified().ok());
         if ft.is_dir() {
             if show_all || dir_has_listable(&path) {
-                dirs.push((name, path));
+                dirs.push((name, path, modified));
             }
         } else if ft.is_file() && (show_all || is_text_file(&path)) {
-            files.push((name, path));
+            files.push((name, path, modified));
         }
     }
-    let by_name = |a: &(String, PathBuf), b: &(String, PathBuf)| {
-        a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase())
-    };
+    let by_name = |a: &Row, b: &Row| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase());
     dirs.sort_by(by_name);
     files.sort_by(by_name);
-    for (name, path) in dirs {
+    for (name, path, modified) in dirs {
         out.push(BrowserEntry {
             path,
             display: format!("{}/", name),
             kind: BrowserEntryKind::Dir,
+            modified,
         });
     }
-    for (name, path) in files {
+    for (name, path, modified) in files {
         out.push(BrowserEntry {
             path,
             display: name,
             kind: BrowserEntryKind::Markdown,
+            modified,
         });
     }
 }
@@ -5064,6 +5074,7 @@ impl Browser {
             last_meta: None,
             find: None,
             show_all: false,
+            sort_by_modified: false,
         };
         b.rebuild()?;
         Ok(b)
@@ -5080,10 +5091,26 @@ impl Browser {
                     path: parent.to_path_buf(),
                     display: "../".to_string(),
                     kind: BrowserEntryKind::ParentDir,
+                    modified: None,
                 });
             }
         }
         push_children(&self.dir, &mut entries, self.show_all);
+        if self.sort_by_modified {
+            // Reorder by mtime, newest first, but keep a leading `../` pinned at
+            // the top. `None` mtimes sort last; ties fall back to name order.
+            let start = usize::from(matches!(
+                entries.first().map(|e| e.kind),
+                Some(BrowserEntryKind::ParentDir)
+            ));
+            entries[start..].sort_by(|a, b| {
+                b.modified.cmp(&a.modified).then_with(|| {
+                    a.display
+                        .to_ascii_lowercase()
+                        .cmp(&b.display.to_ascii_lowercase())
+                })
+            });
+        }
         self.entries = entries;
         // Skip past `../` on a fresh listing so the cursor lands on the first
         // real entry — `Esc`/`h`/`Backspace` already covers "go up", and
@@ -5113,6 +5140,13 @@ impl Browser {
     /// highlighted entry across the rebuild when it survives the filter change.
     pub fn toggle_show_all(&mut self) {
         self.show_all = !self.show_all;
+        let _ = self.rebuild();
+    }
+
+    /// Toggle name-order vs. recency-order (`s`) and re-list. Preserves the
+    /// highlighted entry across the reorder when it survives.
+    pub fn toggle_sort_by_modified(&mut self) {
+        self.sort_by_modified = !self.sort_by_modified;
         let _ = self.rebuild();
     }
 
@@ -5658,6 +5692,43 @@ mod tests {
         let names: Vec<&str> = b.entries.iter().map(|e| e.display.as_str()).collect();
         assert!(!names.contains(&"blob"), "blob still shown, got {names:?}");
         assert!(!b.show_all);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sort_by_modified_orders_newest_first() {
+        use std::time::{Duration, SystemTime};
+        let dir = fresh_temp("browser-sort-mtime");
+        // Stamp distinct mtimes so recency order is deterministic regardless of
+        // the order the filesystem reports them in.
+        for (name, age_secs) in [("old.md", 3000u64), ("mid.md", 1200), ("new.md", 60)] {
+            let p = dir.join(name);
+            std::fs::write(&p, "x").unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+            f.set_modified(SystemTime::now() - Duration::from_secs(age_secs))
+                .unwrap();
+        }
+        let md_names = |b: &Browser| -> Vec<String> {
+            b.entries
+                .iter()
+                .filter(|e| e.kind == BrowserEntryKind::Markdown)
+                .map(|e| e.display.clone())
+                .collect()
+        };
+
+        let mut b = Browser::scan(&dir).unwrap();
+        // Default: case-insensitive name order.
+        assert_eq!(md_names(&b), vec!["mid.md", "new.md", "old.md"]);
+
+        // Toggle → newest first.
+        b.toggle_sort_by_modified();
+        assert!(b.sort_by_modified);
+        assert_eq!(md_names(&b), vec!["new.md", "mid.md", "old.md"]);
+
+        // Toggle back → name order again.
+        b.toggle_sort_by_modified();
+        assert_eq!(md_names(&b), vec!["mid.md", "new.md", "old.md"]);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -6372,12 +6443,14 @@ index abc..def 100644\n\
                 path: dir.join("a.md"),
                 display: "a.md".to_string(),
                 kind: BrowserEntryKind::Markdown,
+                modified: None,
             }],
             selected: 0,
             scroll: 0,
             last_meta: None,
             find: None,
             show_all: false,
+            sort_by_modified: false,
         };
         // Re-scan (rebuild discovers `..` if the dir has a parent — fine, just
         // assert the fallback never out-of-bounds).
@@ -6396,6 +6469,7 @@ index abc..def 100644\n\
                     path: PathBuf::from("/tmp").join(n),
                     display: n.to_string(),
                     kind: BrowserEntryKind::Markdown,
+                    modified: None,
                 })
                 .collect(),
             selected: 0,
@@ -6403,6 +6477,7 @@ index abc..def 100644\n\
             last_meta: None,
             find: None,
             show_all: false,
+            sort_by_modified: false,
         }
     }
 
