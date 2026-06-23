@@ -873,6 +873,24 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
     }
 
+    // Ctrl-↑/↓ moves the whole current source line up or down, swapping it
+    // with its neighbour (e.g. to reorder bullet-list items). Operates on
+    // logical lines, independent of visual wrapping. Handled before word
+    // motion below so it isn't shadowed by the Ctrl-arrow branch.
+    if ctrl {
+        match key.code {
+            KeyCode::Up => {
+                app.edit_move_line(-1);
+                return Ok(());
+            }
+            KeyCode::Down => {
+                app.edit_move_line(1);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     // Word-level movement and deletion (Alt-arrow / Alt-Backspace / Alt-
     // Delete on macOS, Ctrl-arrow / Ctrl-Backspace on Linux/Windows).
     if alt || ctrl {

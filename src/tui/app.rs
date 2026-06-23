@@ -3007,6 +3007,61 @@ impl App {
         }
     }
 
+    /// Move the current source line up (`delta < 0`) or down (`delta > 0`),
+    /// swapping it with its neighbour. Operates on logical lines (the text
+    /// between `\n`s, as if the pane were infinitely wide), so the whole line
+    /// travels as one unit regardless of how it visually wraps — handy for
+    /// reordering list items. The cursor rides along with the moved line,
+    /// keeping its byte column. No-op at the buffer edge (the first line can't
+    /// go up, the last can't go down) or outside edit mode.
+    pub fn edit_move_line(&mut self, delta: i32) {
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        let Some(e) = r.edit.as_ref() else { return };
+        let len = r.raw.len();
+        let c = floor_char_boundary(&r.raw, e.cursor.min(len));
+        // Current line: [ls, le), excluding its trailing newline (if any).
+        let ls = r.raw[..c].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let le = r.raw[c..].find('\n').map(|i| c + i).unwrap_or(len);
+
+        let (region_start, region_end, new_region, new_cursor) = if delta < 0 {
+            // Move up: swap with the previous line.
+            if ls == 0 {
+                return; // already the first line
+            }
+            let pe = ls - 1; // the '\n' that ends the previous line
+            let ps = r.raw[..pe].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let prev = &r.raw[ps..pe];
+            let cur = &r.raw[ls..le];
+            (ps, le, format!("{cur}\n{prev}"), ps + (c - ls))
+        } else {
+            // Move down: swap with the next line.
+            if le == len {
+                return; // already the last line
+            }
+            let ns = le + 1;
+            let ne = r.raw[ns..].find('\n').map(|i| ns + i).unwrap_or(len);
+            let cur = &r.raw[ls..le];
+            let next = &r.raw[ns..ne];
+            (
+                ls,
+                ne,
+                format!("{next}\n{cur}"),
+                ls + next.len() + 1 + (c - ls),
+            )
+        };
+
+        push_undo(r);
+        r.raw.replace_range(region_start..region_end, &new_region);
+        let e = r.edit.as_mut().unwrap();
+        e.cursor = new_cursor;
+        e.dirty = true;
+        e.command = None;
+        e.selection = None;
+        r.rendered = None;
+    }
+
     /// Delete `n` chars to the left of the cursor (Backspace). No-op if
     /// the cursor is at byte 0.
     pub fn edit_backspace(&mut self) {
@@ -6072,6 +6127,57 @@ mod tests {
             View::Reader(r) => assert_eq!(r.raw, "Xabc\n"),
             _ => panic!(),
         };
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn move_line_swaps_with_neighbour_and_keeps_cursor() {
+        let dir = fresh_temp("edit-move-line");
+        let path = dir.join("m.md");
+        std::fs::write(&path, "alpha\nbravo\ncharlie\n").unwrap();
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        app.enter_edit();
+
+        // Put the cursor inside "bravo" (col 2 → the 'a'), then move it down.
+        let set_cursor = |app: &mut App, pos: usize| match &mut app.view {
+            View::Reader(r) => r.edit.as_mut().unwrap().cursor = pos,
+            _ => panic!(),
+        };
+        set_cursor(&mut app, 8); // "alpha\n" = 6, "br" = 2 → byte 8
+        app.edit_move_line(1);
+        match &app.view {
+            View::Reader(r) => {
+                assert_eq!(r.raw, "alpha\ncharlie\nbravo\n");
+                // Cursor rode along: still on the 'a' of "bravo".
+                assert_eq!(&r.raw[r.edit.as_ref().unwrap().cursor..][..1], "a");
+            }
+            _ => panic!(),
+        }
+
+        // Move it back up to the original order.
+        app.edit_move_line(-1);
+        match &app.view {
+            View::Reader(r) => assert_eq!(r.raw, "alpha\nbravo\ncharlie\n"),
+            _ => panic!(),
+        }
+
+        // Edge: first line can't go up, last line can't go down (no-op).
+        set_cursor(&mut app, 0);
+        app.edit_move_line(-1);
+        match &app.view {
+            View::Reader(r) => assert_eq!(r.raw, "alpha\nbravo\ncharlie\n"),
+            _ => panic!(),
+        }
+        // Last logical line is "charlie" (the trailing "" after the final \n
+        // is the real last line, so charlie moving down swaps with it).
+        set_cursor(&mut app, 14); // inside "charlie"
+        app.edit_move_line(1);
+        match &app.view {
+            View::Reader(r) => assert_eq!(r.raw, "alpha\nbravo\n\ncharlie"),
+            _ => panic!(),
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
