@@ -783,6 +783,13 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
     // scrolling doesn't touch the cursor, so without this gate every frame
     // would snap the scroll back and the wheel would feel inert.
     let visible_h_raw = raw_area.height as usize;
+    // The raw pane scrolls over a padded page: `EDIT_PAD` blank rows above the
+    // first line and below the last, so the document edges get breathing room
+    // and the top gap matches the preview's leading blank. Cursor row, scroll
+    // offset and clamps all live in this padded space.
+    let pad = app::EDIT_PAD;
+    let cur_padded = cur_row_idx + pad;
+    let span = app::raw_scroll_span(raw_rows.len());
     let mut raw_scroll = r.scroll as usize;
     let cursor_changed = r
         .edit
@@ -790,25 +797,32 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
         .map(|e| e.last_drawn_cursor != Some(cursor))
         .unwrap_or(false);
     if cursor_changed {
-        if cur_row_idx < raw_scroll {
-            raw_scroll = cur_row_idx;
+        // Keep `pad` rows of context above and below the cursor (scrolloff):
+        // the top of the doc shows a gap, and typing on the last line still
+        // leaves a gap below rather than butting against the pane edge.
+        if cur_padded < raw_scroll + pad {
+            raw_scroll = cur_padded.saturating_sub(pad);
         }
-        if visible_h_raw > 0 && cur_row_idx >= raw_scroll + visible_h_raw {
-            raw_scroll = cur_row_idx + 1 - visible_h_raw;
+        if visible_h_raw > 0 && cur_padded + pad >= raw_scroll + visible_h_raw {
+            raw_scroll = cur_padded + pad + 1 - visible_h_raw;
         }
     }
-    let max_raw_scroll = raw_rows.len().saturating_sub(visible_h_raw);
+    let max_raw_scroll = span.saturating_sub(visible_h_raw);
     if raw_scroll > max_raw_scroll {
         raw_scroll = max_raw_scroll;
     }
 
     let mut raw_lines: Vec<Line> = Vec::with_capacity(visible_h_raw);
     for i in 0..visible_h_raw {
-        let idx = raw_scroll + i;
-        if idx >= raw_rows.len() {
-            break;
-        }
-        let row = &raw_rows[idx];
+        // Map the viewport row to a real wrapped row; top/bottom pad rows (and
+        // anything past the last line) render blank as page breathing room.
+        let row = (raw_scroll + i)
+            .checked_sub(pad)
+            .and_then(|idx| raw_rows.get(idx));
+        let Some(row) = row else {
+            raw_lines.push(Line::default());
+            continue;
+        };
         // Kind is computed per source line so wrapped continuation rows
         // keep the same styling as their head row.
         let style = match row.kind {
@@ -833,8 +847,11 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
         let (sel_start, sel_end) = sel.range();
         let buf = f.buffer_mut();
         for i in 0..visible_h_raw {
-            let Some(row) = raw_rows.get(raw_scroll + i) else {
-                break;
+            let Some(row) = (raw_scroll + i)
+                .checked_sub(pad)
+                .and_then(|idx| raw_rows.get(idx))
+            else {
+                continue;
             };
             let from = row.source_range.start.max(sel_start);
             let to = row.source_range.end.min(sel_end);
@@ -854,8 +871,8 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    // Cursor: reverse-video cell at (cur_col, cur_row_idx - raw_scroll).
-    let cy_view = cur_row_idx as i32 - raw_scroll as i32;
+    // Cursor: reverse-video cell at (cur_col, cur_padded - raw_scroll).
+    let cy_view = cur_padded as i32 - raw_scroll as i32;
     if cy_view >= 0 && (cy_view as u16) < raw_area.height {
         let row = raw_area.y + cy_view as u16;
         let col = raw_area.x + cur_col;

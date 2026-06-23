@@ -4779,6 +4779,20 @@ pub struct RawRow {
     pub kind: RawRowKind,
 }
 
+/// Rows of blank breathing room added above the first and below the last
+/// line of the raw editor pane. It lives in the scrollable page (not as a
+/// fixed viewport overlay) and doubles as a scroll margin (scrolloff), so the
+/// document top shows a gap, the bottom never feels like writing into a wall,
+/// and the top gap lines up with the preview pane's leading blank.
+pub const EDIT_PAD: usize = 1;
+
+/// Total scrollable height of the raw pane for `n` wrapped rows, counting the
+/// top and bottom pad. The raw-pane scroll offset (`Reader::scroll` in split
+/// edit) is an index into this padded space.
+pub fn raw_scroll_span(n: usize) -> usize {
+    n + 2 * EDIT_PAD
+}
+
 /// Wrap `raw` to `width` columns, producing one `RawRow` per display row.
 /// Splits on `\n` first (preserving the implicit empty row at the end of
 /// the buffer so the cursor can land just after a trailing newline), then

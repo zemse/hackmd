@@ -2080,7 +2080,10 @@ fn split_drag_raw(app: &mut App, col: u16, row: u16) {
     if r.edit.as_ref().and_then(|e| e.selection.as_ref()).is_none() {
         return;
     }
-    let local_row = (row - area.y) as usize + r.scroll as usize;
+    // Scroll offset is in padded page space; subtract the top pad to land on
+    // the real wrapped row (a click in the top pad clamps to the first row).
+    let local_row =
+        ((row - area.y) as usize + r.scroll as usize).saturating_sub(crate::tui::app::EDIT_PAD);
     let local_col = (col - area.x) as usize;
     let rows = crate::tui::app::render_raw_pane(&r.raw, raw_w);
     let byte = crate::tui::app::raw_click_to_source(&rows, &r.raw, local_row, local_col);
@@ -2107,11 +2110,17 @@ fn split_scroll_raw(app: &mut App, delta: i32) {
         return;
     };
     let rows = crate::tui::app::render_raw_pane(&r.raw, raw_w);
-    let max = rows.len().saturating_sub(raw_h.max(1)) as i32;
+    let span = crate::tui::app::raw_scroll_span(rows.len());
+    let max = span.saturating_sub(raw_h.max(1)) as i32;
     let new = (r.scroll as i32 + delta).clamp(0, max) as u16;
     r.scroll = new;
-    // Sync preview: anchor on the source byte at top of raw pane.
-    if let Some(top_row) = rows.get(new as usize) {
+    // Sync preview: anchor on the source byte at top of raw pane. The top row
+    // index is in padded space, so subtract the pad to find the real row (the
+    // top-pad rows have no source to anchor on).
+    if let Some(top_row) = (new as usize)
+        .checked_sub(crate::tui::app::EDIT_PAD)
+        .and_then(|i| rows.get(i))
+    {
         let src = top_row.source_range.start;
         if let Some(rendered) = r.rendered.as_ref() {
             let prev_row = crate::tui::app::preview_row_for_source(rendered, src);
@@ -2139,8 +2148,10 @@ fn split_scroll_preview(app: &mut App, delta: i32) {
     let src = crate::tui::app::source_for_preview_row(rendered, new as usize);
     let rows = crate::tui::app::render_raw_pane(&r.raw, raw_w);
     let raw_row = crate::tui::app::raw_row_for_cursor(&rows, src);
-    let max_raw = rows.len().saturating_sub(raw_h.max(1)) as u16;
-    r.scroll = (raw_row as u16).min(max_raw);
+    let span = crate::tui::app::raw_scroll_span(rows.len());
+    let max_raw = span.saturating_sub(raw_h.max(1)) as u16;
+    // Raw scroll lives in padded space; offset the row by the top pad.
+    r.scroll = (raw_row as u16 + crate::tui::app::EDIT_PAD as u16).min(max_raw);
 }
 
 /// Set the source cursor from a click in the raw pane.
@@ -2150,11 +2161,14 @@ fn split_click_raw(app: &mut App, col: u16, row: u16) {
     if !point_in(area, col, row) {
         return;
     }
-    let local_row = (row - area.y) as usize
+    // Scroll offset is in padded page space; subtract the top pad to land on
+    // the real wrapped row (a click in the top pad clamps to the first row).
+    let local_row = ((row - area.y) as usize
         + match &app.view {
             View::Reader(r) => r.scroll as usize,
             _ => 0,
-        };
+        })
+    .saturating_sub(crate::tui::app::EDIT_PAD);
     let local_col = (col - area.x) as usize;
     let View::Reader(r) = &mut app.view else {
         return;
