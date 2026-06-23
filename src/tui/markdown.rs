@@ -42,6 +42,26 @@ pub struct Rendered {
     /// by edit mode to convert mouse clicks and Up/Down keys into source
     /// byte offsets in display-row space (which respects soft-wrap).
     pub row_source: Vec<Option<std::ops::Range<usize>>>,
+    /// Per-display-line source spans: each maps a run of display columns to
+    /// the source byte range that produced it. Lets a drag-selection in the
+    /// formatted view copy the underlying *markdown* (URLs, `#` headings,
+    /// `**bold**` delimiters) instead of the rendered glyphs. Only the prose
+    /// paths (paragraphs, headings, lists) populate these; code/tables stay
+    /// empty and fall back to copying rendered text.
+    pub src_spans: Vec<Vec<SrcSpan>>,
+}
+
+/// One source-mapped run of display columns on a single display line.
+/// `[col_start, col_end)` is the display-column span; `src` is the source
+/// byte range it came from. When `atomic` is set the run is one indivisible
+/// inline element (link/bold/code/image): selecting any of its cells should
+/// pull the *whole* `src` range so the markdown delimiters stay balanced.
+#[derive(Clone, Debug)]
+pub struct SrcSpan {
+    pub col_start: u16,
+    pub col_end: u16,
+    pub src: std::ops::Range<usize>,
+    pub atomic: bool,
 }
 
 /// One heading in the document outline.
@@ -133,6 +153,12 @@ struct Run {
     /// this to find the smallest enclosing element to swap for raw source.
     /// `None` for plain paragraph/heading text not wrapped in inline syntax.
     inline_range: Option<std::ops::Range<usize>>,
+    /// Source byte range of this run's *plain text*, when it maps 1:1 to a
+    /// slice of the source (ordinary paragraph/heading text and bare URLs).
+    /// Used to copy the underlying markdown for a drag-selection at character
+    /// granularity. `None` for synthetic runs (soft breaks, list markers,
+    /// footnote glyphs) that have no clean source slice.
+    text_range: Option<std::ops::Range<usize>>,
     /// When `Some(byte_offset)`, the cursor sits at this byte position within
     /// `text`. Set by the edit-mode substitution pass on the synthetic raw
     /// run; the layout pass watches for it and records the resulting display
@@ -328,6 +354,7 @@ impl Builder {
             checkbox: None,
             image: None,
             inline_range: None,
+            text_range: None,
             cursor_at: None,
         }]
     }
@@ -357,6 +384,7 @@ impl Builder {
                 checkbox: None,
                 image: None,
                 inline_range: None,
+                text_range: None,
                 cursor_at: None,
             },
             Run {
@@ -366,6 +394,7 @@ impl Builder {
                 checkbox: None,
                 image: None,
                 inline_range: None,
+                text_range: None,
                 cursor_at: None,
             },
         ];
@@ -376,6 +405,7 @@ impl Builder {
             checkbox: None,
             image: None,
             inline_range: None,
+            text_range: None,
             cursor_at: None,
         }];
         (prefix, hanging)
@@ -416,7 +446,7 @@ impl Builder {
         );
     }
 
-    fn push_text(&mut self, text: &str) {
+    fn push_text(&mut self, text: &str, range: std::ops::Range<usize>) {
         if self.in_code_block {
             self.code_content.push_str(text);
             return;
@@ -436,6 +466,7 @@ impl Builder {
                 checkbox: None,
                 image: None,
                 inline_range,
+                text_range: Some(range.clone()),
                 cursor_at: None,
             });
             return;
@@ -444,17 +475,22 @@ impl Builder {
         // pulldown-cmark, so split them into their own clickable runs.
         for seg in autolink_segments(text) {
             match seg {
-                Segment::Text(t) => self.cur_runs.push(Run {
-                    text: t.to_string(),
-                    style,
-                    link: None,
-                    checkbox: None,
-                    image: None,
-                    inline_range: inline_range.clone(),
-                    cursor_at: None,
-                }),
+                Segment::Text(t) => {
+                    let tr = subslice_range(text, t, &range);
+                    self.cur_runs.push(Run {
+                        text: t.to_string(),
+                        style,
+                        link: None,
+                        checkbox: None,
+                        image: None,
+                        inline_range: inline_range.clone(),
+                        text_range: tr,
+                        cursor_at: None,
+                    });
+                }
                 Segment::Url { display, href } => {
                     let idx = self.links.len();
+                    let tr = subslice_range(text, display, &range);
                     self.links.push(PendingLink {
                         target: LinkTarget::Url(href),
                     });
@@ -468,6 +504,7 @@ impl Builder {
                         checkbox: None,
                         image: None,
                         inline_range: inline_range.clone(),
+                        text_range: tr,
                         cursor_at: None,
                     });
                 }
@@ -479,7 +516,7 @@ impl Builder {
         match ev {
             Event::Start(tag) => self.start_tag(tag, range.clone()),
             Event::End(tag) => self.end_tag(tag, range.clone()),
-            Event::Text(s) => self.push_text(&s),
+            Event::Text(s) => self.push_text(&s, range.clone()),
             Event::Code(s) => {
                 let style = self
                     .cur_style()
@@ -495,6 +532,7 @@ impl Builder {
                     checkbox: None,
                     image: None,
                     inline_range: Some(range.clone()),
+                    text_range: None,
                     cursor_at: None,
                 });
                 if self.in_heading.is_some() {
@@ -511,6 +549,7 @@ impl Builder {
                     checkbox: None,
                     image: None,
                     inline_range: None,
+                    text_range: None,
                     cursor_at: None,
                 });
             }
@@ -522,6 +561,7 @@ impl Builder {
                     checkbox: None,
                     image: None,
                     inline_range: None,
+                    text_range: None,
                     cursor_at: None,
                 });
             }
@@ -533,6 +573,7 @@ impl Builder {
                     checkbox: None,
                     image: None,
                     inline_range: None,
+                    text_range: None,
                     cursor_at: None,
                 });
             }
@@ -554,6 +595,7 @@ impl Builder {
                     checkbox: Some(cb_idx),
                     image: None,
                     inline_range: None,
+                    text_range: None,
                     cursor_at: None,
                 });
                 self.cur_runs.push(Run {
@@ -563,6 +605,7 @@ impl Builder {
                     checkbox: None,
                     image: None,
                     inline_range: None,
+                    text_range: None,
                     cursor_at: None,
                 });
             }
@@ -652,7 +695,11 @@ impl Builder {
                     link: None,
                     checkbox: None,
                     image: Some(img_idx),
-                    inline_range: None,
+                    // The whole `![alt](url)` is one atomic element so a
+                    // selection over the placeholder copies the raw image
+                    // markdown rather than the `[image: …]` label.
+                    inline_range: Some(range.clone()),
+                    text_range: None,
                     cursor_at: None,
                 });
             }
@@ -682,6 +729,7 @@ impl Builder {
                     checkbox: None,
                     image: None,
                     inline_range: None,
+                    text_range: None,
                     cursor_at: None,
                 });
             }
@@ -745,6 +793,7 @@ impl Builder {
                                 checkbox: None,
                                 image: None,
                                 inline_range: None,
+                                text_range: None,
                                 cursor_at: None,
                             })
                             .collect()
@@ -995,6 +1044,7 @@ fn substitute_inline_at_cursor(
         checkbox: None,
         image: None,
         inline_range: Some(elem),
+        text_range: None,
         cursor_at: Some(cursor_at),
     };
     runs.splice(first..=last, std::iter::once(synthetic));
@@ -1058,6 +1108,7 @@ fn make_raw_block(
                     checkbox: None,
                     image: None,
                     inline_range: None,
+                    text_range: None,
                     cursor_at,
                 }]);
             }
@@ -1093,6 +1144,31 @@ enum Segment<'a> {
 /// `https://`, and `www.` starts at a non-alphanumeric boundary, mirroring the
 /// common subset of GFM autolinking. Trailing sentence punctuation and
 /// unbalanced closing parens are excluded from the link.
+/// Byte offset of `child` within `parent`, where `child` must be a subslice
+/// of `parent` (i.e. produced by slicing it). `None` if it isn't.
+fn subslice_offset(parent: &str, child: &str) -> Option<usize> {
+    let p = parent.as_ptr() as usize;
+    let c = child.as_ptr() as usize;
+    if c >= p && c + child.len() <= p + parent.len() {
+        Some(c - p)
+    } else {
+        None
+    }
+}
+
+/// Map a subslice `child` of `parent` back to the source byte range it
+/// occupies, given `parent`'s own source range. Returns `None` when `child`
+/// isn't a subslice of `parent`.
+fn subslice_range(
+    parent: &str,
+    child: &str,
+    parent_range: &std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let off = subslice_offset(parent, child)?;
+    let start = parent_range.start + off;
+    Some(start..start + child.len())
+}
+
 fn autolink_segments(text: &str) -> Vec<Segment<'_>> {
     let mut segs = Vec::new();
     let mut plain_start = 0;
@@ -1229,6 +1305,9 @@ fn layout(
     let mut block_infos: Vec<BlockInfo> = Vec::new();
     let mut headings: Vec<HeadingInfo> = Vec::new();
     let mut cursor_xy: Option<(u16, u16)> = None;
+    // Flat (line, span) source mapping, bucketed into `src_spans` once every
+    // line index is known. Populated by the prose paths via `push_chunk`.
+    let mut src_acc: Vec<(usize, SrcSpan)> = Vec::new();
 
     // For each link index, track the open span being built across runs.
     let mut open_spans: Vec<Option<OpenSpan>> = (0..links.len()).map(|_| None).collect();
@@ -1282,6 +1361,7 @@ fn layout(
                     &checkboxes,
                     &mut image_lines,
                     &mut cursor_xy,
+                    &mut src_acc,
                 );
             }
             Block::Paragraph {
@@ -1302,6 +1382,7 @@ fn layout(
                     &checkboxes,
                     &mut image_lines,
                     &mut cursor_xy,
+                    &mut src_acc,
                 );
             }
             Block::Table {
@@ -1417,6 +1498,13 @@ fn layout(
         .zip(image_lines.iter())
         .filter_map(|(source, line)| line.map(|l| ImageRef { line: l, source }))
         .collect();
+    // Bucket the flat (line, span) source map into per-line lists.
+    let mut src_spans: Vec<Vec<SrcSpan>> = vec![Vec::new(); out_lines.len()];
+    for (line, span) in src_acc {
+        if let Some(bucket) = src_spans.get_mut(line) {
+            bucket.push(span);
+        }
+    }
     Rendered {
         lines: out_lines,
         link_map,
@@ -1430,6 +1518,7 @@ fn layout(
         headings,
         cursor_xy,
         row_source,
+        src_spans,
     }
 }
 
@@ -1457,6 +1546,7 @@ fn wrap_runs(
     checkboxes: &[PendingCheckbox],
     image_lines: &mut [Option<usize>],
     cursor_xy: &mut Option<(u16, u16)>,
+    src_acc: &mut Vec<(usize, SrcSpan)>,
 ) {
     let prefix_width: usize = prefix.iter().map(|r| r.text.width()).sum();
     let hanging_width: usize = hanging.iter().map(|r| r.text.width()).sum();
@@ -1589,6 +1679,7 @@ fn wrap_runs(
                     &mut current_link,
                     links,
                     &mut active_inner_width,
+                    src_acc,
                 );
                 // Force break.
                 break_line(
@@ -1622,6 +1713,7 @@ fn wrap_runs(
                     &mut current_link,
                     links,
                     &mut active_inner_width,
+                    src_acc,
                 );
                 text = "";
             }
@@ -1687,6 +1779,7 @@ fn emit_segment(
     current_link: &mut Option<usize>,
     links: &[PendingLink],
     active_inner_width: &mut usize,
+    src_acc: &mut Vec<(usize, SrcSpan)>,
 ) {
     // Word-wrap the text on whitespace boundaries.
     let mut remaining = text;
@@ -1734,6 +1827,8 @@ fn emit_segment(
                 word,
                 current_link,
                 open_spans,
+                out_lines.len(),
+                src_acc,
             );
             *at_line_start = false;
             remaining = rest;
@@ -1785,6 +1880,8 @@ fn emit_segment(
                     head,
                     current_link,
                     open_spans,
+                    out_lines.len(),
+                    src_acc,
                 );
                 *at_line_start = false;
                 if !tail.is_empty() {
@@ -1833,12 +1930,15 @@ fn emit_segment(
             word,
             current_link,
             open_spans,
+            out_lines.len(),
+            src_acc,
         );
         *at_line_start = false;
         remaining = rest;
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_chunk(
     cur_spans: &mut Vec<Span<'static>>,
     cur_col: &mut usize,
@@ -1847,10 +1947,13 @@ fn push_chunk(
     chunk: &str,
     current_link: &Option<usize>,
     open_spans: &mut [Option<OpenSpan>],
+    line_idx: usize,
+    src_acc: &mut Vec<(usize, SrcSpan)>,
 ) {
     if chunk.is_empty() {
         return;
     }
+    let col_start = *cur_col;
     let w = chunk.width();
     cur_spans.push(Span::styled(chunk.to_string(), run.style));
     *cur_col += w;
@@ -1859,6 +1962,28 @@ fn push_chunk(
         if let Some(open) = &mut open_spans[*li] {
             open.col_cur = *cur_col;
         }
+    }
+    // Record where this chunk came from in the source so a drag-selection
+    // can recover the underlying markdown. An inline element's range covers
+    // the whole `**…**` / `[…](…)`; plain text maps the chunk's own bytes.
+    let src = if let Some(ir) = &run.inline_range {
+        Some((ir.clone(), true))
+    } else {
+        run.text_range.as_ref().and_then(|tr| {
+            subslice_offset(&run.text, chunk)
+                .map(|off| (tr.start + off..tr.start + off + chunk.len(), false))
+        })
+    };
+    if let Some((src, atomic)) = src {
+        src_acc.push((
+            line_idx,
+            SrcSpan {
+                col_start: col_start as u16,
+                col_end: *cur_col as u16,
+                src,
+                atomic,
+            },
+        ));
     }
 }
 
@@ -2244,6 +2369,7 @@ fn slice_runs(runs: &[Run], offsets: &[usize], start: usize, end: usize) -> Vec<
             checkbox: None,
             image: None,
             inline_range: None,
+            text_range: None,
             cursor_at: None,
         });
     }
@@ -2298,6 +2424,7 @@ fn truncate_runs(runs: &[Run], max: usize) -> Vec<Run> {
                     checkbox: run.checkbox,
                     image: run.image,
                     inline_range: run.inline_range.clone(),
+                    text_range: None,
                     cursor_at: None,
                 });
             }
@@ -2311,6 +2438,7 @@ fn truncate_runs(runs: &[Run], max: usize) -> Vec<Run> {
         checkbox: None,
         image: None,
         inline_range: None,
+        text_range: None,
         cursor_at: None,
     });
     out

@@ -2156,10 +2156,200 @@ fn body_pos(app: &App, col: u16, row: u16) -> Option<(usize, u16)> {
     Some((scroll + local_row, local_col))
 }
 
+/// Text a drag-selection should copy. Prefers the underlying *markdown*
+/// source (so URLs, `#` headings and `**bold**` delimiters come along and
+/// the result pastes back as valid markdown), falling back to the rendered
+/// glyphs when the selection covers content with no source mapping (code
+/// blocks, tables, the JSONL view).
+fn extract_selection_text(app: &App, sel: &crate::tui::app::Selection) -> Option<String> {
+    match extract_selection_source(app, sel) {
+        Some(s) if !s.is_empty() => Some(s),
+        _ => extract_selection_rendered(app, sel),
+    }
+}
+
+/// Map a drag-selection back to the markdown source it was rendered from.
+/// Collects the source byte range each selected display cell came from, takes
+/// the min/max so the in-between markup (delimiters, links, line breaks) is
+/// carried verbatim, then extends the start over any leading block marker
+/// (`#`, `-`, `>`) so headings and list items copy formatted. Returns `None`
+/// when nothing in the selection is source-mapped, so the caller can fall
+/// back to copying rendered text.
+fn extract_selection_source(app: &App, sel: &crate::tui::app::Selection) -> Option<String> {
+    let View::Reader(r) = &app.view else {
+        return None;
+    };
+    // The JSONL view renders a transformed source; its offsets don't line up
+    // with `render_source`, so don't try to reconstruct markdown there.
+    if r.is_jsonl_view() {
+        return None;
+    }
+    let rd = r.rendered.as_ref()?;
+    let source = r.render_source();
+    let source = source.as_ref();
+    let ((s_line, s_col), (e_line, e_col)) = sel.normalized();
+    let last = rd.lines.len().saturating_sub(1);
+    if s_line > last {
+        return None;
+    }
+    let mut lo = usize::MAX;
+    let mut hi = 0usize;
+    for li in s_line..=e_line.min(last) {
+        let from = if li == s_line { s_col as usize } else { 0 };
+        let to = if li == e_line {
+            e_col as usize
+        } else {
+            usize::MAX
+        };
+        let Some(spans) = rd.src_spans.get(li) else {
+            continue;
+        };
+        for sp in spans {
+            let cs = sp.col_start as usize;
+            let ce = sp.col_end as usize;
+            let ov_lo = cs.max(from);
+            let ov_hi = ce.min(to);
+            if ov_lo >= ov_hi {
+                continue;
+            }
+            if sp.atomic {
+                // Indivisible inline element: pull the whole `**…**`/`[…](…)`
+                // so its delimiters stay balanced even on a partial selection.
+                lo = lo.min(sp.src.start);
+                hi = hi.max(sp.src.end);
+            } else if let Some(slice) = source.get(sp.src.clone()) {
+                let b0 = sp.src.start + col_to_byte(slice, ov_lo - cs);
+                let b1 = sp.src.start + col_to_byte(slice, ov_hi - cs);
+                lo = lo.min(b0);
+                hi = hi.max(b1);
+            }
+        }
+    }
+    if lo >= hi {
+        return None;
+    }
+    // Pull in a leading block marker when the selection starts at the first
+    // content column of its source line, so a heading copies as `## Title`
+    // and a list item keeps its bullet.
+    let line_start = source[..lo].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let markup = leading_markup_len(&source[line_start..]);
+    if lo <= line_start + markup {
+        lo = line_start;
+    }
+    // Smart-punctuation substitutions can leave an offset mid-character;
+    // widen to the nearest char boundaries so the slice is always valid.
+    while lo > 0 && !source.is_char_boundary(lo) {
+        lo -= 1;
+    }
+    while hi < source.len() && !source.is_char_boundary(hi) {
+        hi += 1;
+    }
+    Some(source[lo..hi].to_string())
+}
+
+/// Byte offset within `slice` at which the cumulative display width reaches
+/// `target_col`. Used to map a display column inside a plain-text span to a
+/// source byte offset.
+fn col_to_byte(slice: &str, target_col: usize) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let mut w = 0usize;
+    for (i, ch) in slice.char_indices() {
+        if w >= target_col {
+            return i;
+        }
+        w += ch.width().unwrap_or(0);
+    }
+    slice.len()
+}
+
+/// Byte length of the leading block markup (`#` heading, `-`/`*`/`+`/ordered
+/// list bullet incl. a task `[ ]`, `>` blockquote, and their trailing space)
+/// at the start of `line`. Returns 0 for plain paragraph text so only real
+/// markers trigger the start-of-selection extension.
+fn leading_markup_len(line: &str) -> usize {
+    let leading_ws = |s: &str, mut i: usize| {
+        let b = s.as_bytes();
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+            i += 1;
+        }
+        i
+    };
+    let mut i = leading_ws(line, 0);
+    let mut found = false;
+    // Blockquote markers, possibly nested (`> > `).
+    while line.as_bytes().get(i) == Some(&b'>') {
+        found = true;
+        i += 1;
+        i = leading_ws(line, i);
+    }
+    let rest = &line[i..];
+    if let Some(h) = heading_marker_len(rest) {
+        return i + h;
+    }
+    if let Some(l) = list_marker_len(rest) {
+        return i + l;
+    }
+    if found { i } else { 0 }
+}
+
+/// Length of a leading `#`…`###### ` heading marker (incl. trailing spaces),
+/// or `None` if `s` doesn't start with one.
+fn heading_marker_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut n = 0;
+    while n < b.len() && b[n] == b'#' {
+        n += 1;
+    }
+    if n == 0 || n > 6 || b.get(n) != Some(&b' ') {
+        return None;
+    }
+    let mut i = n;
+    while i < b.len() && b[i] == b' ' {
+        i += 1;
+    }
+    Some(i)
+}
+
+/// Length of a leading list marker (`- `, `* `, `+ `, `1. `, `1) `, with an
+/// optional `[ ]`/`[x]` task box), incl. trailing spaces, or `None`.
+fn list_marker_len(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    let mut i;
+    if matches!(b.first(), Some(b'-' | b'*' | b'+')) {
+        i = 1;
+    } else {
+        let mut n = 0;
+        while n < b.len() && b[n].is_ascii_digit() {
+            n += 1;
+        }
+        if n == 0 || !matches!(b.get(n), Some(b'.' | b')')) {
+            return None;
+        }
+        i = n + 1;
+    }
+    if b.get(i) != Some(&b' ') {
+        return None;
+    }
+    while i < b.len() && b[i] == b' ' {
+        i += 1;
+    }
+    // Optional task-list checkbox.
+    if b.get(i) == Some(&b'[')
+        && b.get(i + 2) == Some(&b']')
+        && matches!(b.get(i + 1), Some(b' ' | b'x' | b'X'))
+    {
+        i += 3;
+        while i < b.len() && b[i] == b' ' {
+            i += 1;
+        }
+    }
+    Some(i)
+}
+
 /// Extract the text covered by a selection, walking `Rendered::lines` and
 /// slicing each line by display columns. Inserts `\n` between lines. Returns
 /// `None` if the reader hasn't been rendered yet.
-fn extract_selection_text(app: &App, sel: &crate::tui::app::Selection) -> Option<String> {
+fn extract_selection_rendered(app: &App, sel: &crate::tui::app::Selection) -> Option<String> {
     use unicode_width::UnicodeWidthChar;
     let View::Reader(r) = &app.view else {
         return None;
@@ -3624,4 +3814,110 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
         activate_browser_entry(app, entry)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod copy_tests {
+    use super::{extract_selection_text, leading_markup_len};
+    use crate::tui::app::{App, Options, Selection, Source, View};
+    use crate::tui::theme::Theme;
+
+    fn render_app(tag: &str, body: &str) -> App {
+        let mut p = std::env::temp_dir();
+        p.push(format!("md-tui-copy-{}-{}.md", tag, std::process::id()));
+        std::fs::write(&p, body).unwrap();
+        let opts = Options {
+            width: 80,
+            line_numbers: false,
+            theme: Theme::dark(),
+        };
+        let mut app = App::new(Source::File(p), opts).unwrap();
+        app.ensure_rendered(80);
+        app.viewport = ratatui::layout::Rect::new(0, 0, 80, 40);
+        app
+    }
+
+    fn line_containing(app: &App, needle: &str) -> usize {
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader")
+        };
+        let rd = r.rendered.as_ref().unwrap();
+        rd.lines
+            .iter()
+            .position(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no rendered line contains {needle:?}"))
+    }
+
+    fn sel(line: usize, from: u16, to: u16) -> Selection {
+        Selection {
+            anchor_line: line,
+            anchor_col: from,
+            focus_line: line,
+            focus_col: to,
+            dragged: true,
+        }
+    }
+
+    #[test]
+    fn copies_heading_with_hashes() {
+        let app = render_app("heading", "# Title Here\n\nbody text\n");
+        let li = line_containing(&app, "Title Here");
+        let got = extract_selection_text(&app, &sel(li, 0, 200)).unwrap();
+        assert_eq!(got, "# Title Here");
+    }
+
+    #[test]
+    fn copies_link_with_url() {
+        let body = "Some **bold** and a [link](https://example.com) end.\n";
+        let app = render_app("link", body);
+        let li = line_containing(&app, "link");
+        let got = extract_selection_text(&app, &sel(li, 0, 200)).unwrap();
+        assert_eq!(got, "Some **bold** and a [link](https://example.com) end.");
+    }
+
+    #[test]
+    fn partial_bold_selection_keeps_delimiters() {
+        // "Some " is 5 cells; rendered "bold" occupies cells 5..9. Selecting
+        // the middle two cells must still copy the whole `**bold**`.
+        let app = render_app("bold", "Some **bold** and a [link](https://x.io) end.\n");
+        let li = line_containing(&app, "bold");
+        let got = extract_selection_text(&app, &sel(li, 6, 8)).unwrap();
+        assert_eq!(got, "**bold**");
+    }
+
+    #[test]
+    fn partial_link_selection_keeps_target() {
+        // Rendered link text is "link" at cells 0..4 of its line.
+        let app = render_app("linkpart", "[link](https://example.com)\n");
+        let li = line_containing(&app, "link");
+        let got = extract_selection_text(&app, &sel(li, 1, 3)).unwrap();
+        assert_eq!(got, "[link](https://example.com)");
+    }
+
+    #[test]
+    fn plain_text_selection_is_character_precise() {
+        let app = render_app("plain", "hello world here\n");
+        let li = line_containing(&app, "hello world");
+        // cells 0..5 = "hello"
+        let got = extract_selection_text(&app, &sel(li, 0, 5)).unwrap();
+        assert_eq!(got, "hello");
+    }
+
+    #[test]
+    fn leading_markup_len_detects_markers() {
+        assert_eq!(leading_markup_len("# Heading"), 2);
+        assert_eq!(leading_markup_len("### Deep"), 4);
+        assert_eq!(leading_markup_len("- item"), 2);
+        assert_eq!(leading_markup_len("1. item"), 3);
+        assert_eq!(leading_markup_len("- [ ] task"), 6);
+        assert_eq!(leading_markup_len("> quote"), 2);
+        assert_eq!(leading_markup_len("plain text"), 0);
+        assert_eq!(leading_markup_len("not#a heading"), 0);
+    }
 }
