@@ -2951,6 +2951,26 @@ impl App {
         }
     }
 
+    /// Keep the editor buffer ending in a single trailing newline while a
+    /// document is open for editing. This is the POSIX text-file convention
+    /// (git and most editors enforce a final newline on save), and the raw
+    /// editor leans on it directly: a trailing `\n` produces the phantom empty
+    /// row in `render_raw_pane`, which is what lets the cursor step down off
+    /// the last content line. The event loop calls this after every input
+    /// event, so a Backspace, Delete, or `:s` that strips the newline is
+    /// corrected on the spot — the user can't leave the buffer without one.
+    /// No-op outside edit mode and for an empty buffer; never strips content
+    /// and never touches the cursor (appending at the end keeps every byte
+    /// offset valid).
+    pub fn ensure_edit_trailing_newline(&mut self) {
+        if let View::Reader(r) = &mut self.view {
+            if r.edit.is_some() && !r.raw.is_empty() && !r.raw.ends_with('\n') {
+                r.raw.push('\n');
+                r.rendered = None;
+            }
+        }
+    }
+
     /// Insert `text` at the current edit cursor and advance the cursor past
     /// it. Marks dirty. No-op outside edit mode.
     pub fn edit_insert(&mut self, text: &str) {
@@ -3719,6 +3739,13 @@ impl App {
         };
         if r.edit.is_none() {
             return Ok(());
+        }
+        // Persist with the POSIX trailing newline. The edit loop already keeps
+        // the live buffer normalized; this also covers non-interactive save
+        // paths so what lands on disk / HackMD always ends in one `\n`.
+        if !r.raw.is_empty() && !r.raw.ends_with('\n') {
+            r.raw.push('\n');
+            r.rendered = None;
         }
         // Set when a saved local file is linked, so we can kick off a sync
         // after the `view`/`r` borrow is released.

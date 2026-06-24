@@ -54,6 +54,10 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
             }
             _ => {}
         }
+        // Re-assert the editor's trailing newline after every event, so any
+        // edit that stripped it (Backspace/Delete on the last line, `:s`,
+        // paste over a tail selection) is corrected before the next render.
+        app.ensure_edit_trailing_newline();
         // Mirror unsaved edits to the crash-recovery file. `force` on the way
         // out so the last keystrokes before a quit are captured despite the
         // throttle.
