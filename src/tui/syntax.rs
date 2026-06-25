@@ -28,7 +28,11 @@ pub fn highlight(
 ) {
     let ss = syntaxes();
     let ts = themes();
-    let Some(theme) = ts.themes.get(theme_name).or_else(|| ts.themes.values().next()) else {
+    let Some(theme) = ts
+        .themes
+        .get(theme_name)
+        .or_else(|| ts.themes.values().next())
+    else {
         // No themes at all (should never happen with `load_defaults`): fall
         // back to unstyled text rather than panicking.
         for line in code.lines() {
