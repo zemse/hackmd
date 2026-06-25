@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — 2026-06-10
+## 0.1.0 (2026-06-25)
 
 The md-tui merge: one crate now ships the HackMD SDK/CLI **and** a full
 terminal markdown reader/editor behind `hackmd tui`.
@@ -24,6 +24,22 @@ terminal markdown reader/editor behind `hackmd tui`.
   copy/open the publish link, `S` download to a local file, `U` push a
   local file up as a new note. All API calls run on background tasks
   drained each UI tick — the interface never blocks on the network.
+- **Continuous bidirectional local ↔ HackMD sync** — a `diffy` 3-way
+  merge with a git-style conflict resolver and a version-stable
+  base-content cache, so edits made in both places reconcile instead of
+  clobbering each other.
+- **Editor refinements** — drag-select with copy-as-markdown / cut /
+  delete, shift-click and shift+arrow range selection, `:s///`
+  substitute, command-line history, `:N` line jump, `:e!` reload,
+  bracket/emphasis pair completion, `Ctrl+Up`/`Down` line move, list
+  continuation, paste-as-link, scrolloff + page padding, crash-recovery
+  autosave to `/tmp`, GUI clipboard cut/copy/paste, and
+  confirm-before-discard on unsaved edits.
+- **Double-click dictionary lookup** (macOS) with the looked-up word
+  highlighted while the popover is open.
+- **Autolink bare URLs** in rendered markdown.
+- **Browser** — text-file detection, show-all toggle, a last-modified
+  column with `s` to sort by recency, and a UTF-8 error modal.
 - `hackmd tui` now opens this TUI instead of the previous minimal
   two-pane viewer — straight into the cloud browser when logged in,
   the local cwd browser otherwise.
@@ -32,6 +48,15 @@ terminal markdown reader/editor behind `hackmd tui`.
 
 - `dirs` 5 → 6.
 - The crate version jumps 0.0.2 → 0.1.0 to mark the merge.
+
+### Fixed
+
+- Pin `time` below 0.3.48 so a non-locked `cargo install` builds.
+- Quote CSV fields containing carriage returns (RFC 4180).
+- Sync hardening (revert, comment-eating, dupes); in-document
+  search-match highlight inside wider spans; wide-char selection edges;
+  long-line wrap clipping; fall back to plain text instead of panicking
+  on a missing theme.
 
 ### Removed
 
