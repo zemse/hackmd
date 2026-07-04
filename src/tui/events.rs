@@ -2949,6 +2949,18 @@ mod word_tests {
         let line = "src/foo_bar-baz.rs";
         assert_eq!(word_at_col(line, 0).as_deref(), Some("src/foo_bar-baz.rs"));
     }
+
+    #[test]
+    fn strips_trailing_period_but_keeps_internal_and_leading_dots() {
+        // Sentence-final full stop is dropped from the looked-up word.
+        assert_eq!(word_at_col("something.", 0).as_deref(), Some("something"));
+        // Ellipsis and other trailing dots go too.
+        assert_eq!(word_at_col("wait...", 0).as_deref(), Some("wait"));
+        // Internal dots (file paths) still survive.
+        assert_eq!(word_at_col("foo.rs.", 0).as_deref(), Some("foo.rs"));
+        // A leading dot is kept for dotfiles.
+        assert_eq!(word_at_col(".gitignore", 0).as_deref(), Some(".gitignore"));
+    }
 }
 
 /// Map a display (line_idx, col) to a source byte offset. Uses
@@ -3025,11 +3037,17 @@ fn word_span_at_col(line: &str, target_col: usize) -> Option<(String, usize, usi
         return None;
     }
     // Strip leading/trailing punctuation but keep internal characters (so
-    // links/anchors like `src/foo_bar-baz.rs` stay whole).
+    // links/anchors like `src/foo_bar-baz.rs` stay whole). A leading `.` is
+    // kept for dotfiles (`.gitignore`), but a trailing `.` is dropped so a
+    // sentence-final `word.` doesn't get looked up with its full stop.
     let raw = &line[start..end];
-    let word = raw.trim_matches(|c: char| {
-        c.is_ascii_punctuation() && !matches!(c, '_' | '-' | '/' | '.' | '#')
-    });
+    let word = raw
+        .trim_start_matches(|c: char| {
+            c.is_ascii_punctuation() && !matches!(c, '_' | '-' | '/' | '.' | '#')
+        })
+        .trim_end_matches(|c: char| {
+            c.is_ascii_punctuation() && !matches!(c, '_' | '-' | '/' | '#')
+        });
     if word.is_empty() {
         return None;
     }
