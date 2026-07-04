@@ -1964,6 +1964,20 @@ fn compute_middle(app: &App) -> Mid {
                     .into(),
             );
         }
+        // A persisted drag-selection swaps in its action menu.
+        if app
+            .selection
+            .as_ref()
+            .map(|s| s.is_active())
+            .unwrap_or(false)
+        {
+            let hint = if crate::tui::dict::SUPPORTED {
+                "selection  c copy  l look up  Esc clear"
+            } else {
+                "selection  c copy  Esc clear"
+            };
+            return Mid::Hint(hint.into());
+        }
         if let Some(s) = r.doc_search.as_ref() {
             let txt = if s.editing {
                 format!("/{}_", s.query)

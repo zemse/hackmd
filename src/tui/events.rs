@@ -82,6 +82,14 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if app.prompt.is_none() && app.is_editing() {
             edit_copy(app);
+        } else if app.prompt.is_none()
+            && app
+                .selection
+                .as_ref()
+                .map(|s| s.is_active())
+                .unwrap_or(false)
+        {
+            copy_selection(app);
         } else {
             app.should_quit = true;
         }
@@ -213,6 +221,38 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // Edit mode: keys go to the in-house editor instead of the viewer.
         if r.edit.is_some() {
             return handle_edit_key(app, key);
+        }
+    }
+
+    // A persisted reader selection (left over from a mouse drag) offers copy /
+    // look-up / clear actions. Scroll-motion keys pass through so the highlight
+    // survives scrolling; any other key clears it before acting.
+    if !app.is_editing()
+        && matches!(app.view, View::Reader(_))
+        && app
+            .selection
+            .as_ref()
+            .map(|s| s.is_active())
+            .unwrap_or(false)
+    {
+        match key.code {
+            KeyCode::Char('c') | KeyCode::Char('y') => {
+                copy_selection(app);
+                return Ok(());
+            }
+            KeyCode::Char('l') if crate::tui::dict::SUPPORTED => {
+                lookup_selection(app);
+                return Ok(());
+            }
+            KeyCode::Esc => {
+                app.selection = None;
+                return Ok(());
+            }
+            _ if !key_preserves_selection(&key) => {
+                app.selection = None;
+                // Fall through to normal handling of this key.
+            }
+            _ => {}
         }
     }
 
@@ -1905,19 +1945,19 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
                 return Ok(());
             }
             // Single Down: defer the click action until Up so a Drag can
-            // claim the gesture as a selection. Set the selection anchor
-            // to the down position; selection only "activates" once a Drag
-            // arrives with a different position.
+            // claim the gesture as a selection. Re-anchor the selection at the
+            // down position (clearing any persisted highlight from a previous
+            // drag — a click elsewhere always dismisses it); it only
+            // "activates" once a Drag arrives with a different position.
             app.pending_click = Some((m.column, m.row));
-            if let Some((line_idx, col)) = body_pos(app, m.column, m.row) {
-                app.selection = Some(crate::tui::app::Selection {
+            app.selection =
+                body_pos(app, m.column, m.row).map(|(line_idx, col)| crate::tui::app::Selection {
                     anchor_line: line_idx,
                     anchor_col: col,
                     focus_line: line_idx,
                     focus_col: col,
                     dragged: false,
                 });
-            }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if let Some((line_idx, col)) = body_pos(app, m.column, m.row) {
@@ -1936,33 +1976,25 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            // If the selection turned into a real drag, copy and exit.
-            let copied = if let Some(s) = app.selection.take() {
-                if s.is_active() {
-                    if let Some(text) = extract_selection_text(app, &s) {
-                        if !text.is_empty() {
-                            copy_to_clipboard(&text);
-                            app.status = format!("Copied {} chars", text.chars().count());
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if copied {
+            // A completed drag *persists* the selection (highlighted) rather
+            // than copying immediately, so the user can pick an action — copy
+            // (`c`) or look up (`l`) — from the statusline hint. The highlight
+            // survives scrolling and is dismissed by a click elsewhere or Esc.
+            if app
+                .selection
+                .as_ref()
+                .map(|s| s.is_active())
+                .unwrap_or(false)
+            {
                 app.pending_click = None;
+                // Clear any stale status so the selection action hint shows.
+                app.status.clear();
                 return Ok(());
             }
-            // No drag → fire the deferred click target (link / checkbox /
-            // browser entry). This preserves the click-to-follow behaviour
-            // that existed before drag-select was introduced.
+            // No drag → drop the zero-width selection and fire the deferred
+            // click target (link / checkbox / browser entry). This preserves
+            // the click-to-follow behaviour from before drag-select existed.
+            app.selection = None;
             if let Some((c, r)) = app.pending_click.take() {
                 click_at(app, c, r)?;
             }
@@ -2487,6 +2519,98 @@ fn extract_selection_rendered(app: &App, sel: &crate::tui::app::Selection) -> Op
         }
     }
     Some(out)
+}
+
+/// Keys that only move the viewport (or arm a motion chord) within the same
+/// document. Pressing one keeps a persisted reader selection alive so the
+/// highlight survives scrolling ("stays even after scrolls"); any other key
+/// dismisses it.
+fn key_preserves_selection(key: &KeyEvent) -> bool {
+    if let KeyCode::Char(c) = key.code {
+        if c.is_ascii_digit() {
+            return true;
+        }
+        if matches!(
+            c,
+            'j' | 'k' | 'd' | 'u' | 'f' | 'b' | ' ' | 'g' | 'G' | 'z' | 'H' | 'M' | 'L' | ']' | '['
+        ) {
+            return true;
+        }
+    }
+    matches!(
+        key.code,
+        KeyCode::Down
+            | KeyCode::Up
+            | KeyCode::PageDown
+            | KeyCode::PageUp
+            | KeyCode::Home
+            | KeyCode::End
+    )
+}
+
+/// Copy the persisted reader selection to the system clipboard, then clear it
+/// (matching the editor's copy-and-deselect). No-op without an active range.
+fn copy_selection(app: &mut App) {
+    let Some(sel) = app.selection.take() else {
+        return;
+    };
+    if let Some(text) = extract_selection_text(app, &sel).filter(|t| !t.is_empty()) {
+        copy_to_clipboard(&text);
+        app.status = format!("Copied {} chars", text.chars().count());
+    }
+}
+
+/// Look up the persisted reader selection in the macOS dictionary, anchoring
+/// the definition popover at the selection's start, then clear the selection.
+/// Feeds the dictionary the rendered plain text (markdown stripped, line breaks
+/// flattened to spaces) so multi-word phrases resolve when an entry exists.
+fn lookup_selection(app: &mut App) {
+    let Some(sel) = app.selection.take() else {
+        return;
+    };
+    let Some(raw) = extract_selection_rendered(app, &sel) else {
+        return;
+    };
+    let phrase = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if phrase.is_empty() {
+        return;
+    }
+    // Map the selection's start from document coords to an absolute screen
+    // cell for the popover anchor.
+    let area = app.viewport;
+    let ((s_line, s_col), (e_line, e_col)) = sel.normalized();
+    let (line_num_w, scroll) = match &app.view {
+        View::Reader(r) => {
+            let w = if app.opts.line_numbers {
+                r.rendered
+                    .as_ref()
+                    .map(|rd| (format!("{}", rd.lines.len()).len() + 1) as u16)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            (w, r.scroll as usize)
+        }
+        _ => (0, 0),
+    };
+    let rel = s_line
+        .saturating_sub(scroll)
+        .min(area.height.saturating_sub(1) as usize) as u16;
+    let anchor_row = area.y + rel;
+    let anchor_col = area.x + line_num_w + s_col;
+    let width = if s_line == e_line {
+        e_col.saturating_sub(s_col).max(1)
+    } else {
+        phrase.chars().count().min(u16::MAX as usize) as u16
+    };
+    app.lookup = Some(crate::tui::app::LookupState {
+        word: phrase.clone(),
+        anchor: (anchor_col, anchor_row, width),
+        status: crate::tui::app::LookupStatus::Loading,
+        scroll: 0,
+        rect: ratatui::layout::Rect::default(),
+    });
+    app.cloud.ctx.spawn_lookup(phrase);
 }
 
 /// Select the word under the click and push it to the system clipboard.
