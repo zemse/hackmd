@@ -112,12 +112,12 @@ fn format_rate_limit(user_limit: u32, user_remaining: u32, reset_after: Option<i
         );
     }
     // The per-window limit is 100 calls / 5 min, so a reset far beyond that
-    // window means the monthly quota is exhausted (2,000 on Free, 10,000 on
+    // window means the monthly quota is exhausted (2,000 on Free, 20,000 on
     // Prime), which needs a plan upgrade or the month rollover, not a wait.
     if secs > 15 * 60 {
         let _ = write!(
             msg,
-            ". This is well past the 5-minute window, so the monthly quota is the likely cause (2,000 calls/month on Free, 10,000 on Prime)"
+            ". This is well past the 5-minute window, so the monthly quota is the likely cause (2,000 calls/month on Free, 20,000 on Prime)"
         );
     }
     msg
