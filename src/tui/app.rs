@@ -153,6 +153,10 @@ pub struct App {
     /// different path syncs immediately (on open); the same path re-syncs once
     /// `SYNC_INTERVAL` elapses (background upstream polling).
     pub last_sync: Option<(PathBuf, std::time::Instant)>,
+    /// When the most recent HackMD `429 Too Many Requests` landed. Drives the
+    /// live "rate limited (Ns ago)" statusline badge; survives the per-keypress
+    /// `status.clear()` so the warning persists after the message is gone.
+    pub last_rate_limit: Option<std::time::Instant>,
     /// Active conflict-resolution session (local vs upstream), shown as a
     /// full-screen resolver. `None` when there's no unresolved conflict.
     pub conflict: Option<ConflictState>,
@@ -911,6 +915,7 @@ impl App {
             recovery_throttle: None,
             pending_sync: false,
             last_sync: None,
+            last_rate_limit: None,
             conflict: None,
             edit_cmd_history: Vec::new(),
             edit_cmd_nav: None,
@@ -929,6 +934,14 @@ impl App {
                 break;
             };
             self.apply_cloud_msg(msg);
+            // A rate-limited op surfaces via the error Display, which carries
+            // the "HTTP 429" marker (see `Error::RateLimit`). Stamp the time so
+            // the statusline can show a live "rate limited (Ns ago)" badge that
+            // outlives the next keypress's `status.clear()`. Checked per message
+            // so a 429 isn't masked by a later success in the same drain.
+            if self.status.contains("HTTP 429") {
+                self.last_rate_limit = Some(std::time::Instant::now());
+            }
         }
     }
 

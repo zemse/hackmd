@@ -288,11 +288,22 @@ fn rate_limit_allows_retry(headers: &HeaderMap) -> bool {
     !matches!(remaining, Some(n) if n <= 0)
 }
 
-async fn sleep_backoff(base: Duration, attempt: u32) {
-    // exponential backoff: 2^attempt * base
+/// Ceiling on a single retry sleep. The exponential schedule (`2^attempt *
+/// base`) is clamped to this, so a large `base_delay` or `max_retries` can't
+/// produce an unbounded wait; a 429/5xx that needs longer than this surfaces to
+/// the caller (with its reset hint) rather than blocking the request here.
+const MAX_BACKOFF: Duration = Duration::from_secs(2);
+
+/// Exponential backoff `2^attempt * base`, saturating and capped at
+/// [`MAX_BACKOFF`]. Pure so the cap is unit-testable without sleeping.
+fn backoff_delay(base: Duration, attempt: u32) -> Duration {
     let factor = 1u64.checked_shl(attempt).unwrap_or(u64::MAX);
-    let delay = base.saturating_mul(factor.min(u32::MAX as u64) as u32);
-    tokio::time::sleep(delay).await;
+    base.saturating_mul(factor.min(u32::MAX as u64) as u32)
+        .min(MAX_BACKOFF)
+}
+
+async fn sleep_backoff(base: Duration, attempt: u32) {
+    tokio::time::sleep(backoff_delay(base, attempt)).await;
 }
 
 #[cfg(test)]
@@ -322,6 +333,20 @@ mod tests {
             "photo": "p.png",
             "teams": []
         })
+    }
+
+    #[test]
+    fn backoff_delay_grows_then_caps() {
+        let base = Duration::from_millis(100);
+        // Grows exponentially while under the ceiling.
+        assert_eq!(backoff_delay(base, 1), Duration::from_millis(200));
+        assert_eq!(backoff_delay(base, 2), Duration::from_millis(400));
+        assert_eq!(backoff_delay(base, 3), Duration::from_millis(800));
+        // Capped at MAX_BACKOFF once the schedule would exceed it.
+        assert_eq!(backoff_delay(base, 5), MAX_BACKOFF); // 3200ms → 2s
+        assert_eq!(backoff_delay(base, 40), MAX_BACKOFF); // huge shift → 2s
+        // A large base is capped immediately too.
+        assert_eq!(backoff_delay(Duration::from_secs(60), 1), MAX_BACKOFF);
     }
 
     #[tokio::test]

@@ -1642,7 +1642,32 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
         .as_ref()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .unwrap_or(0);
-    let right_w = scroll_w + badge_w;
+    // Persistent rate-limit warning: once a 429 lands, show how long ago for the
+    // length of HackMD's 5-minute window, then stop nagging. Counts up live
+    // because the loop redraws ≥4×/sec (see events::run).
+    let rl_badge: Option<Span> = app.last_rate_limit.and_then(|t| {
+        let secs = t.elapsed().as_secs();
+        if secs > 300 {
+            return None;
+        }
+        let ago = if secs < 60 {
+            format!("{secs}s ago")
+        } else {
+            format!("{}m {}s ago", secs / 60, secs % 60)
+        };
+        Some(Span::styled(
+            format!(" ⚠ 429 · {ago} "),
+            Style::default()
+                .bg(theme.status_bg)
+                .fg(theme.heading[0])
+                .add_modifier(Modifier::BOLD),
+        ))
+    });
+    let rl_w = rl_badge
+        .as_ref()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .unwrap_or(0);
+    let right_w = scroll_w + badge_w + rl_w;
 
     // Left span: edit-mode badge (if editing) OR optional back button +
     // path. The edit badge takes precedence over Back so the user always
@@ -1729,6 +1754,9 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
             line_spans.push(Span::raw(" ".repeat(total_w.saturating_sub(used))));
             url_hit_region = url_hit(&line_spans, mid_w);
             line_spans.push(mid_styled);
+            if let Some(b) = rl_badge.clone() {
+                line_spans.push(b);
+            }
             if let Some(b) = badge_span.clone() {
                 line_spans.push(b);
             }
@@ -1746,6 +1774,9 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
             line_spans.push(mid_styled);
             let used = span_width(&line_spans) + right_w;
             line_spans.push(Span::raw(" ".repeat(total_w.saturating_sub(used))));
+            if let Some(b) = rl_badge.clone() {
+                line_spans.push(b);
+            }
             if let Some(b) = badge_span.clone() {
                 line_spans.push(b);
             }
@@ -1768,6 +1799,9 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
             }
             let used = span_width(&line_spans) + right_w;
             line_spans.push(Span::raw(" ".repeat(total_w.saturating_sub(used))));
+            if let Some(b) = rl_badge.clone() {
+                line_spans.push(b);
+            }
             if let Some(b) = badge_span.clone() {
                 line_spans.push(b);
             }
@@ -1778,8 +1812,11 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
     // The right group sits flush-right in every layout, so the badge occupies
     // the columns `[total_w - right_w, total_w - scroll_w)`. Only register a hit
     // when there's a link to copy.
+    // The badge sits directly left of the scroll indicator: columns
+    // `[total_w - badge_w - scroll_w, total_w - scroll_w)`. Derived from its own
+    // width (not `right_w`) so the rate-limit badge to its left doesn't shift it.
     app.statusline_badge_hit = badge.as_ref().filter(|b| !b.link.is_empty()).map(|b| {
-        let sx = area.x + total_w.saturating_sub(right_w) as u16;
+        let sx = area.x + total_w.saturating_sub(badge_w + scroll_w) as u16;
         let ex = area.x + total_w.saturating_sub(scroll_w) as u16;
         (sx, ex, b.link.clone())
     });
