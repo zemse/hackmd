@@ -1649,26 +1649,30 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
         .as_ref()
         .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
         .unwrap_or(0);
-    // Persistent rate-limit warning: once a 429 lands, show how long ago for the
-    // length of HackMD's 5-minute window, then stop nagging. Counts up live
-    // because the loop redraws ≥4×/sec (see events::run).
-    let rl_badge: Option<Span> = app.last_rate_limit.and_then(|t| {
-        let secs = t.elapsed().as_secs();
-        if secs > 300 {
-            return None;
-        }
-        let ago = if secs < 60 {
-            format!("{secs}s ago")
-        } else {
-            format!("{}m {}s ago", secs / 60, secs % 60)
-        };
-        Some(Span::styled(
-            format!(" ⚠ 429 · {ago} "),
-            Style::default()
-                .bg(theme.status_bg)
-                .fg(theme.heading[0])
-                .add_modifier(Modifier::BOLD),
-        ))
+    // Live API-quota badge (remaining/limit from HackMD's headers). Falls back
+    // to a "429 Ns ago" warning when no quota snapshot exists yet — e.g. right
+    // after a 429 whose headers we couldn't parse. The 429 warning self-expires
+    // after HackMD's 5-minute window; both count up live because the loop
+    // redraws ≥4×/sec (see events::run).
+    let rl_badge: Option<Span> = quota_badge(app, theme).or_else(|| {
+        app.last_rate_limit.and_then(|t| {
+            let secs = t.elapsed().as_secs();
+            if secs > 300 {
+                return None;
+            }
+            let ago = if secs < 60 {
+                format!("{secs}s ago")
+            } else {
+                format!("{}m {}s ago", secs / 60, secs % 60)
+            };
+            Some(Span::styled(
+                format!(" ⚠ 429 · {ago} "),
+                Style::default()
+                    .bg(theme.status_bg)
+                    .fg(theme.heading[0])
+                    .add_modifier(Modifier::BOLD),
+            ))
+        })
     });
     let rl_w = rl_badge
         .as_ref()
@@ -1930,6 +1934,56 @@ impl Mid {
                 .add_modifier(Modifier::BOLD),
             Mid::Hint(_) => Style::default().fg(theme.muted),
         }
+    }
+}
+
+/// Live API-quota badge from HackMD's rate-limit headers. Shows
+/// `remaining/limit`; turns into a bold warning (with the reset countdown) once
+/// the quota is nearly or fully spent, so the tank is visibly draining before a
+/// 429 ever lands. `None` until a response has carried the headers (or when
+/// logged out).
+fn quota_badge(app: &App, theme: &crate::tui::theme::Theme) -> Option<Span<'static>> {
+    let rl = app.cloud.ctx.rate_limit()?;
+    if rl.limit == 0 {
+        return None;
+    }
+    let frac = rl.remaining as f32 / rl.limit as f32;
+    let low = rl.remaining == 0 || frac <= 0.10;
+    let mut label = if low {
+        format!(" ⚠ {}/{} API", rl.remaining, rl.limit)
+    } else {
+        format!(" {}/{} API ", rl.remaining, rl.limit)
+    };
+    if low {
+        let secs = rl.reset - chrono::Utc::now().timestamp();
+        if rl.reset > 0 && secs > 0 {
+            label.push_str(&format!(" · resets {} ", coarse_duration(secs)));
+        } else {
+            label.push(' ');
+        }
+    }
+    let style = if low {
+        Style::default()
+            .bg(theme.status_bg)
+            .fg(theme.heading[0])
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    Some(Span::styled(label, style))
+}
+
+/// Compact "27d" / "3h" / "12m" / "45s" for the quota reset countdown.
+fn coarse_duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs >= 86_400 {
+        format!("{}d", secs / 86_400)
+    } else if secs >= 3_600 {
+        format!("{}h", secs / 3_600)
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
     }
 }
 

@@ -89,7 +89,7 @@ fn format_rate_limit(user_limit: u32, user_remaining: u32, reset_after: Option<i
     if user_limit > 0 {
         let _ = write!(
             msg,
-            " — {user_remaining}/{user_limit} calls remaining in the current window"
+            ": {user_remaining}/{user_limit} calls remaining in the current window"
         );
     }
 
@@ -111,14 +111,24 @@ fn format_rate_limit(user_limit: u32, user_remaining: u32, reset_after: Option<i
             dt.with_timezone(&chrono::Local).format("%H:%M:%S")
         );
     }
-    // The per-window limit is 100 calls / 5 min, so a reset far beyond that
-    // window means the monthly quota is exhausted (2,000 on Free, 20,000 on
-    // Prime), which needs a plan upgrade or the month rollover, not a wait.
+    // The burst limit is 100 calls / 5 min, so a reset far beyond that window
+    // means the *monthly* quota is exhausted, not a short burst. We do NOT
+    // hardcode the cap: it varies by plan (as low as 400/month on a Free
+    // workspace) and HackMD's own docs disagree with the product, so the only
+    // trustworthy number is `user_limit` from the response header above. This
+    // needs a plan upgrade or the monthly rollover, not a wait.
     if secs > 15 * 60 {
-        let _ = write!(
-            msg,
-            ". This is well past the 5-minute window, so the monthly quota is the likely cause (2,000 calls/month on Free, 20,000 on Prime)"
-        );
+        if user_limit > 0 {
+            let _ = write!(
+                msg,
+                ". That is well past the 5-minute burst window, so your monthly quota of {user_limit} API calls is used up; wait for the reset above or upgrade to Prime for a higher limit"
+            );
+        } else {
+            let _ = write!(
+                msg,
+                ". That is well past the 5-minute burst window, so your monthly API quota is used up; wait for the reset above or upgrade to Prime for a higher limit"
+            );
+        }
     }
     msg
 }
@@ -153,15 +163,15 @@ fn human_duration(secs: i64) -> String {
     }
 }
 
-fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(crate) fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-fn header_u32(headers: &HeaderMap, name: &str) -> Option<u32> {
+pub(crate) fn header_u32(headers: &HeaderMap, name: &str) -> Option<u32> {
     header_str(headers, name).and_then(|s| s.parse::<u32>().ok())
 }
 
-fn header_i64(headers: &HeaderMap, name: &str) -> Option<i64> {
+pub(crate) fn header_i64(headers: &HeaderMap, name: &str) -> Option<i64> {
     header_str(headers, name).and_then(|s| s.parse::<i64>().ok())
 }
 
@@ -259,6 +269,28 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("monthly quota"), "got: {msg}");
+    }
+
+    #[test]
+    fn rate_limit_message_uses_header_limit_not_hardcoded_numbers() {
+        // A Free workspace reports a 400/month cap. The message must echo that
+        // real number and never the stale doc figures (2,000 / 20,000).
+        let reset = chrono::Utc::now().timestamp() + 86_400;
+        let err = Error::RateLimit {
+            user_limit: 400,
+            user_remaining: 0,
+            reset_after: Some(reset),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("400 API calls"), "got: {msg}");
+        assert!(
+            !msg.contains("2,000"),
+            "must not hardcode Free quota: {msg}"
+        );
+        assert!(
+            !msg.contains("20,000"),
+            "must not hardcode Prime quota: {msg}"
+        );
     }
 
     #[test]

@@ -185,6 +185,13 @@ impl CloudContext {
         self.handle.is_some() && self.client.is_some()
     }
 
+    /// Latest HackMD rate-limit snapshot from the underlying client, or `None`
+    /// when disconnected or no response has yet carried the headers. Read each
+    /// frame to drive the live quota badge.
+    pub fn rate_limit(&self) -> Option<crate::client::RateLimit> {
+        self.client.as_ref().and_then(|c| c.rate_limit())
+    }
+
     /// Non-blocking receive of the next finished operation, if any.
     pub fn try_recv(&mut self) -> Option<CloudMsg> {
         self.rx.try_recv().ok()

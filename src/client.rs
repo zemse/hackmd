@@ -2,6 +2,8 @@
 //!
 //! Mirrors the behavior contract of `_ref/api-client/nodejs/src/index.ts`.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, IF_NONE_MATCH};
@@ -9,10 +11,70 @@ use reqwest::{Method, StatusCode};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, header_i64, header_u32};
 
 /// Default base URL used when callers don't override the endpoint.
 pub const DEFAULT_ENDPOINT: &str = "https://api.hackmd.io/v1";
+
+/// A snapshot of HackMD's `X-RateLimit-User*` headers from the most recent
+/// response. `limit`/`remaining` are calls in the current window (per HackMD's
+/// [API policy]); `reset` is the Unix second the window clears (`0` when the
+/// header was absent). This is the authoritative quota source — HackMD's own
+/// docs disagree with the product, so callers should trust `limit`, not a
+/// hardcoded plan figure.
+///
+/// [API policy]: https://hackmd.io/@docs/api-policy
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimit {
+    pub limit: u32,
+    pub remaining: u32,
+    pub reset: i64,
+}
+
+/// Shared, lock-free cell holding the latest [`RateLimit`]. Updated on every
+/// response at the client's single send choke point and read by the TUI for a
+/// live quota badge. Clones of a [`Client`] share one cell (behind `Arc`), so a
+/// snapshot recorded inside a spawned request task is visible to the context
+/// that spawned it.
+#[derive(Debug, Default)]
+struct RateLimitCell {
+    present: AtomicBool,
+    limit: AtomicU32,
+    remaining: AtomicU32,
+    reset: AtomicI64,
+}
+
+impl RateLimitCell {
+    /// Record the `X-RateLimit-User*` headers from a response. A response
+    /// missing the authoritative `userlimit` header leaves the last known
+    /// snapshot untouched (some endpoints/errors omit them).
+    fn record(&self, headers: &HeaderMap) {
+        let Some(limit) = header_u32(headers, "x-ratelimit-userlimit") else {
+            return;
+        };
+        self.limit.store(limit, Ordering::Relaxed);
+        self.remaining.store(
+            header_u32(headers, "x-ratelimit-userremaining").unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        self.reset.store(
+            header_i64(headers, "x-ratelimit-userreset").unwrap_or(0),
+            Ordering::Relaxed,
+        );
+        self.present.store(true, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> Option<RateLimit> {
+        if !self.present.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(RateLimit {
+            limit: self.limit.load(Ordering::Relaxed),
+            remaining: self.remaining.load(Ordering::Relaxed),
+            reset: self.reset.load(Ordering::Relaxed),
+        })
+    }
+}
 
 /// Retry behavior. `max_retries = 0` disables retries entirely.
 #[derive(Debug, Clone)]
@@ -69,6 +131,8 @@ pub struct Client {
     base_url: String,
     token: String,
     retry: RetryConfig,
+    /// Latest rate-limit snapshot, shared across clones (see [`RateLimitCell`]).
+    rate_limit: Arc<RateLimitCell>,
 }
 
 impl Client {
@@ -104,7 +168,15 @@ impl Client {
             base_url,
             token,
             retry: config.retry,
+            rate_limit: Arc::new(RateLimitCell::default()),
         })
+    }
+
+    /// The most recent rate-limit snapshot from HackMD's response headers, or
+    /// `None` if no response has carried them yet. Lock-free; shared across
+    /// clones of this client, so it reflects requests made on any clone.
+    pub fn rate_limit(&self) -> Option<RateLimit> {
+        self.rate_limit.snapshot()
     }
 
     // ─── Internal request plumbing ──────────────────────────────────────
@@ -229,6 +301,10 @@ impl Client {
                 Ok(resp) => {
                     let status = resp.status();
                     let headers = resp.headers().clone();
+                    // Single choke point for every response (success, 304, and
+                    // errors): capture the live quota so the TUI can show it
+                    // before the user ever hits a 429.
+                    self.rate_limit.record(&headers);
                     // 304 is treated as success with an empty body.
                     if status == StatusCode::NOT_MODIFIED {
                         return Ok((String::new(), headers, status));
@@ -375,6 +451,54 @@ mod tests {
         assert_eq!(user.id, "u1");
         assert_eq!(user.name, "Alice");
         assert_eq!(user.email.as_deref(), Some("alice@example.com"));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_snapshot_captured_on_success() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-userlimit", "400")
+                    .insert_header("x-ratelimit-userremaining", "137")
+                    .insert_header("x-ratelimit-userreset", "1700000000")
+                    .set_body_json(user_json()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::with_config("t", server.uri(), fast_config()).expect("client builds");
+        // No response seen yet.
+        assert!(client.rate_limit().is_none());
+
+        client.me().await.expect("me ok");
+        let rl = client.rate_limit().expect("snapshot recorded on 200");
+        assert_eq!(rl.limit, 400);
+        assert_eq!(rl.remaining, 137);
+        assert_eq!(rl.reset, 1700000000);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_snapshot_shared_across_clones() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/me"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("x-ratelimit-userlimit", "400")
+                    .insert_header("x-ratelimit-userremaining", "42")
+                    .set_body_json(user_json()),
+            )
+            .mount(&server)
+            .await;
+
+        let client = Client::with_config("t", server.uri(), fast_config()).expect("client builds");
+        // A request made on a clone updates the shared cell the original reads.
+        let clone = client.clone();
+        clone.me().await.expect("me ok");
+        let rl = client.rate_limit().expect("snapshot visible via original");
+        assert_eq!(rl.remaining, 42);
     }
 
     #[tokio::test]
