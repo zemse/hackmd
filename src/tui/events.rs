@@ -1092,7 +1092,17 @@ fn is_bracket_closer(c: char) -> bool {
 
 /// Editor commands the command line accepts, in suggestion order. `:` is
 /// implicit — the stored input never includes it.
-const EDIT_COMMANDS: &[&str] = &["w", "wq", "x", "q", "q!", "preview", "e!"];
+const EDIT_COMMANDS: &[&str] = &[
+    "w",
+    "wq",
+    "x",
+    "q",
+    "q!",
+    "preview",
+    "e!",
+    "set number",
+    "set nonumber",
+];
 
 /// The grey inline completion for a partial command: the first command the
 /// input is a strict prefix of. `None` for empty input, exact matches, and
@@ -1200,6 +1210,25 @@ fn exec_edit_command(app: &mut App, cmd: &str) -> Result<()> {
         // `:e!` — reload the buffer from disk / cloud cache, dropping
         // unsaved edits but staying in the editor.
         "e!" => edit_reload(app),
+        // Vim-style line-number toggle. Affects the editor gutter and the
+        // reader immediately, no restart needed; `config.toml` sets the
+        // default. `:set number!` flips the current state.
+        "set number" | "set nu" => {
+            app.opts.line_numbers = true;
+            app.status = "line numbers on".into();
+        }
+        "set nonumber" | "set nonu" => {
+            app.opts.line_numbers = false;
+            app.status = "line numbers off".into();
+        }
+        "set number!" | "set invnumber" => {
+            app.opts.line_numbers = !app.opts.line_numbers;
+            app.status = if app.opts.line_numbers {
+                "line numbers on".into()
+            } else {
+                "line numbers off".into()
+            };
+        }
         other => {
             // `:s/old/new/[g]` (current line) and `:%s/old/new/[g]` (whole
             // buffer) — literal substitution (no regex).
@@ -3388,6 +3417,23 @@ mod keybind_tests {
             edit_state_of(&app).is_none(),
             "second Esc leaves the editor"
         );
+    }
+
+    #[test]
+    fn set_number_command_toggles_line_numbers() {
+        let mut app = app_with_headings("set-number");
+        assert!(!app.opts.line_numbers, "default off");
+        press(&mut app, KeyCode::Char('e'));
+        press(&mut app, KeyCode::Esc);
+        type_str(&mut app, "set number");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.opts.line_numbers, ":set number turns them on");
+
+        // Still editing; flip back off with the bang form.
+        press(&mut app, KeyCode::Esc);
+        type_str(&mut app, "set number!");
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.opts.line_numbers, ":set number! flips them off");
     }
 
     #[test]

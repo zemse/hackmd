@@ -52,7 +52,10 @@ pub fn run_blocking(opts: LaunchOpts, cloud: cloud::CloudContext) -> Result<()> 
 
     let app_opts = app::Options {
         width: opts.width,
-        line_numbers: opts.line_numbers,
+        // `config.toml` may enable line numbers; fall back to the launch flag
+        // (currently always false) when the key is absent. Without this the
+        // config field was loaded but silently ignored.
+        line_numbers: cfg.line_numbers.unwrap_or(opts.line_numbers),
         theme,
     };
 

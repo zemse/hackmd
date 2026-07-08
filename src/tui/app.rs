@@ -4856,6 +4856,10 @@ pub struct RawRow {
     pub text: String,
     pub source_range: std::ops::Range<usize>,
     pub kind: RawRowKind,
+    /// 1-based source line number, set only on the *head* row of each source
+    /// line. Wrapped continuation rows carry `None` so the gutter shows a
+    /// number once per logical line, like every other editor.
+    pub line_no: Option<usize>,
 }
 
 /// Rows of blank breathing room added above the first and below the last
@@ -4905,13 +4909,15 @@ pub fn render_raw_pane(raw: &str, width: usize) -> Vec<RawRow> {
         } else {
             chunks
         };
-        for (chunk_range, chunk_text) in chunks {
+        for (ci, (chunk_range, chunk_text)) in chunks.into_iter().enumerate() {
             let src_start = line_start + chunk_range.start;
             let src_end = line_start + chunk_range.end;
             rows.push(RawRow {
                 text: chunk_text,
                 source_range: src_start..src_end,
                 kind,
+                // Number only the first display row of each source line.
+                line_no: (ci == 0).then_some(i + 1),
             });
         }
         // Advance past `\n` between lines (but not after the last entry,
@@ -5568,6 +5574,28 @@ mod tests {
             line_numbers: false,
             theme: Theme::dark(),
         }
+    }
+
+    #[test]
+    fn raw_rows_number_source_lines_once_across_wraps() {
+        // Line 1 wraps into several display rows; lines 2 and 3 are short.
+        // The gutter numbers each *source* line once, on its head row, and
+        // leaves wrapped continuation rows unnumbered.
+        let raw = "aaaa bbbb cccc dddd eeee ffff\nshort\nlast";
+        let rows = render_raw_pane(raw, 10);
+
+        // Head rows carry sequential 1-based line numbers.
+        let numbered: Vec<usize> = rows.iter().filter_map(|r| r.line_no).collect();
+        assert_eq!(numbered, vec![1, 2, 3]);
+
+        // The first source line wrapped, so at least one continuation row with
+        // no number exists before line 2 appears.
+        let first_two = rows.first().and_then(|r| r.line_no);
+        assert_eq!(first_two, Some(1));
+        assert!(
+            rows.iter().any(|r| r.line_no.is_none()),
+            "expected an unnumbered wrapped continuation row"
+        );
     }
 
     #[test]

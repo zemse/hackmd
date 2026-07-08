@@ -718,7 +718,7 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Layout choice: side-by-side at >= 100 cols, vertical stack below.
     let horizontal = area.width >= 100;
-    let (raw_area, preview_area) = if horizontal {
+    let (pane, preview_area) = if horizontal {
         let half = area.width / 2;
         let raw = Rect {
             x: area.x,
@@ -774,6 +774,30 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
         (raw, prev)
     };
 
+    // Reserve a left gutter for source line numbers when `line_numbers` is on
+    // (the same toggle the reader honors), sized to the widest number in the
+    // document: right-aligned in `digits` columns plus one trailing space, to
+    // match the reader gutter. The rest of the pane is the text area — and
+    // because every cursor / click / wrap calculation derives its width and
+    // x-origin from `edit_raw_area`, storing the *text* sub-rect there keeps
+    // all of that math correct with no other changes.
+    let line_count = r.raw.split('\n').count().max(1);
+    let digits = line_count.to_string().len();
+    let gutter_w = if app.opts.line_numbers {
+        (digits as u16 + 1).min(pane.width)
+    } else {
+        0
+    };
+    let gutter_area = Rect {
+        width: gutter_w,
+        ..pane
+    };
+    let raw_area = Rect {
+        x: pane.x + gutter_w,
+        width: pane.width.saturating_sub(gutter_w),
+        ..pane
+    };
+
     app.edit_raw_area = raw_area;
     app.edit_preview_area = preview_area;
 
@@ -821,7 +845,18 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
         raw_scroll = max_raw_scroll;
     }
 
+    // Line number of the source line the cursor sits on, so its gutter entry
+    // can be highlighted. Counting newlines up to the cursor is O(n) but the
+    // buffer is a single document, so it's cheap once per frame.
+    let cur_line_no = r
+        .raw
+        .get(..cursor)
+        .map(|s| s.bytes().filter(|&b| b == b'\n').count() + 1)
+        .unwrap_or(1);
+
     let mut raw_lines: Vec<Line> = Vec::with_capacity(visible_h_raw);
+    let mut gutter_lines: Vec<Line> = Vec::with_capacity(visible_h_raw);
+    let num_w = gutter_w.saturating_sub(1) as usize;
     for i in 0..visible_h_raw {
         // Map the viewport row to a real wrapped row; top/bottom pad rows (and
         // anything past the last line) render blank as page breathing room.
@@ -830,8 +865,23 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
             .and_then(|idx| raw_rows.get(idx));
         let Some(row) = row else {
             raw_lines.push(Line::default());
+            gutter_lines.push(Line::default());
             continue;
         };
+        // Gutter: right-aligned number on head rows, blank on wrapped
+        // continuations. The cursor's line is brightened.
+        let gutter_line = match row.line_no {
+            Some(n) if gutter_w > 0 => {
+                let style = if n == cur_line_no {
+                    Style::default().fg(theme.fg).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.muted)
+                };
+                Line::from(Span::styled(format!("{n:>num_w$} "), style))
+            }
+            _ => Line::default(),
+        };
+        gutter_lines.push(gutter_line);
         // Kind is computed per source line so wrapped continuation rows
         // keep the same styling as their head row.
         let style = match row.kind {
@@ -843,6 +893,7 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
         };
         raw_lines.push(Line::from(Span::styled(row.text.clone(), style)));
     }
+    f.render_widget(Paragraph::new(gutter_lines), gutter_area);
     f.render_widget(Paragraph::new(raw_lines), raw_area);
 
     // Drag-selection highlight: reverse-video over the selected byte range,
