@@ -477,6 +477,13 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
                 .fg(theme.heading[3])
                 .add_modifier(Modifier::BOLD),
         ))
+    } else if matches!(p.kind, app::PromptKind::ConfirmFetchUpdate { .. }) {
+        Line::from(Span::styled(
+            "y / Enter fetch (1 API call) · any other key keeps local",
+            Style::default()
+                .fg(theme.heading[3])
+                .add_modifier(Modifier::BOLD),
+        ))
     } else {
         Line::from(vec![
             Span::styled(
@@ -2392,7 +2399,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from("  n                new file (browser)   c / F2  rename"),
         Line::from("  A                browser: toggle showing all files & hidden"),
         Line::from("  U                publish to HackMD — links the file, then"),
-        Line::from("                   auto-syncs both ways (on open, save & poll)"),
+        Line::from("                   pushes up on save; asks before fetching on open"),
         Line::from("  conflicts        l:local u:upstream b:both n:drop Enter:apply"),
         Line::from("  Ctrl-G           git lens (diff vs HEAD; staged + unstaged)"),
         Line::from("  r                mark read (browser; dirs recurse)"),

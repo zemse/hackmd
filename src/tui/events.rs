@@ -33,8 +33,9 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
         app.poll_browser_change();
         // Apply any cloud operations that finished since the last tick.
         app.drain_cloud_msgs();
-        // Bidirectional HackMD sync for a linked, open local file: fires on
-        // open and then every SYNC_INTERVAL to pull upstream edits.
+        // HackMD sync for a linked, open local file: on first sight, offer a
+        // one-shot prompt to pull upstream edits (no background polling — each
+        // fetch costs an API call against a quota as low as 400/month).
         app.maybe_sync();
         term.draw(|f| ui::draw(f, app))?;
         // Flush trailing unsaved edits to the recovery mirror on idle ticks,
@@ -1545,6 +1546,26 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.status = "Recovery kept — will ask again next time".into();
             }
             _ => {}
+        }
+        return Ok(());
+    }
+    // Fetch-from-HackMD confirm: `y`/Enter spends the API call, anything else
+    // keeps the local copy untouched.
+    let fetch_update = matches!(
+        app.prompt.as_ref().map(|p| &p.kind),
+        Some(crate::tui::app::PromptKind::ConfirmFetchUpdate { .. })
+    );
+    if fetch_update {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                if let Some(p) = app.prompt.take() {
+                    app.commit_prompt(p);
+                }
+            }
+            _ => {
+                app.prompt = None;
+                app.status = "Kept local copy — no fetch".into();
+            }
         }
         return Ok(());
     }

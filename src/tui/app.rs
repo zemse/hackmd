@@ -146,12 +146,14 @@ pub struct App {
     /// recovery file: `(when, content_hash)` of the last write, so an
     /// unchanged buffer or a too-recent write is skipped.
     pub recovery_throttle: Option<(std::time::Instant, u64)>,
-    /// True while a local↔HackMD sync fetch is in flight, so the periodic
-    /// poll doesn't stack duplicate requests for the same file.
+    /// True while a local↔HackMD sync fetch is in flight, so we don't stack
+    /// duplicate requests for the same file.
     pub pending_sync: bool,
-    /// `(path, when)` of the last sync trigger for the open linked file. A
-    /// different path syncs immediately (on open); the same path re-syncs once
-    /// `SYNC_INTERVAL` elapses (background upstream polling).
+    /// `(path, when)` of the last linked file we offered to sync. Records that
+    /// the open file has already been handled (prompted or synced) so it isn't
+    /// re-offered every tick. There is no background re-poll: an API quota as
+    /// low as 400 calls/month makes periodic upstream polling too expensive, so
+    /// a still-open file is fetched only when the user asks.
     pub last_sync: Option<(PathBuf, std::time::Instant)>,
     /// When the most recent HackMD `429 Too Many Requests` landed. Drives the
     /// live "rate limited (Ns ago)" statusline badge; survives the per-keypress
@@ -172,10 +174,6 @@ pub struct App {
     /// open a file that isn't valid UTF-8). Dismissed by the next keypress.
     pub error: Option<String>,
 }
-
-/// How often a still-open linked file re-syncs with upstream in the
-/// background (catching edits made on hackmd.io).
-pub const SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// In-TUI dictionary-definition popover, opened by double-clicking a word in
 /// the reader (which also copies it). Anchored to the word on screen and
@@ -359,6 +357,11 @@ pub enum PromptKind {
     /// discards the recovery file, Esc leaves it for next time. Carries the
     /// recovered buffer and cursor.
     RecoverEdit { content: String, cursor: usize },
+    /// A HackMD-linked local file was just opened in the reader. Pulling the
+    /// upstream copy costs an API call (quota is as low as 400/month on a Free
+    /// workspace), so ask before spending one: `y`/Enter fetches, any other
+    /// key keeps the local copy.
+    ConfirmFetchUpdate { path: PathBuf },
 }
 
 /// What to do once a dirty editor has been resolved through the
@@ -1760,15 +1763,22 @@ impl App {
         }
     }
 
-    /// Background-driven sync check, called every event-loop tick. When a
-    /// linked local file is open in the reader (and not being edited), kick off
-    /// a sync on first sight and then every [`SYNC_INTERVAL`]. Cheap: the file
-    /// read + parse only runs when a sync is actually due.
+    /// Background-driven check, called every event-loop tick. When a
+    /// HackMD-linked local file is freshly opened in the reader (and not being
+    /// edited), offer a one-shot prompt to pull upstream edits. There is
+    /// deliberately NO periodic re-poll: at 400 API calls/month on a Free
+    /// workspace, a 15s background poll drained a whole day's quota in ~3
+    /// minutes, so the fetch happens only if the user confirms. The file read +
+    /// parse runs once per newly-seen file, not every tick.
     pub fn maybe_sync(&mut self) {
-        if self.pending_sync || self.conflict.is_some() || !self.cloud.is_connected() {
+        if self.pending_sync
+            || self.conflict.is_some()
+            || self.prompt.is_some()
+            || !self.cloud.is_connected()
+        {
             return;
         }
-        // Only auto-sync a plain (non-edit) reader over a real file.
+        // Only a plain (non-edit) reader over a real file can sync.
         let path = match &self.view {
             View::Reader(r) if r.edit.is_none() => match &r.origin {
                 ReaderOrigin::File(p) => p.clone(),
@@ -1776,19 +1786,33 @@ impl App {
             },
             _ => return,
         };
-        let due = match &self.last_sync {
-            Some((p, t)) if *p == path => t.elapsed() >= SYNC_INTERVAL,
-            _ => true, // newly-opened file (or never synced) → sync now
-        };
-        if due {
-            self.sync_local_file(path);
+        // Act once per newly-seen file. `last_sync` marks the path already
+        // handled; with no periodic re-poll it never becomes "due" again while
+        // the same file stays open.
+        if matches!(&self.last_sync, Some((p, _)) if *p == path) {
+            return;
         }
+        self.last_sync = Some((path.clone(), std::time::Instant::now()));
+        // Read + parse to see whether it's actually a HackMD-linked note. Only
+        // a linked file has anything to fetch; an unlinked file is marked
+        // handled above and silently skipped (no prompt, no call).
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        if crate::tui::hackmd_meta::parse(&content).is_none() {
+            return;
+        }
+        self.prompt = Some(Prompt {
+            title: "Fetch latest from HackMD?".into(),
+            input: String::new(),
+            kind: PromptKind::ConfirmFetchUpdate { path },
+        });
     }
 
     /// Kick off a three-way sync for the linked file at `path`: fetch upstream,
     /// then merge when it lands (see [`Self::apply_sync`]). No-op for an
-    /// unlinked file or when disconnected. Records the trigger time so the
-    /// periodic poll backs off until [`SYNC_INTERVAL`] passes.
+    /// unlinked file or when disconnected. Records the path as handled so the
+    /// open-file check doesn't re-offer it.
     pub fn sync_local_file(&mut self, path: PathBuf) {
         if self.pending_sync || !self.cloud.is_connected() {
             return;
@@ -2212,6 +2236,11 @@ impl App {
             // via the generic Enter→commit path.
             PromptKind::ConfirmDiscardEdit { .. } => {}
             PromptKind::RecoverEdit { .. } => {}
+            PromptKind::ConfirmFetchUpdate { path } => {
+                // User accepted the one API call — pull upstream and merge.
+                self.status = "⟳ fetching from HackMD…".into();
+                self.sync_local_file(path);
+            }
             PromptKind::RenameFile { from } => {
                 let name = p.input.trim();
                 if name.is_empty() {
@@ -6624,6 +6653,114 @@ mod cloud_msg_tests {
     /// runtime. `apply_cloud_msg` is a pure state transition on top.
     fn test_app() -> App {
         App::new(Source::Stdin("local text".into()), opts()).expect("app")
+    }
+
+    /// A *connected* app: a live tokio runtime plus a client pointed at an
+    /// unroutable endpoint (no request is actually made in these tests). The
+    /// returned `Runtime` must outlive the app — dropping it staleness the
+    /// handle the cloud holds.
+    fn connected_app() -> (tokio::runtime::Runtime, App) {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        let client = crate::Client::with_endpoint("tok", "http://127.0.0.1:1/").expect("client");
+        let cloud = CloudContext::new(rt.handle().clone(), Some(client));
+        let app = App::with_cloud(Source::Stdin("x".into()), opts(), cloud).expect("app");
+        (rt, app)
+    }
+
+    fn open_file_reader(app: &mut App, path: &std::path::Path) {
+        app.view = View::Reader(Reader::from_file(path).expect("open reader"));
+        // Fresh file → not yet handled by the open-file sync check.
+        app.last_sync = None;
+    }
+
+    const LINKED_DOC: &str =
+        "<!-- hackmd-sync\nid: AbCdEf123\nurl: https://hackmd.io/AbCdEf123\n-->\n# hi\n";
+
+    /// Opening a HackMD-linked local file offers a confirm prompt and does NOT
+    /// spend an API call until the user accepts — this is the fix for the 15s
+    /// background poll that drained a Free workspace's 400/month quota.
+    #[test]
+    fn maybe_sync_prompts_before_fetching_linked_file() {
+        let (_rt, mut app) = connected_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, LINKED_DOC).unwrap();
+        open_file_reader(&mut app, &path);
+
+        app.maybe_sync();
+
+        assert!(
+            matches!(
+                app.prompt.as_ref().map(|p| &p.kind),
+                Some(PromptKind::ConfirmFetchUpdate { .. })
+            ),
+            "a linked file should offer a fetch confirmation on open"
+        );
+        assert!(
+            !app.pending_sync,
+            "no fetch may be in flight before the user confirms"
+        );
+    }
+
+    /// The prompt fires exactly once per open — the tick loop must not re-offer
+    /// it (nor re-poll) every 250ms.
+    #[test]
+    fn maybe_sync_does_not_re_prompt_same_file() {
+        let (_rt, mut app) = connected_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, LINKED_DOC).unwrap();
+        open_file_reader(&mut app, &path);
+
+        app.maybe_sync();
+        // Dismiss (user chose "keep local").
+        app.prompt = None;
+        app.maybe_sync();
+
+        assert!(
+            app.prompt.is_none(),
+            "a dismissed fetch prompt must not immediately reappear"
+        );
+    }
+
+    /// Accepting the prompt spends the call: `sync_local_file` runs and marks a
+    /// fetch in flight.
+    #[test]
+    fn confirming_fetch_prompt_kicks_off_sync() {
+        let (_rt, mut app) = connected_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, LINKED_DOC).unwrap();
+        open_file_reader(&mut app, &path);
+        app.maybe_sync();
+        let prompt = app.prompt.take().expect("prompt present");
+
+        app.commit_prompt(prompt);
+
+        assert!(
+            app.pending_sync,
+            "confirming should start the upstream fetch"
+        );
+    }
+
+    /// A plain local file with no HackMD block is silently skipped: no prompt,
+    /// no call, but marked handled so it isn't re-read every tick.
+    #[test]
+    fn maybe_sync_skips_unlinked_file() {
+        let (_rt, mut app) = connected_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.md");
+        std::fs::write(&path, "# just a local note\n").unwrap();
+        open_file_reader(&mut app, &path);
+
+        app.maybe_sync();
+
+        assert!(app.prompt.is_none(), "unlinked file must not prompt");
+        assert!(!app.pending_sync, "unlinked file must not fetch");
+        assert!(
+            matches!(&app.last_sync, Some((p, _)) if *p == path),
+            "unlinked file should still be marked handled"
+        );
     }
 
     fn note(id: &str, title: &str, content: &str) -> SingleNote {
