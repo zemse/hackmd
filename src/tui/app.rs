@@ -1862,12 +1862,17 @@ impl App {
         // while the local file is `\n`, and `merge3` compares exact strings —
         // a mismatch would surface every line as a spurious whole-file
         // conflict on the first sync.
+        // `normalize_for_merge` reconciles both CRLF *and* the trailing-newline
+        // mismatch between HackMD content (no trailing `\n`) and `strip` (which
+        // forces one): without it an otherwise-identical first sync differs by
+        // that lone newline and, with no cached base, blows up into a spurious
+        // whole-file conflict.
         let local_clean =
-            crate::tui::sync::normalize_newlines(&crate::tui::hackmd_meta::strip(&local_raw));
-        let remote = crate::tui::sync::normalize_newlines(&remote);
+            crate::tui::sync::normalize_for_merge(&crate::tui::hackmd_meta::strip(&local_raw));
+        let remote = crate::tui::sync::normalize_for_merge(&remote);
         // Missing base → treat as empty so nothing is silently dropped: equal
         // sides still merge clean, differing sides surface as a conflict.
-        let base = crate::tui::sync::normalize_newlines(
+        let base = crate::tui::sync::normalize_for_merge(
             &crate::tui::sync::read_base(&self.root, &id, &path).unwrap_or_default(),
         );
         match crate::tui::sync::merge3(&base, &local_clean, &remote) {

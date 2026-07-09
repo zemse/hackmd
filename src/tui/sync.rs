@@ -92,6 +92,27 @@ pub fn normalize_newlines(s: &str) -> String {
     }
 }
 
+/// Prepare a string for three-way merge comparison: [`normalize_newlines`] plus
+/// a single trailing newline on non-empty content.
+///
+/// HackMD stores note content with **no** trailing newline, while
+/// [`crate::tui::hackmd_meta::strip`] always forces exactly one. Left
+/// unreconciled, the two sides of an otherwise-identical first sync differ by
+/// that lone newline, so [`merge3`]'s `local == remote` fast path misses and
+/// (with no cached base) the whole file explodes into a spurious conflict.
+/// Collapsing trailing newlines to exactly one on both sides — matching
+/// `strip`'s own contract — makes identical text compare equal. Empty input
+/// (an absent base) stays empty so the "nothing silently dropped" semantics of
+/// an empty ancestor are preserved.
+pub fn normalize_for_merge(s: &str) -> String {
+    let lf = normalize_newlines(s);
+    if lf.is_empty() {
+        return lf;
+    }
+    let core = lf.trim_end_matches('\n');
+    format!("{core}\n")
+}
+
 /// One piece of a (possibly conflicted) merged document, in document order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Segment {
@@ -263,6 +284,37 @@ mod tests {
             merge3("", &local_n, &remote_n),
             MergeOutcome::Clean(local.into())
         );
+    }
+
+    #[test]
+    fn trailing_newline_only_diff_merges_clean() {
+        // The bug: HackMD stores content with no trailing newline, while
+        // `hackmd_meta::strip` forces exactly one. With no cached base a first
+        // sync of otherwise-identical text `merge3("", "x\n", "x")` conflicts
+        // over that lone newline. `normalize_for_merge` reconciles both sides.
+        let remote_no_nl = "# Title\n\nbody line"; // as HackMD returns it
+        let local_stripped = "# Title\n\nbody line\n"; // as `strip` produces it
+        assert_ne!(remote_no_nl, local_stripped);
+        // Raw, with an empty base, this is the spurious whole-file conflict.
+        assert!(matches!(
+            merge3("", local_stripped, remote_no_nl),
+            MergeOutcome::Conflict { .. }
+        ));
+        // Normalised, both collapse to one trailing newline and merge clean.
+        let l = normalize_for_merge(local_stripped);
+        let r = normalize_for_merge(remote_no_nl);
+        assert_eq!(l, r);
+        assert_eq!(merge3("", &l, &r), MergeOutcome::Clean(l.clone()));
+    }
+
+    #[test]
+    fn normalize_for_merge_collapses_trailing_and_keeps_empty() {
+        assert_eq!(normalize_for_merge("x"), "x\n");
+        assert_eq!(normalize_for_merge("x\n"), "x\n");
+        assert_eq!(normalize_for_merge("x\n\n\n"), "x\n");
+        assert_eq!(normalize_for_merge("x\r\n"), "x\n");
+        // An absent base stays empty so empty-ancestor semantics are preserved.
+        assert_eq!(normalize_for_merge(""), "");
     }
 
     #[test]
