@@ -27,10 +27,13 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
         // Detect external edits to the open file. One stat syscall per tick
         // (≤4/sec when idle, served from the kernel inode cache) — far
         // cheaper than a notification thread, and zero new dependencies.
-        app.poll_external_change();
+        let ext_changed = app.poll_external_change();
         // Same idea for the browser: one stat of the listed directory per tick
         // picks up files added/removed/renamed in it without a watcher thread.
-        app.poll_browser_change();
+        let dir_changed = app.poll_browser_change();
+        // Refresh the uncommitted-file cache when something on disk moved, or
+        // on a TTL backstop; drives the browser `[uncommitted]` badge.
+        app.poll_git_status(ext_changed || dir_changed);
         // Apply any cloud operations that finished since the last tick.
         app.drain_cloud_msgs();
         // HackMD sync for a linked, open local file: on first sight, offer a
@@ -121,6 +124,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // The conflict resolver is a full-screen modal — it captures all keys.
     if app.conflict.is_some() {
         return handle_conflict_key(app, key);
+    }
+    // The commit screen is a full-screen modal — it captures all keys.
+    if app.commit.is_some() {
+        return handle_commit_key(app, key);
     }
     // Modal prompt (new note / push / download / delete confirm) captures
     // all keys while open.
@@ -288,6 +295,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         // where plain `H` keeps its vim viewport meaning).
         if let KeyCode::Char('h') = key.code {
             app.toggle_cloud_mode();
+            app.count_prefix = None;
+            return Ok(());
+        }
+        // `gc` — git commit. Opens the commit screen for the current file /
+        // folder / repo (no-op with a hint outside a repo or when clean).
+        if let KeyCode::Char('c') = key.code {
+            app.open_commit();
             app.count_prefix = None;
             return Ok(());
         }
@@ -1513,6 +1527,89 @@ fn handle_conflict_key(app: &mut App, key: KeyEvent) -> Result<()> {
             app.status = "Conflict resolution cancelled".into();
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// Keystrokes while the git commit screen is open. Two focus panes:
+///
+/// - **List**: `j`/`k` (and arrows) move the cursor, `space` toggles whether
+///   the file is committed, `a` toggles all, `Tab`/`i`/Enter jump to the
+///   message box.
+/// - **Message**: printable keys type the commit message, `Enter` commits
+///   (needs ≥1 file and a non-empty message), `Tab` returns to the list.
+///
+/// `Esc` cancels from either pane; Ctrl-C quits the app.
+fn handle_commit_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    use crate::tui::app::CommitFocus;
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if key.code == KeyCode::Char('c') && ctrl {
+        app.should_quit = true;
+        return Ok(());
+    }
+    if key.code == KeyCode::Esc {
+        app.commit = None;
+        app.status = "Commit cancelled".into();
+        return Ok(());
+    }
+
+    let focus = match app.commit.as_ref() {
+        Some(st) => st.focus,
+        None => return Ok(()),
+    };
+    match focus {
+        CommitFocus::List => {
+            let Some(st) = app.commit.as_mut() else {
+                return Ok(());
+            };
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => st.step(1),
+                KeyCode::Char('k') | KeyCode::Up => st.step(-1),
+                KeyCode::PageDown => st.step(10),
+                KeyCode::PageUp => st.step(-10),
+                KeyCode::Char(' ') => {
+                    if let Some(f) = st.files.get_mut(st.selected) {
+                        f.include = !f.include;
+                    }
+                }
+                KeyCode::Char('a') => {
+                    // Toggle all: if everything's already checked, clear;
+                    // otherwise check everything.
+                    let all_on = st.files.iter().all(|f| f.include);
+                    for f in &mut st.files {
+                        f.include = !all_on;
+                    }
+                }
+                KeyCode::Tab | KeyCode::Char('i') | KeyCode::Enter => {
+                    st.focus = CommitFocus::Message;
+                }
+                _ => {}
+            }
+        }
+        CommitFocus::Message => match key.code {
+            KeyCode::Enter => app.do_commit(),
+            KeyCode::Tab => {
+                if let Some(st) = app.commit.as_mut() {
+                    st.focus = CommitFocus::List;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(st) = app.commit.as_mut() {
+                    st.message.pop();
+                }
+            }
+            KeyCode::Char('u') if ctrl => {
+                if let Some(st) = app.commit.as_mut() {
+                    st.message.clear();
+                }
+            }
+            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
+                if let Some(st) = app.commit.as_mut() {
+                    st.message.push(c);
+                }
+            }
+            _ => {}
+        },
     }
     Ok(())
 }

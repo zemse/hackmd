@@ -70,6 +70,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_conflict(f, app, area);
         return;
     }
+    // The commit screen is a full-screen modal too.
+    if app.commit.is_some() {
+        draw_commit(f, app, area);
+        return;
+    }
 
     // Reserve 1 column on the right for the reader scrollbar so layout stays
     // stable whether or not content overflows. Browser ignores this width.
@@ -1320,6 +1325,9 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     let badge_style = Style::default()
         .fg(theme.heading[3])
         .add_modifier(Modifier::BOLD);
+    // `[uncommitted]` uses the link colour to read as "action available here"
+    // and to stay visually distinct from the bold `[unread]` badge.
+    let uncommitted_style = Style::default().fg(theme.link).add_modifier(Modifier::BOLD);
     // Selection is styled by hand (no `ListState` selection): the wheel
     // scrolls the viewport independently of the cursor, and ratatui's List
     // would otherwise snap the offset back to keep the selection visible.
@@ -1347,6 +1355,14 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
             };
             if unread {
                 spans.push(Span::styled(" [unread]", badge_style));
+            }
+            let uncommitted = match e.kind {
+                BrowserEntryKind::Markdown => app.git_status.is_uncommitted(&e.path),
+                BrowserEntryKind::Dir => app.git_status.dir_has_uncommitted(&e.path),
+                BrowserEntryKind::ParentDir => false,
+            };
+            if uncommitted {
+                spans.push(Span::styled(" [uncommitted]", uncommitted_style));
             }
             // Right-aligned last-modified column. Skipped for `../` (no mtime)
             // and when the name leaves no room, so a long filename is never
@@ -2444,6 +2460,142 @@ fn draw_conflict(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// Full-screen git commit screen: a scrollable, per-file check list (path on
+/// the left, `+adds -dels` on the right) with a commit-message box at the
+/// bottom. Mirrors the conflict resolver's layout / scroll math.
+fn draw_commit(f: &mut Frame, app: &App, area: Rect) {
+    let Some(st) = app.commit.as_ref() else {
+        return;
+    };
+    let theme = &app.opts.theme;
+    let list_focused = st.focus == app::CommitFocus::List;
+    let msg_focused = st.focus == app::CommitFocus::Message;
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Min(1),    // file list
+            Constraint::Length(1), // message label
+            Constraint::Length(1), // message input
+            Constraint::Length(1), // hint
+        ])
+        .split(area);
+    let (title_area, list_area, msg_label_area, msg_area, hint_area) =
+        (chunks[0], chunks[1], chunks[2], chunks[3], chunks[4]);
+
+    // Title: repo name + selected / total counts.
+    let repo = st
+        .root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+    let title = format!(
+        " Commit — {}/{} file(s) selected  ({repo}) ",
+        st.included_count(),
+        st.files.len()
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.heading[0])
+                .add_modifier(Modifier::BOLD),
+        ))),
+        title_area,
+    );
+
+    // File list. Each row: `▶ [x] path/to/file.md        +12 -3`.
+    let inner_w = list_area.width as usize;
+    let hl = Style::default()
+        .bg(theme.status_bg)
+        .fg(theme.status_fg)
+        .add_modifier(Modifier::BOLD);
+    let add_style = Style::default().fg(Color::Rgb(0x5a, 0xb0, 0x5a));
+    let del_style = Style::default().fg(Color::Rgb(0xd0, 0x60, 0x60));
+    let rows: Vec<Line> = st
+        .files
+        .iter()
+        .enumerate()
+        .map(|(i, file)| {
+            let selected = list_focused && i == st.selected;
+            let marker = if selected { "▶ " } else { "  " };
+            let check = if file.include { "[x] " } else { "[ ] " };
+            let path_style = if file.include {
+                Style::default().fg(theme.fg)
+            } else {
+                Style::default().fg(theme.muted)
+            };
+            let mut spans = vec![
+                Span::styled(marker, Style::default().fg(theme.muted)),
+                Span::styled(check, path_style),
+                Span::styled(file.rel.clone(), path_style),
+            ];
+            // Right-aligned `+a -d` column.
+            let counts = format!("+{} -{}", file.added, file.removed);
+            let left_w: usize = spans
+                .iter()
+                .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+                .sum();
+            let counts_w = UnicodeWidthStr::width(counts.as_str());
+            if left_w + 1 + counts_w <= inner_w {
+                spans.push(Span::raw(" ".repeat(inner_w - left_w - counts_w)));
+                spans.push(Span::styled(format!("+{}", file.added), add_style));
+                spans.push(Span::raw(" "));
+                spans.push(Span::styled(format!("-{}", file.removed), del_style));
+            }
+            // Full-row highlight for the cursor row (mirrors `list_row`).
+            let mut line = Line::from(spans);
+            if selected {
+                for s in &mut line.spans {
+                    s.style = hl;
+                }
+                line.style = hl;
+            }
+            line
+        })
+        .collect();
+
+    // Keep the cursor row in view (upper third), same math as the conflict
+    // view — so tabbing to the message box leaves the list where it was.
+    let h = list_area.height as usize;
+    let max_scroll = rows.len().saturating_sub(h.max(1));
+    let scroll = st.selected.saturating_sub(h / 3).min(max_scroll);
+    f.render_widget(Paragraph::new(rows).scroll((scroll as u16, 0)), list_area);
+
+    // Message label.
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " Commit message:",
+            Style::default().fg(theme.muted),
+        ))),
+        msg_label_area,
+    );
+    // Message input line, cursor shown only when the box has focus.
+    let mut msg_spans = vec![
+        Span::styled(" ▸ ", Style::default().fg(theme.heading[3])),
+        Span::raw(st.message.clone()),
+    ];
+    if msg_focused {
+        msg_spans.push(Span::styled("█", Style::default().fg(theme.fg)));
+    }
+    f.render_widget(Paragraph::new(Line::from(msg_spans)), msg_area);
+
+    // Context-aware hint.
+    let hint = if list_focused {
+        " j/k move   Space toggle   a all   Tab/i → message   Esc cancel "
+    } else {
+        " type message   Enter commit   Tab → files   Ctrl-U clear   Esc cancel "
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(theme.heading[1]),
+        ))),
+        hint_area,
+    );
+}
+
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     let w = 66.min(area.width.saturating_sub(4));
     let h = 42.min(area.height.saturating_sub(4));
@@ -2507,6 +2659,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from("                   pushes up on save; asks before fetching on open"),
         Line::from("  conflicts        l:local u:upstream b:both n:drop Enter:apply"),
         Line::from("  Ctrl-G           git lens (diff vs HEAD; staged + unstaged)"),
+        Line::from("  gc               git commit (file / folder / repo; Space picks)"),
         Line::from("  r                mark read (browser; dirs recurse)"),
         Line::from(""),
         section(if app.cloud.is_connected() {
@@ -2649,5 +2802,59 @@ mod tests {
             Mid::Status(s) => assert_eq!(s, "Copied: something"),
             other => panic!("expected status, got {:?}", other),
         }
+    }
+
+    // The commit screen renders its title, the file rows (path + counts) and
+    // the message box without panicking, and takes over the whole frame.
+    #[test]
+    fn commit_screen_renders_files_and_message() {
+        use crate::tui::app::{CommitFile, CommitFocus, CommitState};
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with_link();
+        app.commit = Some(CommitState {
+            root: std::path::PathBuf::from("/tmp/myrepo"),
+            files: vec![
+                CommitFile {
+                    path: "/tmp/myrepo/alpha.md".into(),
+                    rel: "alpha.md".into(),
+                    added: 3,
+                    removed: 1,
+                    include: true,
+                },
+                CommitFile {
+                    path: "/tmp/myrepo/notes/beta.md".into(),
+                    rel: "notes/beta.md".into(),
+                    added: 0,
+                    removed: 0,
+                    include: false,
+                },
+            ],
+            selected: 0,
+            message: "wip".into(),
+            focus: CommitFocus::Message,
+        });
+
+        let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        // Flatten the buffer into text and assert the key pieces are present.
+        let buf = term.backend().buffer().clone();
+        let mut text = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                text.push_str(buf[(x, y)].symbol());
+            }
+            text.push('\n');
+        }
+        assert!(text.contains("Commit"), "title missing:\n{text}");
+        assert!(text.contains("alpha.md"), "checked file missing:\n{text}");
+        assert!(
+            text.contains("notes/beta.md"),
+            "second file missing:\n{text}"
+        );
+        assert!(text.contains("[x]"), "checkbox state missing:\n{text}");
+        assert!(text.contains("+3"), "additions column missing:\n{text}");
+        assert!(text.contains("wip"), "commit message missing:\n{text}");
     }
 }

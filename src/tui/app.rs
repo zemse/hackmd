@@ -173,6 +173,11 @@ pub struct App {
     /// `Some(message)` while a blocking error modal is shown (e.g. trying to
     /// open a file that isn't valid UTF-8). Dismissed by the next keypress.
     pub error: Option<String>,
+    /// Cached uncommitted-file set for the repo the browser / reader is in.
+    /// Drives the `[uncommitted]` browser badge and seeds the commit screen.
+    pub git_status: crate::tui::git::GitStatus,
+    /// `Some` while the git commit screen is open. `None` otherwise.
+    pub commit: Option<CommitState>,
 }
 
 /// In-TUI dictionary-definition popover, opened by double-clicking a word in
@@ -593,6 +598,92 @@ impl Selection {
     }
 }
 
+/// Git commit screen (`gc`): a full-screen modal listing the repo's
+/// uncommitted files with a per-file include toggle and +/- line counts,
+/// plus a commit-message input at the bottom. Files whose changes the user
+/// wants to commit are checked; the rest are shown but excluded.
+pub struct CommitState {
+    /// Worktree root the commit runs against.
+    pub root: PathBuf,
+    /// Every uncommitted file in the repo, sorted by path.
+    pub files: Vec<CommitFile>,
+    /// Cursor row within `files` (which entry `space` toggles). The list
+    /// scrolls to keep this row in view; there's no separate scroll offset.
+    pub selected: usize,
+    /// The commit message being typed.
+    pub message: String,
+    /// Which pane has keyboard focus (the file list or the message box).
+    pub focus: CommitFocus,
+}
+
+/// One row in the commit screen's file list.
+pub struct CommitFile {
+    /// Absolute path (what `git` is invoked with).
+    pub path: PathBuf,
+    /// Path relative to `root`, for display.
+    pub rel: String,
+    /// Added / removed line counts vs HEAD (untracked: whole file added).
+    pub added: usize,
+    pub removed: usize,
+    /// Whether this file will be committed.
+    pub include: bool,
+}
+
+/// Focus target within the commit screen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitFocus {
+    List,
+    Message,
+}
+
+/// Which uncommitted paths to pre-check when the commit screen opens, derived
+/// from the selection that triggered it.
+enum CommitScope {
+    /// A single file (open in the reader, or selected in the browser).
+    File(PathBuf),
+    /// Every uncommitted file under this directory.
+    Dir(PathBuf),
+    /// No preselection (nothing checked initially).
+    None,
+}
+
+impl CommitScope {
+    /// Whether an uncommitted file falls in this scope.
+    fn contains(&self, path: &Path) -> bool {
+        match self {
+            CommitScope::File(f) => path == f,
+            CommitScope::Dir(d) => path.starts_with(d),
+            CommitScope::None => false,
+        }
+    }
+}
+
+impl CommitState {
+    /// Number of files currently checked for inclusion.
+    pub fn included_count(&self) -> usize {
+        self.files.iter().filter(|f| f.include).count()
+    }
+
+    /// Absolute paths of every checked file.
+    pub fn included_paths(&self) -> Vec<PathBuf> {
+        self.files
+            .iter()
+            .filter(|f| f.include)
+            .map(|f| f.path.clone())
+            .collect()
+    }
+
+    /// Move the list cursor by `delta`, clamped to the list bounds.
+    pub fn step(&mut self, delta: i32) {
+        if self.files.is_empty() {
+            return;
+        }
+        let last = self.files.len() as i32 - 1;
+        let next = (self.selected as i32 + delta).clamp(0, last);
+        self.selected = next as usize;
+    }
+}
+
 /// Pre-parsed `git diff HEAD -- <file>` content. Each entry is a single
 /// display row tagged with how it should be styled. We deliberately keep
 /// the parser tiny and tolerant — the goal is a quick visual lens, not a
@@ -924,6 +1015,8 @@ impl App {
             edit_cmd_nav: None,
             lookup: None,
             error: None,
+            git_status: crate::tui::git::GitStatus::default(),
+            commit: None,
         };
         app.offer_recovery_for_current();
         Ok(app)
@@ -2640,6 +2733,142 @@ impl App {
         }
     }
 
+    /// The filesystem path the git status/commit context is anchored to: the
+    /// open file in the Reader, or the current directory in the Browser. `None`
+    /// for stdin, cloud notes, or the cloud browser.
+    pub fn git_anchor(&self) -> Option<PathBuf> {
+        match &self.view {
+            View::Reader(r) => match &r.origin {
+                ReaderOrigin::File(p) => Some(p.clone()),
+                ReaderOrigin::Stdin | ReaderOrigin::CloudNote { .. } => None,
+            },
+            View::Browser(b) => Some(b.dir.clone()),
+            View::Cloud(_) => None,
+        }
+    }
+
+    /// Refresh the cached git status against the current view's anchor. Called
+    /// eagerly on navigation, save and commit.
+    pub fn refresh_git_status(&mut self) {
+        let anchor = self.git_anchor();
+        self.git_status.refresh(anchor.as_deref());
+    }
+
+    /// TTL-gated git-status refresh for the tick loop. `changed` forces a
+    /// rebuild (something on disk moved); otherwise it only rebuilds when the
+    /// cache has gone stale.
+    pub fn poll_git_status(&mut self, changed: bool) {
+        let anchor = self.git_anchor();
+        self.git_status.poll(anchor.as_deref(), changed);
+    }
+
+    /// Open the git commit screen (`gc`). Lists every uncommitted file in the
+    /// repo, pre-checking the ones in the current selection's scope: the open
+    /// file (Reader), the selected file, or every uncommitted file under the
+    /// selected directory (Browser). Refuses to open outside a repo or when
+    /// there's nothing to commit.
+    pub fn open_commit(&mut self) {
+        // Only from a local file view or the file browser.
+        let anchor = match self.git_anchor() {
+            Some(a) => a,
+            None => {
+                self.status = "Commit needs a local file or folder".into();
+                return;
+            }
+        };
+        self.git_status.refresh(Some(&anchor));
+        let Some(root) = self.git_status.root.clone() else {
+            self.status = "Not a git repository".into();
+            return;
+        };
+        let uncommitted = self.git_status.sorted_files();
+        if uncommitted.is_empty() {
+            self.status = "Nothing to commit — working tree clean".into();
+            return;
+        }
+
+        // Which paths should start checked, based on the current selection.
+        let scope: CommitScope = match &self.view {
+            View::Reader(r) => match &r.origin {
+                ReaderOrigin::File(p) => CommitScope::File(p.clone()),
+                _ => CommitScope::None,
+            },
+            View::Browser(b) => match b.entries.get(b.selected) {
+                Some(e) if matches!(e.kind, BrowserEntryKind::Markdown) => {
+                    CommitScope::File(e.path.clone())
+                }
+                Some(e) if matches!(e.kind, BrowserEntryKind::Dir) => {
+                    CommitScope::Dir(e.path.clone())
+                }
+                // `../` selected or empty dir: scope to the current directory.
+                _ => CommitScope::Dir(b.dir.clone()),
+            },
+            View::Cloud(_) => CommitScope::None,
+        };
+
+        let stats = crate::tui::git::numstat(&root, &uncommitted);
+        let files: Vec<CommitFile> = uncommitted
+            .iter()
+            .map(|p| {
+                let rel = p
+                    .strip_prefix(&root)
+                    .unwrap_or(p)
+                    .to_string_lossy()
+                    .into_owned();
+                let (added, removed) = stats.get(p).copied().unwrap_or((0, 0));
+                CommitFile {
+                    include: scope.contains(p),
+                    path: p.clone(),
+                    rel,
+                    added,
+                    removed,
+                }
+            })
+            .collect();
+
+        // Land the cursor on the first checked file so the eye starts on the
+        // scoped selection rather than the top of the repo-wide list.
+        let selected = files.iter().position(|f| f.include).unwrap_or(0);
+        self.commit = Some(CommitState {
+            root,
+            files,
+            selected,
+            message: String::new(),
+            focus: CommitFocus::Message,
+        });
+    }
+
+    /// Execute the commit from the open commit screen. Requires a non-empty
+    /// message and at least one checked file; surfaces the outcome (short git
+    /// summary, or the error) on the statusline and closes the screen on
+    /// success.
+    pub fn do_commit(&mut self) {
+        let Some(st) = self.commit.as_ref() else {
+            return;
+        };
+        let paths = st.included_paths();
+        if paths.is_empty() {
+            self.status = "Select at least one file to commit (space)".into();
+            return;
+        }
+        let message = st.message.trim().to_string();
+        if message.is_empty() {
+            self.status = "Enter a commit message".into();
+            return;
+        }
+        let root = st.root.clone();
+        match crate::tui::git::commit(&root, &paths, &message) {
+            Ok(summary) => {
+                self.commit = None;
+                self.refresh_git_status();
+                self.status = summary;
+            }
+            Err(e) => {
+                self.status = e;
+            }
+        }
+    }
+
     /// Open the table-of-contents overlay (`t` in the Reader). Pre-selects
     /// the heading the viewport currently sits in so Enter is a no-op-ish
     /// "stay here" and j/k move relative to the reading position.
@@ -3841,6 +4070,9 @@ impl App {
             self.last_sync = None;
             self.sync_local_file(path);
         }
+        // A save changes the working tree — refresh so the `[uncommitted]`
+        // badge is accurate the moment the user returns to the browser.
+        self.refresh_git_status();
         Ok(())
     }
 

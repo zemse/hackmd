@@ -9,6 +9,7 @@ pub mod app;
 pub mod cloud;
 mod dict;
 pub mod events;
+pub mod git;
 pub mod hackmd_meta;
 mod jsonl;
 mod links;

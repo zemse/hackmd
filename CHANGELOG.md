@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Git commit from the TUI** — uncommitted files (modified, added, deleted,
+  untracked, renamed) now carry an `[uncommitted]` badge in the browser, on
+  both files and the folders containing them. Press `gc` on an open file, a
+  selected file, or a selected folder to open a commit screen: it lists every
+  uncommitted file in the repo with per-file `+adds -dels` counts, pre-checks
+  the ones in the current selection's scope, and scrolls when the list
+  overflows. `Space` toggles a file, `a` toggles all, `Tab` moves between the
+  file list and the message box, `Enter` commits the checked files, `Esc`
+  cancels. Commits touch only the checked paths, leaving other changes
+  untouched.
+
 ## 0.1.0 (2026-06-25)
 
 The md-tui merge: one crate now ships the HackMD SDK/CLI **and** a full
