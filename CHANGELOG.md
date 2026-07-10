@@ -12,8 +12,9 @@
   the ones in the current selection's scope, and scrolls when the list
   overflows. `Space` toggles a file, `a` toggles all, `Tab` moves between the
   file list and the message box, `Enter` commits the checked files, `Esc`
-  cancels. Commits touch only the checked paths, leaving other changes
-  untouched.
+  cancels. The message box is multi-line: `Shift+Enter` (or `Alt+Enter` where
+  the terminal can't report Shift+Enter) inserts a newline and the box grows to
+  fit. Commits touch only the checked paths, leaving other changes untouched.
 
 ## 0.1.0 (2026-06-25)
 

@@ -1,10 +1,14 @@
 use std::io::{self, Stdout};
 
 use anyhow::Result;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::Frame;
 use ratatui::Terminal;
@@ -25,6 +29,16 @@ pub fn setup_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Ask the terminal to disambiguate modified keys (kitty keyboard protocol)
+    // so combinations like Shift+Enter are reported distinctly — needed for
+    // multi-line commit messages. Legacy terminals collapse Shift+Enter into a
+    // plain Enter, so this is best-effort and only pushed where supported.
+    if matches!(supports_keyboard_enhancement(), Ok(true)) {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
     let backend = CrosstermBackend::new(stdout);
     let term = Terminal::new(backend)?;
     Ok(term)
@@ -32,6 +46,7 @@ pub fn setup_terminal() -> Result<Term> {
 
 pub fn restore_terminal(term: &mut Term) -> Result<()> {
     disable_raw_mode()?;
+    let _ = execute!(term.backend_mut(), PopKeyboardEnhancementFlags);
     execute!(
         term.backend_mut(),
         LeaveAlternateScreen,
@@ -45,6 +60,7 @@ pub fn restore_terminal(term: &mut Term) -> Result<()> {
 pub fn restore_raw() -> Result<()> {
     let _ = disable_raw_mode();
     let mut out = io::stdout();
+    let _ = execute!(out, PopKeyboardEnhancementFlags);
     let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture);
     Ok(())
 }
@@ -2471,14 +2487,20 @@ fn draw_commit(f: &mut Frame, app: &App, area: Rect) {
     let list_focused = st.focus == app::CommitFocus::List;
     let msg_focused = st.focus == app::CommitFocus::Message;
 
+    // The message box grows with its content (Shift+Enter adds lines), up to a
+    // cap; beyond that it scrolls internally so the file list keeps a floor.
+    const MAX_MSG_ROWS: u16 = 8;
+    let msg_line_count = st.message.split('\n').count() as u16;
+    let msg_rows = msg_line_count.clamp(1, MAX_MSG_ROWS);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title
-            Constraint::Min(1),    // file list
-            Constraint::Length(1), // message label
-            Constraint::Length(1), // message input
-            Constraint::Length(1), // hint
+            Constraint::Length(1),        // title
+            Constraint::Min(1),           // file list
+            Constraint::Length(1),        // message label
+            Constraint::Length(msg_rows), // message input (grows with content)
+            Constraint::Length(1),        // hint
         ])
         .split(area);
     let (title_area, list_area, msg_label_area, msg_area, hint_area) =
@@ -2571,21 +2593,38 @@ fn draw_commit(f: &mut Frame, app: &App, area: Rect) {
         ))),
         msg_label_area,
     );
-    // Message input line, cursor shown only when the box has focus.
-    let mut msg_spans = vec![
-        Span::styled(" ▸ ", Style::default().fg(theme.heading[3])),
-        Span::raw(st.message.clone()),
-    ];
-    if msg_focused {
-        msg_spans.push(Span::styled("█", Style::default().fg(theme.fg)));
-    }
-    f.render_widget(Paragraph::new(Line::from(msg_spans)), msg_area);
+    // Message box: one display line per message line, `▸ ` gutter on the
+    // first, aligned indent on continuations. The cursor block sits at the end
+    // of the last line when the box has focus.
+    // `split('\n')` always yields at least one element (the empty string), so
+    // an empty message still renders one cursor row.
+    let msg_lines: Vec<&str> = st.message.split('\n').collect();
+    let last = msg_lines.len() - 1;
+    let msg_display: Vec<Line> = msg_lines
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let gutter = if i == 0 { " ▸ " } else { "   " };
+            let mut spans = vec![
+                Span::styled(gutter, Style::default().fg(theme.heading[3])),
+                Span::raw((*text).to_string()),
+            ];
+            if msg_focused && i == last {
+                spans.push(Span::styled("█", Style::default().fg(theme.fg)));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    // When the message outgrows the box, scroll so the last (cursor) line stays
+    // visible.
+    let overflow = (msg_display.len() as u16).saturating_sub(msg_area.height);
+    f.render_widget(Paragraph::new(msg_display).scroll((overflow, 0)), msg_area);
 
     // Context-aware hint.
     let hint = if list_focused {
         " j/k move   Space toggle   a all   Tab/i → message   Esc cancel "
     } else {
-        " type message   Enter commit   Tab → files   Ctrl-U clear   Esc cancel "
+        " Enter commit   Shift+Enter newline   Tab → files   Ctrl-U clear   Esc cancel "
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -2856,5 +2895,51 @@ mod tests {
         assert!(text.contains("[x]"), "checkbox state missing:\n{text}");
         assert!(text.contains("+3"), "additions column missing:\n{text}");
         assert!(text.contains("wip"), "commit message missing:\n{text}");
+    }
+
+    // A multi-line commit message grows the message box so every line is
+    // visible (Shift+Enter produced the newline).
+    #[test]
+    fn commit_screen_renders_multiline_message() {
+        use crate::tui::app::{CommitFile, CommitFocus, CommitState};
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with_link();
+        app.commit = Some(CommitState {
+            root: std::path::PathBuf::from("/tmp/myrepo"),
+            files: vec![CommitFile {
+                path: "/tmp/myrepo/alpha.md".into(),
+                rel: "alpha.md".into(),
+                added: 1,
+                removed: 0,
+                include: true,
+            }],
+            selected: 0,
+            message: "summary line\n\nbody paragraph here".into(),
+            focus: CommitFocus::Message,
+        });
+
+        let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        let buf = term.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        let has = |needle: &str| rows.iter().any(|r| r.contains(needle));
+        assert!(has("summary line"), "first message line missing");
+        assert!(has("body paragraph here"), "body message line missing");
+        // The two message lines must land on different rows (box expanded).
+        let summary_row = rows.iter().position(|r| r.contains("summary line"));
+        let body_row = rows.iter().position(|r| r.contains("body paragraph here"));
+        assert!(summary_row.is_some() && body_row.is_some());
+        assert!(
+            summary_row != body_row,
+            "message lines should render on separate rows"
+        );
     }
 }

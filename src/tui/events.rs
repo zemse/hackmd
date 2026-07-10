@@ -1586,30 +1586,41 @@ fn handle_commit_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 _ => {}
             }
         }
-        CommitFocus::Message => match key.code {
-            KeyCode::Enter => app.do_commit(),
-            KeyCode::Tab => {
-                if let Some(st) = app.commit.as_mut() {
-                    st.focus = CommitFocus::List;
+        CommitFocus::Message => {
+            let alt = key.modifiers.contains(KeyModifiers::ALT);
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            match key.code {
+                // Shift+Enter (or Alt+Enter on terminals that can't report
+                // Shift+Enter) inserts a newline; plain Enter commits.
+                KeyCode::Enter if shift || alt => {
+                    if let Some(st) = app.commit.as_mut() {
+                        st.message.push('\n');
+                    }
                 }
-            }
-            KeyCode::Backspace => {
-                if let Some(st) = app.commit.as_mut() {
-                    st.message.pop();
+                KeyCode::Enter => app.do_commit(),
+                KeyCode::Tab => {
+                    if let Some(st) = app.commit.as_mut() {
+                        st.focus = CommitFocus::List;
+                    }
                 }
-            }
-            KeyCode::Char('u') if ctrl => {
-                if let Some(st) = app.commit.as_mut() {
-                    st.message.clear();
+                KeyCode::Backspace => {
+                    if let Some(st) = app.commit.as_mut() {
+                        st.message.pop();
+                    }
                 }
-            }
-            KeyCode::Char(c) if !ctrl && !key.modifiers.contains(KeyModifiers::ALT) => {
-                if let Some(st) = app.commit.as_mut() {
-                    st.message.push(c);
+                KeyCode::Char('u') if ctrl => {
+                    if let Some(st) = app.commit.as_mut() {
+                        st.message.clear();
+                    }
                 }
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    if let Some(st) = app.commit.as_mut() {
+                        st.message.push(c);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        },
+        }
     }
     Ok(())
 }
@@ -3785,6 +3796,50 @@ mod keybind_tests {
         press(&mut app, KeyCode::Char('g'));
         press(&mut app, KeyCode::Char('g'));
         assert!(reader_focus(&app).is_none());
+    }
+
+    // In the commit message box, printable keys type; Shift+Enter inserts a
+    // newline (so the message can be multi-line); plain Enter does NOT add a
+    // newline (it attempts the commit instead).
+    #[test]
+    fn commit_message_shift_enter_inserts_newline() {
+        use crate::tui::app::{CommitFile, CommitFocus, CommitState};
+
+        let mut app = app_with_headings("commit-msg");
+        app.commit = Some(CommitState {
+            root: std::path::PathBuf::from("/tmp/does-not-exist-repo"),
+            files: vec![CommitFile {
+                path: "/tmp/does-not-exist-repo/a.md".into(),
+                rel: "a.md".into(),
+                added: 1,
+                removed: 0,
+                include: true,
+            }],
+            selected: 0,
+            message: String::new(),
+            focus: CommitFocus::Message,
+        });
+
+        let press_mod = |app: &mut App, code: KeyCode, mods: KeyModifiers| {
+            handle_key(app, KeyEvent::new(code, mods)).unwrap();
+        };
+
+        press(&mut app, KeyCode::Char('a'));
+        press(&mut app, KeyCode::Char('b'));
+        press_mod(&mut app, KeyCode::Enter, KeyModifiers::SHIFT);
+        press(&mut app, KeyCode::Char('c'));
+        // Alt+Enter is the fallback newline for terminals that can't report
+        // Shift+Enter.
+        press_mod(&mut app, KeyCode::Enter, KeyModifiers::ALT);
+        press(&mut app, KeyCode::Char('d'));
+
+        let msg = app.commit.as_ref().unwrap().message.clone();
+        assert_eq!(msg, "ab\nc\nd");
+
+        // Plain Enter tries to commit (fails against the fake repo) and must
+        // NOT have appended a newline to the message.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.commit.as_ref().unwrap().message, "ab\nc\nd");
     }
 }
 
