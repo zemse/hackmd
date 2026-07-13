@@ -2200,7 +2200,17 @@ fn default_hint(app: &App) -> String {
             ReaderOrigin::CloudNote { .. } => {
                 "j/k:scroll  /:find  t:toc  e:edit  y:link  ?:help  q:quit".into()
             }
-            _ => "j/k:scroll  /:find  e:edit  U:publish  Tab:links  ?:help  q:quit".into(),
+            // `gc` commits a local file; only surface it when the repo has
+            // uncommitted changes (same signal as the browser `[uncommitted]`
+            // badge), so it stays quiet in a clean tree.
+            _ => {
+                let commit = if app.git_status.count() > 0 {
+                    "  gc:commit"
+                } else {
+                    ""
+                };
+                format!("j/k:scroll  /:find  e:edit  U:publish  Tab:links{commit}  ?:help  q:quit")
+            }
         },
         View::Browser(b) => {
             let all = if b.show_all { "A:filtered" } else { "A:all" };
@@ -2209,7 +2219,14 @@ fn default_hint(app: &App) -> String {
             } else {
                 "s:by-recent"
             };
-            format!("j/k  Enter:open  n:new  c:rename  f:find  {sort}  {all}  H:hackmd  ?:help")
+            let commit = if app.git_status.count() > 0 {
+                "  gc:commit"
+            } else {
+                ""
+            };
+            format!(
+                "j/k  Enter:open  n:new  c:rename  f:find  {sort}  {all}{commit}  H:hackmd  ?:help"
+            )
         }
         View::Cloud(c) => {
             if c.show_tab_bar() {
