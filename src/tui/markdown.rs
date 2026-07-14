@@ -15,6 +15,7 @@ use crate::tui::links::{
     self, CheckboxMap, CheckboxSpan, ImageRef, LinkMap, LinkSpan, LinkTarget, TableExpand,
     TableExpansions, TableMap, TableRegion,
 };
+use crate::tui::mermaid;
 use crate::tui::syntax;
 use crate::tui::theme::Theme;
 
@@ -773,8 +774,50 @@ impl Builder {
             }
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
-                let mut highlighted: Vec<Vec<Span<'static>>> = Vec::new();
                 let lang = self.code_lang.take();
+                // A ```mermaid fence renders as an ASCII/Unicode diagram in the
+                // view pane. In edit mode we keep the raw source visible (and
+                // skip the per-keystroke parse), so only attempt it when not
+                // editing; an unsupported diagram or parse error falls through
+                // to the normal highlighted-code path below.
+                if self.edit.is_none()
+                    && lang
+                        .as_deref()
+                        .is_some_and(|l| l.eq_ignore_ascii_case("mermaid"))
+                {
+                    if let Some(diagram) = mermaid::render(&self.code_content) {
+                        let style = Style::default().fg(self.theme.code_fg);
+                        let lines: Vec<Vec<Run>> = diagram
+                            .into_iter()
+                            .map(|text| {
+                                vec![Run {
+                                    text,
+                                    style,
+                                    link: None,
+                                    checkbox: None,
+                                    image: None,
+                                    inline_range: None,
+                                    text_range: None,
+                                    cursor_at: None,
+                                }]
+                            })
+                            .collect();
+                        let prefix = self.quote_prefix();
+                        self.code_content.clear();
+                        self.push_block(
+                            Block::Pre {
+                                lines,
+                                prefix,
+                                flat: false,
+                                line_sources: Vec::new(),
+                            },
+                            range,
+                        );
+                        self.push_blank();
+                        return;
+                    }
+                }
+                let mut highlighted: Vec<Vec<Span<'static>>> = Vec::new();
                 syntax::highlight(
                     &self.code_content,
                     lang.as_deref(),
@@ -2845,5 +2888,46 @@ mod tests {
         for cb in &r.checkbox_map.items {
             assert_eq!(&src[cb.source_offset..cb.source_offset + 1], "[");
         }
+    }
+
+    #[test]
+    fn mermaid_fence_renders_as_diagram_in_view_mode() {
+        let src = "```mermaid\nsequenceDiagram\n    participant B as Lodestar Builder\n    participant EL as Local EL\n    B->>EL: Build payload candidate\n```\n";
+        let r = render(src, None, 120, &Theme::dark());
+        let text: String = r
+            .lines
+            .iter()
+            .map(line_text_of)
+            .collect::<Vec<_>>()
+            .join("\n");
+        // The diagram is laid out, not shown as raw source: the participant
+        // labels and box-drawing lifelines appear, but the `sequenceDiagram`
+        // keyword (source-only) does not.
+        assert!(text.contains("Lodestar Builder"), "diagram body:\n{text}");
+        assert!(text.contains("Build payload candidate"));
+        assert!(text.contains('│'), "expected box-drawing lifelines");
+        assert!(
+            !text.contains("sequenceDiagram"),
+            "raw source leaked into view"
+        );
+    }
+
+    #[test]
+    fn mermaid_fence_shows_raw_source_in_edit_mode() {
+        let src = "```mermaid\nsequenceDiagram\n    B->>EL: hi\n```\n";
+        let tables = TableExpansions::new();
+        // Cursor inside the fence → editor keeps the raw source visible.
+        let ctx = EditCtx { cursor: 20 };
+        let r = render_with_edit(src, None, 120, &Theme::dark(), Some(ctx), &tables);
+        let text: String = r
+            .lines
+            .iter()
+            .map(line_text_of)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("sequenceDiagram"),
+            "editor should show source:\n{text}"
+        );
     }
 }

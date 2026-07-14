@@ -15,6 +15,7 @@ mod jsonl;
 mod links;
 mod markdown;
 mod md_config;
+mod mermaid;
 mod palette;
 mod read_state;
 pub mod recovery;

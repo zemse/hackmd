@@ -43,6 +43,8 @@ tui = [
     "dep:toml",
     "dep:time",
     "dep:diffy",
+    "dep:merman-ascii",
+    "dep:merman-core",
 ]
 
 [dependencies]
@@ -78,6 +80,11 @@ base64 = { version = "0.22", optional = true }
 toml = { version = "1", optional = true }
 # Three-way merge for local ↔ HackMD sync (git-style conflict detection).
 diffy = { version = "0.4", optional = true }
+# Render ```mermaid fenced blocks as ASCII/Unicode diagrams in the view pane.
+# `merman-core` parses the Mermaid source into a typed model; `merman-ascii`
+# lays that model out as terminal text. Used only in read/view mode.
+merman-ascii = { version = "0.7", optional = true }
+merman-core = { version = "0.7", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # System dictionary lookup (DCSCopyTextDefinition) for the in-TUI definition

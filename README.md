@@ -25,7 +25,7 @@ hackmd new my note    # create a cloud note and open it in the editor
 - **Split live-preview editor** — raw markdown on one side, rendered preview on the other, scroll-synced. `e` to edit, `Ctrl-S` to save.
 - **Your HackMD notes in the terminal** — browse, read, edit, publish, and download notes (and team notes) without leaving the shell. `H` toggles local ↔ cloud.
 - **Two-way local ↔ cloud sync** — `U` publishes a local file and keeps it in sync, three-way merging edits from both sides with a per-hunk conflict resolver.
-- **Rich vim-style reader** — fast scrolling, search, table of contents, inline images (kitty/iTerm2/sixel), expandable tables, clickable links, and a git diff lens.
+- **Rich vim-style reader** — fast scrolling, search, table of contents, inline images (kitty/iTerm2/sixel), mermaid diagrams rendered as Unicode art, expandable tables, clickable links, and a git diff lens.
 - **Scriptable CLI** — `@hackmd/hackmd-cli` parity with `table/json/csv/tsv/yaml` output for notes, teams, and folders.
 - **Async Rust SDK** — the full HackMD v1 API with ETag caching and retries (`cargo add hackmd --no-default-features`).
 

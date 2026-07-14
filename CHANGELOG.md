@@ -4,6 +4,12 @@
 
 ### Added
 
+- **Mermaid diagrams in the view pane** — a ` ```mermaid ` fenced block now
+  renders as a Unicode box-drawing diagram in the reader instead of raw source
+  (sequence, flowchart, class, ER, and xychart types via `merman-core` +
+  `merman-ascii`). The editor still shows the raw source so it stays editable,
+  and any unsupported diagram type or parse error falls back to the normal
+  highlighted code block.
 - **Git commit from the TUI** — uncommitted files (modified, added, deleted,
   untracked, renamed) now carry an `[uncommitted]` badge in the browser, on
   both files and the folders containing them. Press `gc` on an open file, a
