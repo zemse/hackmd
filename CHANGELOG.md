@@ -20,6 +20,10 @@
   the ordinary scrolling reader. A `---` inside a fenced code block no longer
   splits the deck, and front-matter spot directives (`_class: lead`) scope to the
   first slide.
+- **Live slide preview while editing a deck** — the split editor's preview pane
+  now shows the single slide the cursor is in (rendered as a slide, with
+  centering, header/footer and a `n / total` label) instead of the whole
+  document, and follows the cursor across slides as you type or move.
 - **Marp background images** — a `![bg left:40%](url)` / `![bg right](url)`
   background now reserves that fraction of the slide for the image and flows the
   slide text into the remaining column (the image is pulled out of the text flow

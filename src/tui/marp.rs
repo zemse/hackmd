@@ -167,44 +167,7 @@ fn is_marp_signal(line: &str) -> bool {
 /// Parse `raw` into a deck. Never fails: a malformed or empty document yields a
 /// single (possibly empty) slide so the presenter always has something to show.
 pub fn parse(raw: &str) -> Deck {
-    let mut global = Directives::default();
-    // Front-matter spot directives (`_class: lead`, …) apply to the first slide.
-    let mut pending_local = Directives::default();
-    // Skip a leading `<!-- marp: true -->` enable comment (and any blank lines)
-    // so the front matter after it is still recognized and stripped, rather than
-    // rendered as a slide of raw `theme:`/`paginate:` text.
-    let head = strip_leading_noise(raw, &mut global, &mut pending_local);
-    let body = strip_front_matter(head, &mut global, &mut pending_local);
-
-    let mut slides = Vec::new();
-    for chunk in split_slides(body) {
-        let mut local = Directives::default();
-        let clean = strip_comments(&chunk, &mut global, &mut local);
-        if clean.trim().is_empty() {
-            // A chunk that was only comments/directives (or blank) is not a real
-            // slide — but its global directives above still carry forward.
-            continue;
-        }
-        // Fold the pending front-matter spot directives into the first real
-        // slide (in-slide `_` comments still win over them), then consume.
-        let local = std::mem::take(&mut pending_local).merged(&local);
-        let eff = global.merged(&local);
-        // Pull `![bg ...]` background images out of the flow so they don't
-        // render as inline `[image: …]` text; draw_slide positions them.
-        let (body, background) = extract_backgrounds(&clean);
-        slides.push(Slide {
-            body: body.trim_matches('\n').to_string(),
-            header: eff.header,
-            footer: eff.footer,
-            paginate: eff.paginate.unwrap_or(false),
-            lead: eff
-                .class
-                .as_deref()
-                .map(|c| c.split_whitespace().any(|w| w == "lead"))
-                .unwrap_or(false),
-            background,
-        });
-    }
+    let mut slides: Vec<Slide> = parse_ranged(raw).into_iter().map(|(_, s)| s).collect();
     if slides.is_empty() {
         slides.push(Slide {
             body: String::new(),
@@ -216,6 +179,82 @@ pub fn parse(raw: &str) -> Deck {
         });
     }
     Deck { slides }
+}
+
+/// Parse into `(content_start, Slide)` pairs, where `content_start` is the byte
+/// offset in `raw` where the slide's content begins. Empty (comment-only)
+/// chunks are dropped, exactly as `parse` does; the offsets let the editor map a
+/// cursor position to its slide (see [`slide_at_cursor`]).
+fn parse_ranged(raw: &str) -> Vec<(usize, Slide)> {
+    let mut global = Directives::default();
+    // Front-matter spot directives (`_class: lead`, …) apply to the first slide.
+    let mut pending_local = Directives::default();
+    // Skip a leading `<!-- marp: true -->` enable comment (and any blank lines)
+    // so the front matter after it is still recognized and stripped, rather than
+    // rendered as a slide of raw `theme:`/`paginate:` text.
+    let head = strip_leading_noise(raw, &mut global, &mut pending_local);
+    let body = strip_front_matter(head, &mut global, &mut pending_local);
+    // `body` is a suffix slice of `raw`, so its start offset is the difference.
+    let body_offset = raw.len() - body.len();
+
+    let mut out = Vec::new();
+    for range in split_slide_spans(body) {
+        let chunk = &body[range.clone()];
+        let mut local = Directives::default();
+        let clean = strip_comments(chunk, &mut global, &mut local);
+        if clean.trim().is_empty() {
+            // A chunk that was only comments/directives (or blank) is not a real
+            // slide — but its global directives above still carry forward.
+            continue;
+        }
+        // Fold the pending front-matter spot directives into the first real
+        // slide (in-slide `_` comments still win over them), then consume.
+        let local = std::mem::take(&mut pending_local).merged(&local);
+        let eff = global.merged(&local);
+        // Pull `![bg ...]` background images out of the flow so they don't
+        // render as inline `[image: …]` text; draw_slide positions them.
+        let (slide_body, background) = extract_backgrounds(&clean);
+        out.push((
+            body_offset + range.start,
+            Slide {
+                body: slide_body.trim_matches('\n').to_string(),
+                header: eff.header,
+                footer: eff.footer,
+                paginate: eff.paginate.unwrap_or(false),
+                lead: eff
+                    .class
+                    .as_deref()
+                    .map(|c| c.split_whitespace().any(|w| w == "lead"))
+                    .unwrap_or(false),
+                background,
+            },
+        ));
+    }
+    out
+}
+
+/// The slide containing byte offset `cursor` in `raw`, plus its `(index, total)`.
+/// Used by the split editor to show the cursor's slide in the preview pane.
+/// Slide 0 absorbs any leading front-matter region, and each slide extends up to
+/// the next slide's start, so every cursor position maps somewhere. `None` only
+/// when there are no slides at all.
+pub fn slide_at_cursor(raw: &str, cursor: usize) -> Option<(Slide, usize, usize)> {
+    let ranged = parse_ranged(raw);
+    if ranged.is_empty() {
+        return None;
+    }
+    // `ranged` is ordered by ascending start; pick the last slide that starts
+    // at or before the cursor (slide 0 always matches, covering the head).
+    let mut idx = 0;
+    for (i, (start, _)) in ranged.iter().enumerate() {
+        if cursor >= *start {
+            idx = i;
+        } else {
+            break;
+        }
+    }
+    let total = ranged.len();
+    Some((ranged[idx].1.clone(), idx, total))
 }
 
 /// `marp: true` (any surrounding whitespace).
@@ -387,39 +426,54 @@ fn strip_front_matter<'a>(
     ""
 }
 
-/// Split a body into slide chunks on `---` page breaks. Any line that is only
-/// dashes (three or more, optionally space-separated) is a break — EXCEPT inside
-/// a fenced code block, where a `---` line is code (this is what shattered decks
-/// that show a `---` separator inside a ```` ```markdown ```` sample). This is
-/// deliberately greedy otherwise: in a Marp deck a lone `---` is a slide
-/// separator, so we don't try to disambiguate the rare setext-`##` underline it
-/// collides with.
-fn split_slides(body: &str) -> Vec<String> {
-    let mut slides = Vec::new();
-    let mut cur = String::new();
-    // `Some((marker, len))` while inside a ``` / ~~~ fence of that width.
+/// Split a body into slide *content* byte ranges on `---` page breaks. Any line
+/// that is only dashes (three or more, optionally space-separated) is a break —
+/// EXCEPT inside a fenced code block, where a `---` line is code (this is what
+/// shattered decks that show a `---` separator inside a ```` ```markdown ````
+/// sample). Otherwise deliberately greedy: in a Marp deck a lone `---` is a
+/// slide separator, so we don't try to disambiguate the rare setext-`##`
+/// underline it collides with.
+///
+/// Each returned range excludes the break line itself; the ranges are otherwise
+/// in document order, so consecutive `start`s bound each slide's full span
+/// (break line included) for cursor mapping.
+fn split_slide_spans(body: &str) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
     let mut fence: Option<(char, usize)> = None;
-    for line in body.lines() {
-        match fence {
+    let mut content_start = 0usize;
+    let mut pos = 0usize;
+    loop {
+        let line_end = body[pos..]
+            .find('\n')
+            .map(|p| pos + p)
+            .unwrap_or(body.len());
+        let line = &body[pos..line_end];
+        let is_break = match fence {
             Some((marker, len)) => {
                 if fence_marker(line).is_some_and(|(m, n)| m == marker && n >= len) {
                     fence = None;
                 }
+                false
             }
-            None => {
-                if let Some(open) = fence_marker(line) {
+            None => match fence_marker(line) {
+                Some(open) => {
                     fence = Some(open);
-                } else if is_page_break(line) {
-                    slides.push(std::mem::take(&mut cur));
-                    continue;
+                    false
                 }
-            }
+                None => is_page_break(line),
+            },
+        };
+        if is_break {
+            spans.push(content_start..pos);
+            content_start = (line_end + 1).min(body.len());
         }
-        cur.push_str(line);
-        cur.push('\n');
+        if line_end >= body.len() {
+            break;
+        }
+        pos = line_end + 1;
     }
-    slides.push(cur);
-    slides
+    spans.push(content_start..body.len());
+    spans
 }
 
 /// A code-fence line (``` or ~~~, 3+), returning `(marker, run length)`. The
@@ -686,6 +740,26 @@ mod tests {
     fn empty_document_yields_one_slide() {
         let deck = parse("---\nmarp: true\n---\n");
         assert_eq!(deck.len(), 1);
+    }
+
+    #[test]
+    fn slide_at_cursor_maps_offsets_to_slides() {
+        let src =
+            "---\nmarp: true\n---\n# One\n\nalpha\n\n---\n\n# Two\n\nbeta\n\n---\n\n# Three\n";
+        // Cursor in the front matter → slide 0.
+        let (_, i, total) = slide_at_cursor(src, 2).unwrap();
+        assert_eq!((i, total), (0, 3));
+        // Cursor inside "alpha" (slide 1's body).
+        let at_alpha = src.find("alpha").unwrap();
+        assert_eq!(slide_at_cursor(src, at_alpha).unwrap().1, 0);
+        // Cursor inside "beta" → slide 2 (index 1).
+        let at_beta = src.find("beta").unwrap();
+        assert_eq!(slide_at_cursor(src, at_beta).unwrap().1, 1);
+        // Cursor inside "# Three" → slide 3 (index 2).
+        let at_three = src.find("# Three").unwrap();
+        assert_eq!(slide_at_cursor(src, at_three).unwrap().1, 2);
+        // Cursor past the end clamps to the last slide.
+        assert_eq!(slide_at_cursor(src, src.len()).unwrap().1, 2);
     }
 
     #[test]

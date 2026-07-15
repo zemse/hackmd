@@ -736,9 +736,9 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Render one Marp slide full-screen: an optional header ribbon at the top, the
-/// slide body (vertically centered when it fits — always for a `lead` slide),
-/// and a footer row carrying the footer text and `n / total` page number.
+/// Render the current Marp slide full-screen and publish its body rect + any
+/// background-image regions for the image overlay. Marks the file read on the
+/// last slide.
 fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
     let View::Reader(r) = &app.view else {
         return;
@@ -752,16 +752,45 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let total = marp.deck.len();
     let idx = marp.slide;
+    let page = slide.paginate.then(|| format!("{} / {}", idx + 1, total));
 
-    // Background images (`![bg left/right]`) carve a column off the slide; the
-    // text content flows in what remains. Record the image regions for the
-    // overlay to fill, then lay out the text column.
+    let (body_area, bg) = paint_slide(f, area, slide, rendered, page.as_deref(), theme);
+    app.slide_area = Some(body_area);
+    app.slide_bg = bg;
+
+    // Mark the file read once the last slide is reached.
+    if idx + 1 >= total
+        && let ReaderOrigin::File(p) = &r.origin
+    {
+        let p = p.clone();
+        app.read_state.mark_read(&p);
+    }
+}
+
+/// Paint a slide's chrome + text into `area`: a `![bg left/right]` background
+/// reserves a column and the text flows in the rest; an optional header ribbon
+/// sits on top; the body is vertically centered when it fits (always for a
+/// `lead` slide, which also centers each line); an optional footer + page label
+/// sit on the bottom row. Returns the text body rect and the background-image
+/// regions so the caller can overlay images. Pure w.r.t. `App`, so both the
+/// presenter and the in-editor preview share it.
+fn paint_slide(
+    f: &mut Frame,
+    area: Rect,
+    slide: &crate::tui::marp::Slide,
+    rendered: &crate::tui::markdown::Rendered,
+    page: Option<&str>,
+    theme: &crate::tui::theme::Theme,
+) -> (Rect, Vec<(String, Rect)>) {
+    use crate::tui::marp::BgPlacement;
+
+    // Backgrounds carve a column off the slide; the text flows in what remains.
     let (left_w, right_w) = slide.split_widths(area.width);
     let content_x = area.x + left_w;
     let content_w = area.width.saturating_sub(left_w + right_w).max(1);
-    for bg in &slide.background {
-        use crate::tui::marp::BgPlacement;
-        let rect = match bg.placement {
+    let mut bg = Vec::new();
+    for b in &slide.background {
+        let rect = match b.placement {
             BgPlacement::Left(_) => Rect {
                 x: area.x,
                 y: area.y,
@@ -777,7 +806,7 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
             BgPlacement::Full => area,
         };
         if rect.width > 0 && rect.height > 0 {
-            app.slide_bg.push((bg.url.clone(), rect));
+            bg.push((b.url.clone(), rect));
         }
     }
 
@@ -787,16 +816,13 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Reserve top/bottom chrome rows only when there's something to put there.
     let has_header = slide.header.is_some();
-    let page = if slide.paginate {
-        Some(format!("{} / {}", idx + 1, total))
-    } else {
-        None
-    };
     let has_footer = slide.footer.is_some() || page.is_some();
     let top = area.y + has_header as u16;
     let mid_h = area
         .height
         .saturating_sub(has_header as u16 + has_footer as u16);
+
+    let muted = Style::default().fg(theme.muted);
 
     // Header ribbon.
     if let Some(h) = &slide.header {
@@ -807,16 +833,12 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
             height: 1,
         };
         f.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                h.clone(),
-                Style::default().fg(theme.muted),
-            ))),
+            Paragraph::new(Line::from(Span::styled(h.clone(), muted))),
             hdr,
         );
     }
 
-    // Body — vertically centered when it fits the middle band, else top-aligned
-    // (long slides clip rather than scroll; terminal decks are short by design).
+    // Body — vertically centered when it fits the middle band, else top-aligned.
     let content_h = rendered.lines.len() as u16;
     let center = slide.lead || content_h < mid_h;
     let pad = if center {
@@ -837,13 +859,10 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
         .cloned()
         .collect();
     let mut para = Paragraph::new(lines);
-    // A `lead` slide centers each line; ordinary slides stay left-aligned.
     if slide.lead {
         para = para.alignment(Alignment::Center);
     }
     f.render_widget(para, body_area);
-    // Publish the body rect so the inline image overlay aligns with the text.
-    app.slide_area = Some(body_area);
 
     // Footer row: footer text on the left, page number on the right.
     if has_footer {
@@ -856,15 +875,12 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
                 height: 1,
             };
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    footer.clone(),
-                    Style::default().fg(theme.muted),
-                ))),
+                Paragraph::new(Line::from(Span::styled(footer.clone(), muted))),
                 fa,
             );
         }
-        if let Some(page) = &page {
-            let w = UnicodeWidthStr::width(page.as_str()) as u16;
+        if let Some(page) = page {
+            let w = UnicodeWidthStr::width(page) as u16;
             let pa = Rect {
                 x: text_x + text_w.saturating_sub(w),
                 y: fy,
@@ -872,22 +888,13 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
                 height: 1,
             };
             f.render_widget(
-                Paragraph::new(Line::from(Span::styled(
-                    page.clone(),
-                    Style::default().fg(theme.muted),
-                ))),
+                Paragraph::new(Line::from(Span::styled(page.to_string(), muted))),
                 pa,
             );
         }
     }
 
-    // Mark the file read once the last slide is reached.
-    if idx + 1 >= total
-        && let ReaderOrigin::File(p) = &r.origin
-    {
-        let p = p.clone();
-        app.read_state.mark_read(&p);
-    }
+    (body_area, bg)
 }
 
 /// Fill each Marp slide-background region (`app.slide_bg`, set by `draw_slide`)
@@ -1150,56 +1157,83 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
     }
 
     // ---- Preview pane ----
-    // Sync preview to follow cursor block — but, like the raw pane, only
-    // when the cursor moved. Otherwise wheel-driven scrolls (which sync
-    // preview via the events layer) would be immediately undone by this
-    // snap-back on the next frame.
-    let preview_target = app::preview_row_for_source(rendered, cursor);
-    let visible_h_prev = preview_area.height as usize;
     let mut prev_scroll = r.preview_scroll as usize;
-    if cursor_changed {
-        if preview_target < prev_scroll {
-            prev_scroll = preview_target;
+    if r.marp.is_some() {
+        // A Marp deck in the editor: preview the slide the cursor is in,
+        // rendered as a slide (chrome + centering + bg-split layout) so the
+        // author sees the page they're editing rather than the whole document.
+        if let Some((slide, idx, total)) = crate::tui::marp::slide_at_cursor(&r.raw, cursor) {
+            let base_dir = match &r.origin {
+                ReaderOrigin::File(p) => p.parent().map(|p| p.to_path_buf()),
+                _ => None,
+            };
+            // Wrap the slide text to its content column (minus any bg split).
+            let (l, rr) = slide.split_widths(preview_area.width);
+            let content_w = preview_area.width.saturating_sub(l + rr).max(1);
+            let slide_rendered = crate::tui::markdown::render_with_edit(
+                &slide.body,
+                base_dir.as_deref(),
+                content_w,
+                theme,
+                None,
+                &crate::tui::links::TableExpansions::new(),
+            );
+            // Always show the slide number here — it orients the author even
+            // when the deck's `paginate` directive is off.
+            let page = format!("{} / {}", idx + 1, total);
+            paint_slide(f, preview_area, &slide, &slide_rendered, Some(&page), theme);
         }
-        if visible_h_prev > 0 && preview_target >= prev_scroll + visible_h_prev {
-            prev_scroll = preview_target + 1 - visible_h_prev;
+    } else {
+        // Sync preview to follow cursor block — but, like the raw pane, only
+        // when the cursor moved. Otherwise wheel-driven scrolls (which sync
+        // preview via the events layer) would be immediately undone by this
+        // snap-back on the next frame.
+        let preview_target = app::preview_row_for_source(rendered, cursor);
+        let visible_h_prev = preview_area.height as usize;
+        if cursor_changed {
+            if preview_target < prev_scroll {
+                prev_scroll = preview_target;
+            }
+            if visible_h_prev > 0 && preview_target >= prev_scroll + visible_h_prev {
+                prev_scroll = preview_target + 1 - visible_h_prev;
+            }
         }
-    }
-    let max_prev_scroll = rendered.lines.len().saturating_sub(visible_h_prev);
-    if prev_scroll > max_prev_scroll {
-        prev_scroll = max_prev_scroll;
-    }
+        let max_prev_scroll = rendered.lines.len().saturating_sub(visible_h_prev);
+        if prev_scroll > max_prev_scroll {
+            prev_scroll = max_prev_scroll;
+        }
 
-    let mut prev_lines: Vec<Line> = Vec::with_capacity(visible_h_prev);
-    for i in 0..visible_h_prev {
-        let idx = prev_scroll + i;
-        if idx >= rendered.lines.len() {
-            break;
+        let mut prev_lines: Vec<Line> = Vec::with_capacity(visible_h_prev);
+        for i in 0..visible_h_prev {
+            let idx = prev_scroll + i;
+            if idx >= rendered.lines.len() {
+                break;
+            }
+            prev_lines.push(rendered.lines[idx].clone());
         }
-        prev_lines.push(rendered.lines[idx].clone());
-    }
-    f.render_widget(Paragraph::new(prev_lines), preview_area);
+        f.render_widget(Paragraph::new(prev_lines), preview_area);
 
-    // Mark the preview row that corresponds to the cursor's block. In the
-    // side-by-side layout we stamp the marker onto the center divider column
-    // (preview_area.x - 1) so it never steals the row's first glyph; in the
-    // vertical stack — which has no left divider beside the preview — we tint
-    // the row's background instead, again leaving every character visible.
-    let cy_prev = preview_target as i32 - prev_scroll as i32;
-    if cy_prev >= 0 && (cy_prev as u16) < preview_area.height && preview_area.width > 0 {
-        let row = preview_area.y + cy_prev as u16;
-        let buf = f.buffer_mut();
-        if horizontal {
-            // Use the heavy box-drawing vertical so it sits centered in the
-            // cell exactly like the `│` divider it replaces — just bolder and
-            // colored to flag the active row.
-            let cell = &mut buf[(preview_area.x - 1, row)];
-            cell.set_char('┃');
-            cell.set_style(Style::default().fg(theme.heading[0]));
-        } else {
-            let wash = theme.code_bg.unwrap_or(theme.heading[0]);
-            for col in preview_area.x..preview_area.x + preview_area.width {
-                buf[(col, row)].set_bg(wash);
+        // Mark the preview row that corresponds to the cursor's block. In the
+        // side-by-side layout we stamp the marker onto the center divider column
+        // (preview_area.x - 1) so it never steals the row's first glyph; in the
+        // vertical stack — which has no left divider beside the preview — we tint
+        // the row's background instead, again leaving every character visible.
+        let cy_prev = preview_target as i32 - prev_scroll as i32;
+        if cy_prev >= 0 && (cy_prev as u16) < preview_area.height && preview_area.width > 0 {
+            let row = preview_area.y + cy_prev as u16;
+            let buf = f.buffer_mut();
+            if horizontal {
+                // Use the heavy box-drawing vertical so it sits centered in the
+                // cell exactly like the `│` divider it replaces — just bolder and
+                // colored to flag the active row.
+                let cell = &mut buf[(preview_area.x - 1, row)];
+                cell.set_char('┃');
+                cell.set_style(Style::default().fg(theme.heading[0]));
+            } else {
+                let wash = theme.code_bg.unwrap_or(theme.heading[0]);
+                for col in preview_area.x..preview_area.x + preview_area.width {
+                    buf[(col, row)].set_bg(wash);
+                }
             }
         }
     }
@@ -3056,6 +3090,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    // Editing a Marp deck previews the slide the cursor is in: moving the
+    // cursor into slide 2 shows slide 2 (not slide 1) in the right preview pane.
+    #[test]
+    fn edit_preview_follows_cursor_slide() {
+        use ratatui::backend::TestBackend;
+        let mut p = std::env::temp_dir();
+        p.push(format!("md-tui-marp-edit-{}.md", std::process::id()));
+        std::fs::write(
+            &p,
+            "---\nmarp: true\n---\n# CoverAlpha\n\nfirst\n\n---\n\n# SecondBeta\n\nsecond body\n",
+        )
+        .unwrap();
+        let opts = Options {
+            width: 0,
+            line_numbers: false,
+            theme: Theme::dark(),
+        };
+        let mut app = App::new(Source::File(p), opts).unwrap();
+        app.viewport = Rect::new(0, 0, 120, 30);
+        app.enter_edit();
+
+        // Put the cursor inside slide 2's heading.
+        let off = {
+            let View::Reader(r) = &app.view else {
+                panic!("reader")
+            };
+            r.raw.find("SecondBeta").unwrap()
+        };
+        if let View::Reader(r) = &mut app.view {
+            if let Some(e) = r.edit.as_mut() {
+                e.cursor = off;
+            }
+        }
+
+        let mut term = ratatui::Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        // Inspect only the right (preview) half — the left pane shows the whole
+        // source, so both headings appear there.
+        let buf = term.backend().buffer().clone();
+        let right: String = (0..buf.area.height)
+            .map(|y| (61..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            right.contains("SecondBeta"),
+            "preview shows the cursor's slide: {right:?}"
+        );
+        assert!(
+            !right.contains("CoverAlpha"),
+            "preview must not show the other slide: {right:?}"
+        );
+        assert!(right.contains("2 / 2"), "preview shows the slide number");
     }
 
     // An active hover over a link must show the URL preview even when a sticky
