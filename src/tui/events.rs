@@ -230,6 +230,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         if r.edit.is_some() {
             return handle_edit_key(app, key);
         }
+        // Marp presentation mode owns navigation: arrows / Space / PageUp/Dn
+        // switch slides instead of scrolling. Handled before the generic reader
+        // keymap so those keys never fall through to scroll motions.
+        if r.marp_present() {
+            return handle_present_key(app, key);
+        }
     }
 
     // A persisted reader selection (left over from a mouse drag) offers copy /
@@ -415,6 +421,15 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             keep_browser_selection_visible(app);
         }
         KeyCode::Char('O') if matches!(app.view, View::Reader(_)) => app.enter_edit_open_above(),
+
+        // `p` starts (or resumes) the presentation of a Marp deck viewed as a
+        // scrolling document. In presentation mode `p`/Esc leave it (handled by
+        // `handle_present_key`, which runs before this match).
+        KeyCode::Char('p') if matches!(&app.view, View::Reader(r) if r.marp.is_some()) => {
+            if let View::Reader(r) = &mut app.view {
+                r.toggle_present();
+            }
+        }
 
         // HackMD note actions — active wherever a cloud note is targeted
         // (cloud browser row or open cloud reader); no-ops elsewhere.
@@ -729,6 +744,75 @@ fn keep_browser_selection_visible(app: &mut App) {
 /// `:preview`, …); a second Esc there leaves the editor, asking save/discard
 /// first if the buffer is dirty. Mouse handling stays in `handle_mouse` and
 /// updates the cursor from click position there.
+/// Key handling while a Marp deck is presented one slide at a time. Movement
+/// keys advance/retreat slides (never scroll); `p`/`Esc` return to the ordinary
+/// scrolling reader.
+fn handle_present_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Char('q') => app.should_quit = true,
+        KeyCode::Char('?') => app.help_open = !app.help_open,
+        // Leave presentation mode → scrolling reader over the whole document.
+        KeyCode::Char('p') | KeyCode::Esc => {
+            if let View::Reader(r) = &mut app.view {
+                r.exit_present();
+            }
+        }
+        // Next slide.
+        KeyCode::Down
+        | KeyCode::Right
+        | KeyCode::Char(' ')
+        | KeyCode::PageDown
+        | KeyCode::Char('j')
+        | KeyCode::Char('l')
+        | KeyCode::Char('n')
+        | KeyCode::Enter
+        | KeyCode::Tab => {
+            if let View::Reader(r) = &mut app.view {
+                r.slide_by(1);
+            }
+        }
+        // Previous slide.
+        KeyCode::Up
+        | KeyCode::Left
+        | KeyCode::PageUp
+        | KeyCode::Char('k')
+        | KeyCode::Char('h')
+        | KeyCode::Char('b')
+        | KeyCode::Char('N')
+        | KeyCode::BackTab
+        | KeyCode::Backspace => {
+            if let View::Reader(r) = &mut app.view {
+                r.slide_by(-1);
+            }
+        }
+        // First / last slide.
+        KeyCode::Home | KeyCode::Char('g') => {
+            if let View::Reader(r) = &mut app.view {
+                r.slide_goto(0);
+            }
+        }
+        KeyCode::Char('G') | KeyCode::End => {
+            if let View::Reader(r) = &mut app.view {
+                let last = r
+                    .marp
+                    .as_ref()
+                    .map(|m| m.deck.len().saturating_sub(1))
+                    .unwrap_or(0);
+                r.slide_goto(last);
+            }
+        }
+        // Editing a slide drops presentation and opens the editor on the deck.
+        KeyCode::Char('e') | KeyCode::Char('i') => {
+            if let View::Reader(r) = &mut app.view {
+                r.exit_present();
+            }
+            app.enter_edit();
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);

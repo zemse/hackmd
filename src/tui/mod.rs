@@ -14,6 +14,7 @@ pub mod hackmd_meta;
 mod jsonl;
 mod links;
 mod markdown;
+pub mod marp;
 mod md_config;
 mod mermaid;
 mod palette;

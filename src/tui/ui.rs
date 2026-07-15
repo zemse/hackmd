@@ -13,7 +13,7 @@ use crossterm::terminal::{
 use ratatui::Frame;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
@@ -114,10 +114,13 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if app.git_lens.is_some() && matches!(app.view, View::Reader(_)) {
         draw_git_lens(f, app, body);
     } else {
+        app.slide_area = None;
         match &app.view {
             View::Reader(r) => {
                 if r.in_split_edit() {
                     draw_edit_split(f, app, body);
+                } else if r.marp_present() {
+                    draw_slide(f, app, body);
                 } else {
                     draw_reader(f, app, body);
                 }
@@ -131,7 +134,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             // wires its own rect, so the global overlay is suppressed.
             let in_split = matches!(&app.view, View::Reader(r) if r.in_split_edit());
             if !in_split {
-                draw_images_overlay(f, app, body);
+                // In presentation mode, images sit inside the (possibly
+                // centered) slide body; use that rect so they align with text.
+                let overlay_area = app.slide_area.unwrap_or(body);
+                draw_images_overlay(f, app, overlay_area);
             }
         }
     }
@@ -721,6 +727,132 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
     // borrow is clean.
     if let Some(path) = mark_read_path {
         app.read_state.mark_read(&path);
+    }
+}
+
+/// Render one Marp slide full-screen: an optional header ribbon at the top, the
+/// slide body (vertically centered when it fits — always for a `lead` slide),
+/// and a footer row carrying the footer text and `n / total` page number.
+fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
+    let View::Reader(r) = &app.view else {
+        return;
+    };
+    let (Some(rendered), Some(marp)) = (&r.rendered, &r.marp) else {
+        return;
+    };
+    let theme = &app.opts.theme;
+    let Some(slide) = marp.current() else {
+        return;
+    };
+    let total = marp.deck.len();
+    let idx = marp.slide;
+
+    // Reserve top/bottom chrome rows only when there's something to put there.
+    let has_header = slide.header.is_some();
+    let page = if slide.paginate {
+        Some(format!("{} / {}", idx + 1, total))
+    } else {
+        None
+    };
+    let has_footer = slide.footer.is_some() || page.is_some();
+    let top = area.y + has_header as u16;
+    let bottom_reserved = has_footer as u16;
+    let mid_h = area
+        .height
+        .saturating_sub(has_header as u16 + bottom_reserved);
+
+    // Header ribbon.
+    if let Some(h) = &slide.header {
+        let hdr = Rect {
+            x: area.x + 1,
+            y: area.y,
+            width: area.width.saturating_sub(2),
+            height: 1,
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                h.clone(),
+                Style::default().fg(theme.muted),
+            ))),
+            hdr,
+        );
+    }
+
+    // Body — vertically centered when it fits the middle band, else top-aligned
+    // (long slides clip rather than scroll; terminal decks are short by design).
+    let content_h = rendered.lines.len() as u16;
+    let center = slide.lead || content_h < mid_h;
+    let pad = if center {
+        mid_h.saturating_sub(content_h) / 2
+    } else {
+        0
+    };
+    // 1-col gutters each side. The Markdown pass already wrapped at
+    // `area.width - 1`, so this only ever clips lines within a column of the
+    // full width — which the renderer avoids anyway.
+    let body_area = Rect {
+        x: area.x + 1,
+        y: top + pad,
+        width: area.width.saturating_sub(2),
+        height: mid_h.saturating_sub(pad),
+    };
+    let lines: Vec<Line> = rendered
+        .lines
+        .iter()
+        .take(body_area.height as usize)
+        .cloned()
+        .collect();
+    let mut para = Paragraph::new(lines);
+    // A `lead` slide centers each line; ordinary slides stay left-aligned.
+    if slide.lead {
+        para = para.alignment(Alignment::Center);
+    }
+    f.render_widget(para, body_area);
+    // Publish the body rect so the image overlay aligns images with the text.
+    app.slide_area = Some(body_area);
+
+    // Footer row: footer text on the left, page number on the right.
+    if has_footer {
+        let fy = area.y + area.height.saturating_sub(1);
+        if let Some(footer) = &slide.footer {
+            let fa = Rect {
+                x: area.x + 1,
+                y: fy,
+                width: area.width.saturating_sub(2),
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    footer.clone(),
+                    Style::default().fg(theme.muted),
+                ))),
+                fa,
+            );
+        }
+        if let Some(page) = &page {
+            let w = UnicodeWidthStr::width(page.as_str()) as u16;
+            let pa = Rect {
+                x: area.x + area.width.saturating_sub(w + 1),
+                y: fy,
+                width: w,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    page.clone(),
+                    Style::default().fg(theme.muted),
+                ))),
+                pa,
+            );
+        }
+    }
+
+    // Mark the file read once the last slide is reached.
+    if idx + 1 >= total
+        && let ReaderOrigin::File(p) = &r.origin
+    {
+        let p = p.clone();
+        app.read_state.mark_read(&p);
     }
 }
 
@@ -1689,6 +1821,11 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
     };
 
     let scroll_pos = match &app.view {
+        // In presentation mode the position indicator is the slide number.
+        View::Reader(r) if r.marp_present() => {
+            let m = r.marp.as_ref().unwrap();
+            format!("Slide {}/{}", m.slide + 1, m.deck.len())
+        }
         View::Reader(r) => {
             let total = r.rendered.as_ref().map(|x| x.lines.len()).unwrap_or(0);
             let h = app.viewport.height as usize;
@@ -2195,6 +2332,10 @@ fn compute_middle(app: &App) -> Mid {
 
 fn default_hint(app: &App) -> String {
     match &app.view {
+        // Presentation mode: navigation is by slide, not by scroll.
+        View::Reader(r) if r.marp_present() => {
+            "←/→:slide  Space:next  Home/End:first/last  p:exit  ?:help  q:quit".into()
+        }
         // Most important keys first; the full reference lives behind `?`.
         View::Reader(r) => match &r.origin {
             ReaderOrigin::CloudNote { .. } => {
@@ -2209,7 +2350,11 @@ fn default_hint(app: &App) -> String {
                 } else {
                     ""
                 };
-                format!("j/k:scroll  /:find  e:edit  U:publish  Tab:links{commit}  ?:help  q:quit")
+                // A Marp deck viewed as a scrolling doc: offer to present it.
+                let present = if r.marp.is_some() { "  p:present" } else { "" };
+                format!(
+                    "j/k:scroll  /:find  e:edit  U:publish  Tab:links{present}{commit}  ?:help  q:quit"
+                )
             }
         },
         View::Browser(b) => {
@@ -2780,6 +2925,46 @@ mod tests {
         };
         assert_eq!(r.rendered.as_ref().unwrap().link_map.links.len(), 1);
         app
+    }
+
+    // A Marp deck renders a slide full-screen without panicking, and paints the
+    // footer / page-number chrome. Also exercises a tiny viewport for rect math.
+    #[test]
+    fn draw_slide_renders_deck_chrome() {
+        use ratatui::backend::TestBackend;
+        let mut p = std::env::temp_dir();
+        p.push(format!("md-tui-marp-test-{}.md", std::process::id()));
+        std::fs::write(
+            &p,
+            "---\nmarp: true\npaginate: true\nfooter: FooterText\n---\n<!-- _class: lead -->\n# Cover\n\n---\n\n## Next\n",
+        )
+        .unwrap();
+        let opts = Options {
+            width: 80,
+            line_numbers: false,
+            theme: Theme::dark(),
+        };
+        let mut app = App::new(Source::File(p), opts).unwrap();
+
+        let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Cover"), "slide body is drawn: {text:?}");
+        assert!(text.contains("FooterText"), "footer directive is drawn");
+        assert!(text.contains("1 / 2"), "pagination is drawn");
+        assert!(app.slide_area.is_some(), "slide body rect is published");
+
+        // A 1-row-tall viewport must not panic (all chrome saturates away).
+        let mut tiny = ratatui::Terminal::new(TestBackend::new(10, 2)).unwrap();
+        tiny.draw(|f| draw(f, &mut app)).unwrap();
     }
 
     // An active hover over a link must show the URL preview even when a sticky

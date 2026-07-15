@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Marp presentations** — a local markdown file that enables
+  [Marp](https://marp.app) (a `marp: true` line in the YAML front matter, or a
+  leading `<!-- marp: true -->` comment) now opens as a slide deck instead of a
+  scrolling document. Slides split on `---` page breaks; front-matter and
+  `<!-- ... -->` directives/presenter-notes are hidden from the render. Arrow
+  keys, `Space`, and PageUp/PageDown switch slides (they don't scroll);
+  `Home`/`End` jump to the first/last slide; the status bar shows `Slide n/m`.
+  Global `header`/`footer`/`paginate` directives carry across slides (locals like
+  `_class: lead` apply to one slide and center it), and the page number renders
+  bottom-right when `paginate` is on. `p` (or `Esc`) toggles between the deck and
+  the ordinary scrolling reader.
 - **Mermaid diagrams in the view pane** — a ` ```mermaid ` fenced block now
   renders as a Unicode box-drawing diagram in the reader instead of raw source
   (sequence, flowchart, class, ER, and xychart types via `merman-core` +

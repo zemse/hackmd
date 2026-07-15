@@ -42,6 +42,11 @@ pub struct App {
     pub should_quit: bool,
     pub status: String,
     pub viewport: Rect,
+    /// In Marp presentation mode, the rect the current slide's body is drawn
+    /// into (already offset for vertical centering). The image overlay uses
+    /// this so images line up with the centered text. `None` when not
+    /// presenting.
+    pub slide_area: Option<Rect>,
     /// The row containing the statusline. Click handling on this row covers
     /// the back-button hit zone.
     pub statusline_area: Rect,
@@ -482,6 +487,27 @@ pub struct Reader {
     /// expands that column; a body cell expands just that cell. Threaded into
     /// the renderer so expanded parts show full, untruncated content.
     pub tables: crate::tui::links::TableExpansions,
+    /// Present when the document is a Marp deck. Drives slide-at-a-time
+    /// presentation mode; `None` for ordinary documents.
+    pub marp: Option<MarpView>,
+}
+
+/// Presentation state for a Marp deck open in the reader.
+pub struct MarpView {
+    /// The parsed deck (slides + resolved directives).
+    pub deck: crate::tui::marp::Deck,
+    /// Index of the slide currently shown (`0`-based).
+    pub slide: usize,
+    /// `true` while showing slides one-at-a-time; `false` falls back to the
+    /// ordinary scrolling reader over the full document.
+    pub present: bool,
+}
+
+impl MarpView {
+    /// The slide currently on screen, if any.
+    pub fn current(&self) -> Option<&crate::tui::marp::Slide> {
+        self.deck.slides.get(self.slide)
+    }
 }
 
 /// Default-active edit-mode UI. `Split` is the new HackMD-style two-pane
@@ -975,6 +1001,7 @@ impl App {
             should_quit: false,
             status: String::new(),
             viewport: Rect::new(0, 0, 0, 0),
+            slide_area: None,
             statusline_area: Rect::new(0, 0, 0, 0),
             back_button_hit: None,
             cloud_tab_hits: Vec::new(),
@@ -4116,7 +4143,17 @@ impl App {
                 // explode into multiple content lines. The returned mapping
                 // lets the post-render pass paint expand/collapse buttons on
                 // the right rows.
-                let (source, jsonl_map) = if r.is_jsonl_view() {
+                let (source, jsonl_map) = if r.marp_present() {
+                    // Presentation mode renders only the current slide's Markdown
+                    // (comments/directives already stripped by the parser).
+                    let body = r
+                        .marp
+                        .as_ref()
+                        .and_then(|m| m.current())
+                        .map(|s| s.body.clone())
+                        .unwrap_or_default();
+                    (std::borrow::Cow::Owned(body), None)
+                } else if r.is_jsonl_view() {
                     let (s, m) = r.jsonl_render_source();
                     (std::borrow::Cow::Owned(s), Some(m))
                 } else {
@@ -4594,6 +4631,17 @@ impl Reader {
         } else {
             Some(lang_token_for_path(path).to_string())
         };
+        // A Marp deck opens straight into presentation mode; `p`/Esc drops back
+        // to the ordinary scrolling reader. Only markdown files are decks.
+        let marp = if wrap_lang.is_none() && crate::tui::marp::detect(&raw) {
+            Some(MarpView {
+                deck: crate::tui::marp::parse(&raw),
+                slide: 0,
+                present: true,
+            })
+        } else {
+            None
+        };
         Ok(Self {
             origin: ReaderOrigin::File(path.to_path_buf()),
             raw,
@@ -4611,6 +4659,7 @@ impl Reader {
             jsonl_overlay: None,
             hover_jsonl: None,
             tables: crate::tui::links::TableExpansions::new(),
+            marp,
         })
     }
 
@@ -4666,6 +4715,64 @@ impl Reader {
         self.rendered = None;
     }
 
+    /// True while showing a Marp deck one slide at a time.
+    pub fn marp_present(&self) -> bool {
+        self.marp.as_ref().map(|m| m.present).unwrap_or(false)
+    }
+
+    /// Step the current slide by `delta`, clamping at the ends (no wrap — a
+    /// deck has a first and a last slide). Re-renders and resets the intra-
+    /// slide scroll. No-op outside presentation mode.
+    pub fn slide_by(&mut self, delta: i32) {
+        let Some(m) = self.marp.as_mut() else {
+            return;
+        };
+        let last = m.deck.len().saturating_sub(1);
+        let next = (m.slide as i32 + delta).clamp(0, last as i32) as usize;
+        if next != m.slide {
+            m.slide = next;
+            self.scroll = 0;
+            self.rendered = None;
+        }
+    }
+
+    /// Jump to slide `idx` (clamped). Used for Home/End (first/last).
+    pub fn slide_goto(&mut self, idx: usize) {
+        let Some(m) = self.marp.as_mut() else {
+            return;
+        };
+        let idx = idx.min(m.deck.len().saturating_sub(1));
+        if idx != m.slide {
+            m.slide = idx;
+            self.scroll = 0;
+            self.rendered = None;
+        }
+    }
+
+    /// Toggle between slide-at-a-time presentation and the ordinary scrolling
+    /// reader over the whole document. No-op for non-Marp documents.
+    pub fn toggle_present(&mut self) {
+        if let Some(m) = self.marp.as_mut() {
+            m.present = !m.present;
+            self.scroll = 0;
+            self.rendered = None;
+        }
+    }
+
+    /// Leave presentation mode (if in it). Returns whether it was active — lets
+    /// the Esc handler consume the key only when it actually exited a deck.
+    pub fn exit_present(&mut self) -> bool {
+        match self.marp.as_mut() {
+            Some(m) if m.present => {
+                m.present = false;
+                self.scroll = 0;
+                self.rendered = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Build a reader over a fetched HackMD note. Sits next to `from_file`;
     /// the origin carries the metadata cloud actions need.
     pub fn from_cloud(note: &crate::types::SingleNote, etag: Option<String>) -> Self {
@@ -4714,6 +4821,7 @@ impl Reader {
             jsonl_overlay: None,
             hover_jsonl: None,
             tables: crate::tui::links::TableExpansions::new(),
+            marp: None,
         }
     }
 
@@ -6940,6 +7048,107 @@ mod cloud_msg_tests {
 
     const LINKED_DOC: &str =
         "<!-- hackmd-sync\nid: AbCdEf123\nurl: https://hackmd.io/AbCdEf123\n-->\n# hi\n";
+
+    const DECK: &str = "---\nmarp: true\npaginate: true\n---\n<!-- _class: lead -->\n# Title\n\n---\n\n## Second\n\n- a\n- b\n";
+
+    /// Opening a Marp file auto-enters presentation mode and renders only the
+    /// current slide; slide navigation moves the deck and re-renders.
+    #[test]
+    fn marp_file_presents_and_navigates() {
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deck.md");
+        std::fs::write(&path, DECK).unwrap();
+        open_file_reader(&mut app, &path);
+
+        // Auto-entered presentation on slide 0.
+        let View::Reader(r) = &app.view else {
+            panic!("reader")
+        };
+        assert!(r.marp_present(), "a Marp deck opens in presentation mode");
+        assert_eq!(r.marp.as_ref().unwrap().deck.len(), 2);
+
+        // First slide renders the title, not the second slide's content.
+        app.ensure_rendered(80);
+        let View::Reader(r) = &app.view else {
+            panic!("reader")
+        };
+        let text: String = r
+            .rendered
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Title"), "slide 0 shows the title");
+        assert!(!text.contains("Second"), "slide 0 must not show slide 1");
+
+        // Advance one slide and re-render.
+        if let View::Reader(r) = &mut app.view {
+            r.slide_by(1);
+        }
+        app.ensure_rendered(80);
+        let View::Reader(r) = &app.view else {
+            panic!("reader")
+        };
+        assert_eq!(r.marp.as_ref().unwrap().slide, 1);
+        let text: String = r
+            .rendered
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Second"), "slide 1 shows its heading");
+
+        // Can't advance past the last slide (no wrap).
+        if let View::Reader(r) = &mut app.view {
+            r.slide_by(1);
+            assert_eq!(r.marp.as_ref().unwrap().slide, 1);
+        }
+
+        // Toggling off presentation renders the whole document again.
+        if let View::Reader(r) = &mut app.view {
+            r.toggle_present();
+            assert!(!r.marp_present());
+        }
+        app.ensure_rendered(80);
+        let View::Reader(r) = &app.view else {
+            panic!("reader")
+        };
+        let text: String = r
+            .rendered
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("Title") && text.contains("Second"),
+            "scroll mode shows the full deck"
+        );
+    }
+
+    /// A plain markdown file (no `marp: true`) is never treated as a deck.
+    #[test]
+    fn plain_markdown_is_not_a_deck() {
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "# Just a note\n\n---\n\nmore text\n").unwrap();
+        open_file_reader(&mut app, &path);
+        let View::Reader(r) = &app.view else {
+            panic!("reader")
+        };
+        assert!(r.marp.is_none());
+        assert!(!r.marp_present());
+    }
 
     /// Opening a HackMD-linked local file offers a confirm prompt and does NOT
     /// spend an API call until the user accepts — this is the fix for the 15s
