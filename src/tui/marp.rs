@@ -94,7 +94,9 @@ pub fn detect(raw: &str) -> bool {
 /// single (possibly empty) slide so the presenter always has something to show.
 pub fn parse(raw: &str) -> Deck {
     let mut global = Directives::default();
-    let body = strip_front_matter(raw, &mut global);
+    // Front-matter spot directives (`_class: lead`, …) apply to the first slide.
+    let mut pending_local = Directives::default();
+    let body = strip_front_matter(raw, &mut global, &mut pending_local);
 
     let mut slides = Vec::new();
     for chunk in split_slides(body) {
@@ -105,6 +107,9 @@ pub fn parse(raw: &str) -> Deck {
             // slide — but its global directives above still carry forward.
             continue;
         }
+        // Fold the pending front-matter spot directives into the first real
+        // slide (in-slide `_` comments still win over them), then consume.
+        let local = std::mem::take(&mut pending_local).merged(&local);
         let eff = global.merged(&local);
         slides.push(Slide {
             body: clean.trim_matches('\n').to_string(),
@@ -220,7 +225,11 @@ fn unquote(s: &str) -> String {
 /// Consume a leading `---` … `---`/`...` front-matter block, applying any
 /// recognised directives to `global`, and return the remaining body. Returns
 /// `raw` unchanged when there is no front matter.
-fn strip_front_matter<'a>(raw: &'a str, global: &mut Directives) -> &'a str {
+fn strip_front_matter<'a>(
+    raw: &'a str,
+    global: &mut Directives,
+    first_local: &mut Directives,
+) -> &'a str {
     let first_end = raw.find('\n').unwrap_or(raw.len());
     if raw[..first_end].trim_end() != "---" {
         return raw;
@@ -233,13 +242,9 @@ fn strip_front_matter<'a>(raw: &'a str, global: &mut Directives) -> &'a str {
             let body_start = (end + 1).min(raw.len());
             return &raw[body_start..];
         }
-        // Front matter is global scope; a stray `_key` here is meaningless.
-        if let Some((k, v)) = line.split_once(':') {
-            let k = k.trim();
-            if known_directive(k) {
-                global.set(k, v.trim());
-            }
-        }
+        // A `_`-prefixed key in front matter is a Marp "spot" directive scoped
+        // to the first slide; a plain key is global.
+        apply_directive_line(line, global, first_local);
         if end >= raw.len() {
             break;
         }
@@ -250,22 +255,51 @@ fn strip_front_matter<'a>(raw: &'a str, global: &mut Directives) -> &'a str {
 }
 
 /// Split a body into slide chunks on `---` page breaks. Any line that is only
-/// dashes (three or more, optionally space-separated) is a break. This is
-/// deliberately greedy: in a Marp deck a lone `---` is a slide separator, so we
-/// don't try to disambiguate the rare setext-`##` underline it collides with.
+/// dashes (three or more, optionally space-separated) is a break — EXCEPT inside
+/// a fenced code block, where a `---` line is code (this is what shattered decks
+/// that show a `---` separator inside a ```` ```markdown ```` sample). This is
+/// deliberately greedy otherwise: in a Marp deck a lone `---` is a slide
+/// separator, so we don't try to disambiguate the rare setext-`##` underline it
+/// collides with.
 fn split_slides(body: &str) -> Vec<String> {
     let mut slides = Vec::new();
     let mut cur = String::new();
+    // `Some((marker, len))` while inside a ``` / ~~~ fence of that width.
+    let mut fence: Option<(char, usize)> = None;
     for line in body.lines() {
-        if is_page_break(line) {
-            slides.push(std::mem::take(&mut cur));
-        } else {
-            cur.push_str(line);
-            cur.push('\n');
+        match fence {
+            Some((marker, len)) => {
+                if fence_marker(line).is_some_and(|(m, n)| m == marker && n >= len) {
+                    fence = None;
+                }
+            }
+            None => {
+                if let Some(open) = fence_marker(line) {
+                    fence = Some(open);
+                } else if is_page_break(line) {
+                    slides.push(std::mem::take(&mut cur));
+                    continue;
+                }
+            }
         }
+        cur.push_str(line);
+        cur.push('\n');
     }
     slides.push(cur);
     slides
+}
+
+/// A code-fence line (``` or ~~~, 3+), returning `(marker, run length)`. The
+/// info string after an opening fence is ignored. `None` for non-fence lines.
+fn fence_marker(line: &str) -> Option<(char, usize)> {
+    let t = line.trim_start();
+    for marker in ['`', '~'] {
+        let n = t.chars().take_while(|&c| c == marker).count();
+        if n >= 3 {
+            return Some((marker, n));
+        }
+    }
+    None
 }
 
 fn is_page_break(line: &str) -> bool {
@@ -370,6 +404,25 @@ mod tests {
         assert!(deck.slides[0].paginate);
         assert!(deck.slides[1].paginate);
         assert_eq!(deck.slides[1].footer.as_deref(), Some("Corp"));
+    }
+
+    #[test]
+    fn page_break_inside_code_fence_is_not_a_split() {
+        // The canonical Marp starter deck: slide 2 contains a fenced markdown
+        // sample whose `---` must NOT create extra slides.
+        let src = "---\nmarp: true\n---\n# One\n\n---\n\n# Two\n\n```markdown\n# Slide 1\n\n---\n\n# Slide 2\n```\n";
+        let deck = parse(src);
+        assert_eq!(deck.len(), 2, "code-fence `---` must not split the deck");
+        assert!(deck.slides[1].body.contains("```markdown"));
+        assert!(deck.slides[1].body.contains("# Slide 2"));
+    }
+
+    #[test]
+    fn front_matter_spot_directive_scopes_to_first_slide() {
+        // `_class: lead` in the front matter centers only slide 1.
+        let deck = parse("---\nmarp: true\n_class: lead\n---\n# Cover\n\n---\n\n# Body\n");
+        assert!(deck.slides[0].lead, "front-matter `_class` centers slide 1");
+        assert!(!deck.slides[1].lead, "and no other slide");
     }
 
     #[test]
