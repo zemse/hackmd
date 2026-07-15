@@ -170,7 +170,11 @@ pub fn parse(raw: &str) -> Deck {
     let mut global = Directives::default();
     // Front-matter spot directives (`_class: lead`, …) apply to the first slide.
     let mut pending_local = Directives::default();
-    let body = strip_front_matter(raw, &mut global, &mut pending_local);
+    // Skip a leading `<!-- marp: true -->` enable comment (and any blank lines)
+    // so the front matter after it is still recognized and stripped, rather than
+    // rendered as a slide of raw `theme:`/`paginate:` text.
+    let head = strip_leading_noise(raw, &mut global, &mut pending_local);
+    let body = strip_front_matter(head, &mut global, &mut pending_local);
 
     let mut slides = Vec::new();
     for chunk in split_slides(body) {
@@ -298,6 +302,56 @@ fn unquote(s: &str) -> String {
         s[1..s.len() - 1].to_string()
     } else {
         s.to_string()
+    }
+}
+
+/// Skip leading blank lines and whole HTML comments, returning the remaining
+/// slice. Directives inside skipped comments are applied (so a leading
+/// `<!-- marp: true -->` enable marker, or a `<!-- _class: lead -->` directive
+/// placed above the front matter, is consumed instead of rendered). This lets
+/// `strip_front_matter` find front matter even when a comment precedes it.
+fn strip_leading_noise<'a>(
+    raw: &'a str,
+    global: &mut Directives,
+    first_local: &mut Directives,
+) -> &'a str {
+    let mut pos = 0;
+    loop {
+        // Advance over any run of blank lines.
+        loop {
+            if pos >= raw.len() {
+                return "";
+            }
+            let end = raw[pos..].find('\n').map(|p| pos + p).unwrap_or(raw.len());
+            if raw[pos..end].trim().is_empty() {
+                if end >= raw.len() {
+                    return "";
+                }
+                pos = end + 1;
+            } else {
+                break;
+            }
+        }
+        // `pos` is at a non-blank line. If it opens an HTML comment, consume the
+        // whole comment (possibly multi-line) and keep scanning; otherwise this
+        // is where real content / front matter begins.
+        let rest = &raw[pos..];
+        let after_indent = rest.trim_start();
+        if !after_indent.starts_with("<!--") {
+            return rest;
+        }
+        let open = pos + (rest.len() - after_indent.len());
+        match raw[open + 4..].find("-->") {
+            Some(rel) => {
+                parse_comment(&raw[open + 4..open + 4 + rel], global, first_local);
+                pos = open + 4 + rel + 3;
+            }
+            None => {
+                // Unterminated comment: the rest of the document is comment.
+                parse_comment(&raw[open + 4..], global, first_local);
+                return "";
+            }
+        }
     }
 }
 
@@ -632,6 +686,29 @@ mod tests {
     fn empty_document_yields_one_slide() {
         let deck = parse("---\nmarp: true\n---\n");
         assert_eq!(deck.len(), 1);
+    }
+
+    #[test]
+    fn comment_before_front_matter_is_still_stripped() {
+        // A `<!-- marp: true -->` enable marker above the front matter must not
+        // stop the `---` block from being recognized and stripped (else the raw
+        // `theme:`/`paginate:` YAML renders as the first slide).
+        let src = "<!-- marp: true -->\n\n---\ntheme: gaia\n_class: lead\npaginate: true\n---\n\n# **Marp**\n\ntagline\n\n---\n\n# Second\n";
+        assert!(detect(src));
+        let deck = parse(src);
+        assert_eq!(deck.len(), 2, "front matter must not become a slide");
+        for s in &deck.slides {
+            assert!(
+                !s.body.contains("theme:"),
+                "front matter leaked: {:?}",
+                s.body
+            );
+            assert!(!s.body.contains("marp: true"), "enable comment leaked");
+        }
+        assert!(deck.slides[0].body.contains("# **Marp**"));
+        assert!(deck.slides[0].paginate);
+        assert!(deck.slides[0].lead, "front-matter _class scopes to slide 1");
+        assert!(deck.slides[1].body.contains("# Second"));
     }
 
     #[test]
