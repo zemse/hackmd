@@ -683,10 +683,21 @@ impl Builder {
                 } else {
                     format!("[image: {} ({})]", title, dest_url)
                 };
-                // Resolve image path against the markdown file's base dir.
-                let resolved: PathBuf = match self.base_dir.as_ref() {
-                    Some(b) => b.join(dest_url.as_ref()),
-                    None => PathBuf::from(dest_url.as_ref()),
+                // Resolve the image source. A remote URL is kept verbatim (the
+                // image loader downloads it); `Path::join` would otherwise mangle
+                // the `https://` into `base/https:/…`. A local path is resolved
+                // against the markdown file's base dir.
+                let is_url = {
+                    let u = dest_url.as_ref();
+                    u.starts_with("http://") || u.starts_with("https://")
+                };
+                let resolved: PathBuf = if is_url {
+                    PathBuf::from(dest_url.as_ref())
+                } else {
+                    match self.base_dir.as_ref() {
+                        Some(b) => b.join(dest_url.as_ref()),
+                        None => PathBuf::from(dest_url.as_ref()),
+                    }
                 };
                 let img_idx = self.images.len();
                 self.images.push(resolved);

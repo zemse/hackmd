@@ -9,8 +9,7 @@ use crate::tui::links::LinkTarget;
 use crate::tui::markdown::{self, Rendered};
 use crate::tui::theme::Theme;
 use ratatui_image::picker::Picker;
-use ratatui_image::protocol::StatefulProtocol;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Statusline hint shown when a cloud action is attempted with no token.
 pub const NO_TOKEN_HINT: &str = "No HackMD token — run `hackmd login` or set HMD_API_ACCESS_TOKEN";
@@ -126,8 +125,9 @@ pub struct App {
     /// Detected terminal image protocol. `None` if the terminal can't render
     /// images (then we fall back to placeholder text).
     pub image_picker: Option<Picker>,
-    /// Lazily-decoded image protocol cache, keyed by canonicalised path.
-    pub image_protocols: HashMap<PathBuf, StatefulProtocol>,
+    /// Async image loader + decoded-protocol cache, keyed by source string
+    /// (local path or remote URL). Handles remote download and SVG rasterizing.
+    pub images: crate::tui::images::ImageStore,
     /// Raw-pane and preview-pane rects from the last frame in split-edit
     /// mode. Used by event routing (which pane received the click / wheel).
     /// Both default to `Rect::default()` outside split-edit mode.
@@ -1025,7 +1025,7 @@ impl App {
             scroll_accum: 0.0,
             last_scroll_at: None,
             image_picker: None,
-            image_protocols: HashMap::new(),
+            images: crate::tui::images::ImageStore::new(),
             edit_raw_area: Rect::default(),
             edit_preview_area: Rect::default(),
             read_state,
@@ -1441,6 +1441,15 @@ impl App {
     /// would otherwise be left on the user's main screen.
     pub fn init_image_picker(&mut self) {
         self.image_picker = Picker::from_query_stdio().ok();
+    }
+
+    /// Fold any images that finished loading on their worker threads into ready
+    /// protocols. Cheap no-op when nothing landed; called once per event tick.
+    /// Skipped entirely when the terminal has no image protocol.
+    pub fn drain_images(&mut self) {
+        if let Some(picker) = self.image_picker.as_mut() {
+            self.images.drain(picker);
+        }
     }
 
     pub fn record_current(&self) -> HistoryEntry {

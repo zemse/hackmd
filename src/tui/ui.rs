@@ -1230,27 +1230,13 @@ fn draw_images_overlay(f: &mut Frame, app: &mut App, body: Rect) {
         if rel_y < 0 || rel_y as u16 >= body.height {
             continue;
         }
-        let path = match std::fs::canonicalize(&img.source) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if !app.image_protocols.contains_key(&path) {
-            let dyn_img = match image::ImageReader::open(&path) {
-                Ok(rdr) => match rdr.decode() {
-                    Ok(d) => d,
-                    Err(_) => continue,
-                },
-                Err(_) => continue,
-            };
-            let proto = match app.image_picker.as_ref() {
-                Some(p) => p.new_resize_protocol(dyn_img),
-                None => continue,
-            };
-            app.image_protocols.insert(path.clone(), proto);
-        }
-        let proto = match app.image_protocols.get_mut(&path) {
-            Some(p) => p,
-            None => continue,
+        // Key by the source string (local path or remote URL). The loader
+        // downloads / rasterizes on a worker thread; until it's ready the image
+        // simply isn't drawn (the `[image: …]` placeholder line shows through).
+        let key = img.source.to_string_lossy();
+        app.images.request(&key);
+        let Some(proto) = app.images.get_mut(&key) else {
+            continue;
         };
         let max_h = body.height.saturating_sub(rel_y as u16);
         let h = 12u16.min(max_h);

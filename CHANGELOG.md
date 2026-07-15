@@ -14,7 +14,15 @@
   Global `header`/`footer`/`paginate` directives carry across slides (locals like
   `_class: lead` apply to one slide and center it), and the page number renders
   bottom-right when `paginate` is on. `p` (or `Esc`) toggles between the deck and
-  the ordinary scrolling reader.
+  the ordinary scrolling reader. A `---` inside a fenced code block no longer
+  splits the deck, and front-matter spot directives (`_class: lead`) scope to the
+  first slide.
+- **Remote and SVG images in the reader** — images now load off the render
+  thread: remote `http(s)://` assets are downloaded (and cached), and `.svg`
+  sources are rasterized (via `resvg`) before being handed to the terminal
+  graphics protocol (kitty / iTerm2 / sixel). Previously only local raster files
+  rendered; a Marp deck's remote SVG logos now appear too. Terminals without a
+  graphics protocol still show the `[image: …]` placeholder.
 - **Mermaid diagrams in the view pane** — a ` ```mermaid ` fenced block now
   renders as a Unicode box-drawing diagram in the reader instead of raw source
   (sequence, flowchart, class, ER, and xychart types via `merman-core` +

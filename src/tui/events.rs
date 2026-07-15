@@ -36,6 +36,9 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
         app.poll_git_status(ext_changed || dir_changed);
         // Apply any cloud operations that finished since the last tick.
         app.drain_cloud_msgs();
+        // Promote any images that finished downloading / rasterizing on their
+        // worker threads into ready protocols for this frame.
+        app.drain_images();
         // HackMD sync for a linked, open local file: on first sight, offer a
         // one-shot prompt to pull upstream edits (no background polling — each
         // fetch costs an API call against a quota as low as 400/month).

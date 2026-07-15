@@ -45,6 +45,7 @@ tui = [
     "dep:diffy",
     "dep:merman-ascii",
     "dep:merman-core",
+    "dep:resvg",
 ]
 
 [dependencies]
@@ -85,6 +86,10 @@ diffy = { version = "0.4", optional = true }
 # lays that model out as terminal text. Used only in read/view mode.
 merman-ascii = { version = "0.7", optional = true }
 merman-core = { version = "0.7", optional = true }
+# Rasterize SVG images (e.g. Marp decks that embed remote `.svg` assets) to a
+# bitmap the terminal image protocol can display. Re-exports usvg + tiny-skia.
+# default-features off drops the font/text machinery we don't need for logos.
+resvg = { version = "0.45", default-features = false, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # System dictionary lookup (DCSCopyTextDefinition) for the in-TUI definition
