@@ -96,8 +96,10 @@ impl Slide {
 
 /// True when `raw` should be treated as a Marp deck.
 pub fn detect(raw: &str) -> bool {
-    // Front matter: `---` on the first line, then a `marp: true` directive
-    // before the closing `---`/`...`.
+    // Front matter: `---` on the first line, then either an explicit `marp: true`
+    // or a Marp-distinctive directive before the closing `---`/`...`. The
+    // canonical marp.app example omits `marp: true` (the site enables Marp
+    // globally), so recognizing its directives is what makes it render as a deck.
     if let Some(first_end) = raw.find('\n')
         && raw[..first_end].trim_end() == "---"
     {
@@ -108,7 +110,7 @@ pub fn detect(raw: &str) -> bool {
             if line == "---" || line == "..." {
                 break;
             }
-            if is_marp_true(line) {
+            if is_marp_true(line) || is_marp_signal(line) {
                 return true;
             }
             if end >= raw.len() {
@@ -133,6 +135,33 @@ pub fn detect(raw: &str) -> bool {
         break;
     }
     false
+}
+
+/// True if a front-matter line is a Marp-distinctive directive — one that
+/// signals a deck even without `marp: true`. Deliberately narrow to avoid
+/// treating ordinary Jekyll/Hugo front matter (`theme:`, `title:`, `layout:`,
+/// `class:`) as a deck: only Marp uses camelCase `background*`, the `paginate`
+/// toggle, `marp:`, or an underscore-prefixed "spot" directive.
+fn is_marp_signal(line: &str) -> bool {
+    let Some((key, _)) = line.split_once(':') else {
+        return false;
+    };
+    let key = key.trim();
+    if let Some(rest) = key.strip_prefix('_') {
+        // `_class`, `_paginate`, `_header`, … — underscore directives are Marp.
+        return known_directive(rest);
+    }
+    // Note: `marp:` itself is intentionally omitted — `marp: true` is handled by
+    // `is_marp_true`, and `marp: false` must NOT count as a signal.
+    matches!(
+        key,
+        "paginate"
+            | "backgroundColor"
+            | "backgroundImage"
+            | "backgroundPosition"
+            | "backgroundRepeat"
+            | "backgroundSize"
+    )
 }
 
 /// Parse `raw` into a deck. Never fails: a malformed or empty document yields a
@@ -498,6 +527,32 @@ mod tests {
     }
 
     #[test]
+    fn detects_marp_directives_without_marp_true() {
+        // The canonical marp.app homepage example has no `marp: true`.
+        let deck = "---\ntheme: gaia\nclass: lead\npaginate: true\nbackgroundColor: #fff\nbackgroundImage: url('https://marp.app/assets/hero-background.svg')\n---\n\n# Marp\n";
+        assert!(
+            detect(deck),
+            "marp.app example must be recognized as a deck"
+        );
+        // A single strong signal is enough.
+        assert!(detect("---\npaginate: true\n---\n# Hi"));
+        assert!(detect("---\n_class: lead\n---\n# Hi"));
+        assert!(detect("---\nbackgroundImage: url(x.png)\n---\n# Hi"));
+    }
+
+    #[test]
+    fn ordinary_front_matter_is_not_a_deck() {
+        // Jekyll / Hugo posts use theme/title/layout/class/date — not a deck.
+        assert!(!detect(
+            "---\nlayout: post\ntitle: Hello\ntheme: minima\ntags: [a, b]\n---\n# Post\n"
+        ));
+        assert!(!detect("---\ntheme: hugo-book\nweight: 3\n---\n# Docs\n"));
+        assert!(!detect(
+            "---\nclass: featured\ndate: 2026-01-01\n---\n# Blog\n"
+        ));
+    }
+
+    #[test]
     fn detects_leading_comment() {
         assert!(detect("<!-- marp: true -->\n# Hi"));
         assert!(detect("\n\n<!-- marp: true -->\n# Hi"));
@@ -577,6 +632,28 @@ mod tests {
     fn empty_document_yields_one_slide() {
         let deck = parse("---\nmarp: true\n---\n");
         assert_eq!(deck.len(), 1);
+    }
+
+    #[test]
+    fn marp_app_example_parses_without_leaking_front_matter() {
+        // The exact marp.app homepage example (no `marp: true`).
+        let src = "---\ntheme: gaia\nclass: lead\npaginate: true\nbackgroundColor: #fff\nbackgroundImage: url('https://marp.app/assets/hero-background.svg')\n---\n\n![bg left:40% 80%](https://marp.app/assets/marp.svg)\n\n# **Marp**\n\nMarkdown Presentation Ecosystem\n\nhttps://marp.app/\n\n---\n\n# How to write slides\n\nSplit pages by horizontal ruler (`---`). It's very simple! :satisfied:\n";
+        assert!(detect(src));
+        let deck = parse(src);
+        assert_eq!(deck.len(), 2);
+        // No front-matter keys leak into the rendered body.
+        for s in &deck.slides {
+            for key in ["theme:", "paginate:", "backgroundColor", "backgroundImage"] {
+                assert!(!s.body.contains(key), "front matter leaked: {:?}", s.body);
+            }
+        }
+        // Slide 1: bg image extracted, heading kept; global paginate applies.
+        assert_eq!(deck.slides[0].background.len(), 1);
+        assert!(deck.slides[0].body.contains("# **Marp**"));
+        assert!(deck.slides[0].paginate);
+        // Global `class: lead` centers every slide here.
+        assert!(deck.slides[0].lead && deck.slides[1].lead);
+        assert!(deck.slides[1].body.contains("How to write slides"));
     }
 
     #[test]

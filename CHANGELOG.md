@@ -5,9 +5,12 @@
 ### Added
 
 - **Marp presentations** — a local markdown file that enables
-  [Marp](https://marp.app) (a `marp: true` line in the YAML front matter, or a
-  leading `<!-- marp: true -->` comment) now opens as a slide deck instead of a
-  scrolling document. Slides split on `---` page breaks; front-matter and
+  [Marp](https://marp.app) now opens as a slide deck instead of a scrolling
+  document. A deck is recognized by a `marp: true` line, a leading
+  `<!-- marp: true -->` comment, or (like the canonical marp.app example, which
+  omits `marp: true`) any Marp-distinctive front-matter directive — `paginate`,
+  `backgroundColor`/`backgroundImage`, or a `_`-prefixed spot directive — while
+  ordinary Jekyll/Hugo front matter stays a plain document. Slides split on `---` page breaks; front-matter and
   `<!-- ... -->` directives/presenter-notes are hidden from the render. Arrow
   keys, `Space`, and PageUp/PageDown switch slides (they don't scroll);
   `Home`/`End` jump to the first/last slide; the status bar shows `Slide n/m`.
