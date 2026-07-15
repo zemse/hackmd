@@ -107,6 +107,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 body.width
             }
         }
+        // A presented slide has no scrollbar, so it uses the full body width —
+        // and this must match the width draw_slide computes its bg split from.
+        View::Reader(r) if r.marp_present() => body.width,
         _ => body.width.saturating_sub(1),
     };
     app.ensure_rendered(render_width);
@@ -115,6 +118,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_git_lens(f, app, body);
     } else {
         app.slide_area = None;
+        app.slide_bg.clear();
         match &app.view {
             View::Reader(r) => {
                 if r.in_split_edit() {
@@ -134,7 +138,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             // wires its own rect, so the global overlay is suppressed.
             let in_split = matches!(&app.view, View::Reader(r) if r.in_split_edit());
             if !in_split {
-                // In presentation mode, images sit inside the (possibly
+                // Marp slide backgrounds fill their reserved columns first.
+                draw_slide_bg_images(f, app);
+                // In presentation mode, inline images sit inside the (possibly
                 // centered) slide body; use that rect so they align with text.
                 let overlay_area = app.slide_area.unwrap_or(body);
                 draw_images_overlay(f, app, overlay_area);
@@ -747,6 +753,38 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
     let total = marp.deck.len();
     let idx = marp.slide;
 
+    // Background images (`![bg left/right]`) carve a column off the slide; the
+    // text content flows in what remains. Record the image regions for the
+    // overlay to fill, then lay out the text column.
+    let (left_w, right_w) = slide.split_widths(area.width);
+    let content_x = area.x + left_w;
+    let content_w = area.width.saturating_sub(left_w + right_w).max(1);
+    for bg in &slide.background {
+        use crate::tui::marp::BgPlacement;
+        let rect = match bg.placement {
+            BgPlacement::Left(_) => Rect {
+                x: area.x,
+                y: area.y,
+                width: left_w,
+                height: area.height,
+            },
+            BgPlacement::Right(_) => Rect {
+                x: area.x + area.width.saturating_sub(right_w),
+                y: area.y,
+                width: right_w,
+                height: area.height,
+            },
+            BgPlacement::Full => area,
+        };
+        if rect.width > 0 && rect.height > 0 {
+            app.slide_bg.push((bg.url.clone(), rect));
+        }
+    }
+
+    // 1-col gutters inside the text column.
+    let text_x = content_x + 1;
+    let text_w = content_w.saturating_sub(2).max(1);
+
     // Reserve top/bottom chrome rows only when there's something to put there.
     let has_header = slide.header.is_some();
     let page = if slide.paginate {
@@ -756,17 +794,16 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
     };
     let has_footer = slide.footer.is_some() || page.is_some();
     let top = area.y + has_header as u16;
-    let bottom_reserved = has_footer as u16;
     let mid_h = area
         .height
-        .saturating_sub(has_header as u16 + bottom_reserved);
+        .saturating_sub(has_header as u16 + has_footer as u16);
 
     // Header ribbon.
     if let Some(h) = &slide.header {
         let hdr = Rect {
-            x: area.x + 1,
+            x: text_x,
             y: area.y,
-            width: area.width.saturating_sub(2),
+            width: text_w,
             height: 1,
         };
         f.render_widget(
@@ -787,13 +824,10 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
     } else {
         0
     };
-    // 1-col gutters each side. The Markdown pass already wrapped at
-    // `area.width - 1`, so this only ever clips lines within a column of the
-    // full width — which the renderer avoids anyway.
     let body_area = Rect {
-        x: area.x + 1,
+        x: text_x,
         y: top + pad,
-        width: area.width.saturating_sub(2),
+        width: text_w,
         height: mid_h.saturating_sub(pad),
     };
     let lines: Vec<Line> = rendered
@@ -808,7 +842,7 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
         para = para.alignment(Alignment::Center);
     }
     f.render_widget(para, body_area);
-    // Publish the body rect so the image overlay aligns images with the text.
+    // Publish the body rect so the inline image overlay aligns with the text.
     app.slide_area = Some(body_area);
 
     // Footer row: footer text on the left, page number on the right.
@@ -816,9 +850,9 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
         let fy = area.y + area.height.saturating_sub(1);
         if let Some(footer) = &slide.footer {
             let fa = Rect {
-                x: area.x + 1,
+                x: text_x,
                 y: fy,
-                width: area.width.saturating_sub(2),
+                width: text_w,
                 height: 1,
             };
             f.render_widget(
@@ -832,7 +866,7 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
         if let Some(page) = &page {
             let w = UnicodeWidthStr::width(page.as_str()) as u16;
             let pa = Rect {
-                x: area.x + area.width.saturating_sub(w + 1),
+                x: text_x + text_w.saturating_sub(w),
                 y: fy,
                 width: w,
                 height: 1,
@@ -853,6 +887,25 @@ fn draw_slide(f: &mut Frame, app: &mut App, area: Rect) {
     {
         let p = p.clone();
         app.read_state.mark_read(&p);
+    }
+}
+
+/// Fill each Marp slide-background region (`app.slide_bg`, set by `draw_slide`)
+/// with its image via the graphics protocol. No-op without a picker or when the
+/// current view has no backgrounds. The image loader fetches / rasterizes each
+/// source on a worker thread; until it's ready the region simply stays blank.
+fn draw_slide_bg_images(f: &mut Frame, app: &mut App) {
+    use ratatui_image::StatefulImage;
+
+    if app.image_picker.is_none() || app.slide_bg.is_empty() {
+        return;
+    }
+    let regions = app.slide_bg.clone();
+    for (url, rect) in &regions {
+        app.images.request(url);
+        if let Some(proto) = app.images.get_mut(url) {
+            f.render_stateful_widget(StatefulImage::default(), *rect, proto);
+        }
     }
 }
 
@@ -2951,6 +3004,58 @@ mod tests {
         // A 1-row-tall viewport must not panic (all chrome saturates away).
         let mut tiny = ratatui::Terminal::new(TestBackend::new(10, 2)).unwrap();
         tiny.draw(|f| draw(f, &mut app)).unwrap();
+    }
+
+    // A `![bg left:40%]` slide reserves the left 40% for the image and lays the
+    // text out in the right column.
+    #[test]
+    fn draw_slide_positions_left_background() {
+        use ratatui::backend::TestBackend;
+        let mut p = std::env::temp_dir();
+        p.push(format!("md-tui-marp-bg-{}.md", std::process::id()));
+        std::fs::write(
+            &p,
+            "---\nmarp: true\n---\n![bg left:40%](https://example.com/logo.svg)\n\n# Heading\n\ntext body\n",
+        )
+        .unwrap();
+        let opts = Options {
+            width: 80,
+            line_numbers: false,
+            theme: Theme::dark(),
+        };
+        let mut app = App::new(Source::File(p), opts).unwrap();
+
+        let mut term = ratatui::Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+
+        // The background region was recorded: the left 40% of an 80-col slide.
+        assert_eq!(app.slide_bg.len(), 1);
+        let (url, rect) = &app.slide_bg[0];
+        assert_eq!(url, "https://example.com/logo.svg");
+        assert_eq!(rect.x, 0);
+        assert_eq!(rect.width, 32); // 80 * 0.40
+        assert_eq!(rect.height, 23); // 24 rows minus the statusline
+
+        // Text is laid out to the right of the reserved column.
+        let body = app.slide_area.expect("slide body rect");
+        assert!(
+            body.x >= 32,
+            "text starts right of the bg column: {}",
+            body.x
+        );
+
+        // And the heading text is not painted into the left (image) column.
+        // Skip the last row — that's the statusline, not the slide.
+        let buf = term.backend().buffer().clone();
+        for y in 0..buf.area.height - 1 {
+            for x in 0..32u16 {
+                let s = buf[(x, y)].symbol();
+                assert!(
+                    s.trim().is_empty(),
+                    "left bg column must stay clear of text at ({x},{y}): {s:?}"
+                );
+            }
+        }
     }
 
     // An active hover over a link must show the URL preview even when a sticky

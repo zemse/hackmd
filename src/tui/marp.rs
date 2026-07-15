@@ -47,6 +47,51 @@ pub struct Slide {
     /// The slide carries a `lead` class — Marp's built-in "center everything"
     /// layout, which we approximate by vertically + horizontally centering.
     pub lead: bool,
+    /// Background images (`![bg ...](url)`) extracted from the body. A `left`/
+    /// `right` background reserves a column of the slide for the image; the text
+    /// flows in what remains.
+    pub background: Vec<BgImage>,
+}
+
+/// A Marp background image and where it sits on the slide.
+#[derive(Clone, Debug)]
+pub struct BgImage {
+    pub url: String,
+    pub placement: BgPlacement,
+}
+
+/// Background placement. The fraction is the share of the slide width the image
+/// column occupies (defaults to half when `left`/`right` carry no `:NN%`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BgPlacement {
+    Full,
+    Left(f32),
+    Right(f32),
+}
+
+impl Slide {
+    /// Cells to reserve on the left / right for background images at `total`
+    /// slide width. Never crushes the text column below a readable minimum.
+    pub fn split_widths(&self, total: u16) -> (u16, u16) {
+        let mut left = 0u16;
+        let mut right = 0u16;
+        for bg in &self.background {
+            match bg.placement {
+                BgPlacement::Left(f) => left = left.max((total as f32 * f).round() as u16),
+                BgPlacement::Right(f) => right = right.max((total as f32 * f).round() as u16),
+                BgPlacement::Full => {}
+            }
+        }
+        let budget = total.saturating_sub(16u16.min(total));
+        while left + right > budget && (left > 0 || right > 0) {
+            if left >= right {
+                left = left.saturating_sub(1);
+            } else {
+                right = right.saturating_sub(1);
+            }
+        }
+        (left, right)
+    }
 }
 
 /// True when `raw` should be treated as a Marp deck.
@@ -111,8 +156,11 @@ pub fn parse(raw: &str) -> Deck {
         // slide (in-slide `_` comments still win over them), then consume.
         let local = std::mem::take(&mut pending_local).merged(&local);
         let eff = global.merged(&local);
+        // Pull `![bg ...]` background images out of the flow so they don't
+        // render as inline `[image: …]` text; draw_slide positions them.
+        let (body, background) = extract_backgrounds(&clean);
         slides.push(Slide {
-            body: clean.trim_matches('\n').to_string(),
+            body: body.trim_matches('\n').to_string(),
             header: eff.header,
             footer: eff.footer,
             paginate: eff.paginate.unwrap_or(false),
@@ -121,6 +169,7 @@ pub fn parse(raw: &str) -> Deck {
                 .as_deref()
                 .map(|c| c.split_whitespace().any(|w| w == "lead"))
                 .unwrap_or(false),
+            background,
         });
     }
     if slides.is_empty() {
@@ -130,6 +179,7 @@ pub fn parse(raw: &str) -> Deck {
             footer: None,
             paginate: false,
             lead: false,
+            background: Vec::new(),
         });
     }
     Deck { slides }
@@ -308,6 +358,81 @@ fn is_page_break(line: &str) -> bool {
     dashes >= 3 && t.chars().all(|c| c == '-' || c == ' ')
 }
 
+/// Pull Marp background images (`![bg ...](url)`) out of the slide body, leaving
+/// the rest of the Markdown untouched. Returns `(clean_body, backgrounds)`.
+fn extract_backgrounds(body: &str) -> (String, Vec<BgImage>) {
+    let mut out = String::new();
+    let mut bgs = Vec::new();
+    let mut rest = body;
+    while let Some(pos) = rest.find("![") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        if let Some((alt, url, consumed)) = parse_image(after)
+            && is_bg_alt(alt)
+        {
+            bgs.push(BgImage {
+                url: url.to_string(),
+                placement: parse_placement(alt),
+            });
+            rest = &after[consumed..];
+            continue;
+        }
+        // Not a background image (or unparsable): keep `![` and move past it so
+        // an ordinary inline image is preserved.
+        out.push_str("![");
+        rest = &after[2..];
+    }
+    out.push_str(rest);
+    (out, bgs)
+}
+
+/// Parse a `![alt](url …)` starting at `s[0]`. Returns the alt text, the URL
+/// (first token inside the parens; a trailing `"title"` is ignored) and the
+/// number of bytes consumed. `None` if `s` isn't a complete image.
+fn parse_image(s: &str) -> Option<(&str, &str, usize)> {
+    let rest = s.strip_prefix("![")?;
+    let close = rest.find(']')?;
+    let alt = &rest[..close];
+    let after = rest[close + 1..].strip_prefix('(')?;
+    let end = after.find(')')?;
+    let url = after[..end].split_whitespace().next().unwrap_or("");
+    // "![" + alt + "]" + "(" + inside + ")"
+    let consumed = 2 + close + 1 + 1 + end + 1;
+    Some((alt, url, consumed))
+}
+
+/// A Marp background image is one whose alt text's first token is `bg`.
+fn is_bg_alt(alt: &str) -> bool {
+    alt.split_whitespace().next() == Some("bg")
+}
+
+/// Read placement from the alt keywords: `left`/`right` (optionally `:NN%`),
+/// else a full-slide background. Size keywords (`fit`, `cover`, `80%`) are
+/// ignored — the image is fit to its column.
+fn parse_placement(alt: &str) -> BgPlacement {
+    let mut placement = BgPlacement::Full;
+    for tok in alt.split_whitespace().skip(1) {
+        let (key, val) = tok.split_once(':').unwrap_or((tok, ""));
+        match key {
+            "left" => placement = BgPlacement::Left(parse_fraction(val)),
+            "right" => placement = BgPlacement::Right(parse_fraction(val)),
+            _ => {}
+        }
+    }
+    placement
+}
+
+/// A `NN%` share as a 0..1 fraction, clamped to a sane band. Empty → half.
+fn parse_fraction(val: &str) -> f32 {
+    let v = val.trim().trim_end_matches('%');
+    if v.is_empty() {
+        return 0.5;
+    }
+    v.parse::<f32>()
+        .map(|p| (p / 100.0).clamp(0.1, 0.9))
+        .unwrap_or(0.5)
+}
+
 /// Remove every `<!-- ... -->` comment from `chunk`, routing directive lines
 /// inside them to `global`/`local`. Returns the comment-free Markdown.
 fn strip_comments(chunk: &str, global: &mut Directives, local: &mut Directives) -> String {
@@ -452,6 +577,43 @@ mod tests {
     fn empty_document_yields_one_slide() {
         let deck = parse("---\nmarp: true\n---\n");
         assert_eq!(deck.len(), 1);
+    }
+
+    #[test]
+    fn background_image_is_extracted_with_placement() {
+        let deck = parse(
+            "---\nmarp: true\n---\n![bg left:40% 80%](https://marp.app/assets/marp.svg)\n\n# Marp\n\ntagline\n",
+        );
+        let s = &deck.slides[0];
+        // The bg image is pulled out of the flow…
+        assert!(
+            !s.body.contains("marp.svg"),
+            "bg image left in body: {:?}",
+            s.body
+        );
+        assert!(s.body.contains("# Marp"));
+        // …and recorded as a left 40% background.
+        assert_eq!(s.background.len(), 1);
+        assert_eq!(s.background[0].url, "https://marp.app/assets/marp.svg");
+        assert_eq!(s.background[0].placement, BgPlacement::Left(0.4));
+    }
+
+    #[test]
+    fn plain_bg_defaults_to_full_and_ordinary_images_stay() {
+        let deck = parse("---\nmarp: true\n---\n![bg](bgpic.png)\n\n![logo](logo.png)\n");
+        let s = &deck.slides[0];
+        assert_eq!(s.background.len(), 1);
+        assert_eq!(s.background[0].placement, BgPlacement::Full);
+        // A non-`bg` image is not touched.
+        assert!(s.body.contains("![logo](logo.png)"));
+    }
+
+    #[test]
+    fn split_widths_reserve_the_right_columns() {
+        let deck = parse("---\nmarp: true\n---\n![bg right:30%](x.png)\n\n# Hi\n");
+        let (left, right) = deck.slides[0].split_widths(100);
+        assert_eq!(left, 0);
+        assert_eq!(right, 30);
     }
 
     #[test]

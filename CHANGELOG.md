@@ -17,6 +17,11 @@
   the ordinary scrolling reader. A `---` inside a fenced code block no longer
   splits the deck, and front-matter spot directives (`_class: lead`) scope to the
   first slide.
+- **Marp background images** — a `![bg left:40%](url)` / `![bg right](url)`
+  background now reserves that fraction of the slide for the image and flows the
+  slide text into the remaining column (the image is pulled out of the text flow
+  instead of rendering as an inline `[image: …]` placeholder). Plain `![bg](url)`
+  fills the slide. The text re-wraps to the narrower content width.
 - **Remote and SVG images in the reader** — images now load off the render
   thread: remote `http(s)://` assets are downloaded (and cached), and `.svg`
   sources are rasterized (via `resvg`) before being handed to the terminal

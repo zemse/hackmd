@@ -46,6 +46,10 @@ pub struct App {
     /// this so images line up with the centered text. `None` when not
     /// presenting.
     pub slide_area: Option<Rect>,
+    /// Marp slide background images to paint this frame: `(source, region)`.
+    /// A `![bg left/right]` image reserves a column; the overlay fills it.
+    /// Rebuilt each present-mode frame, cleared otherwise.
+    pub slide_bg: Vec<(String, Rect)>,
     /// The row containing the statusline. Click handling on this row covers
     /// the back-button hit zone.
     pub statusline_area: Rect,
@@ -1002,6 +1006,7 @@ impl App {
             status: String::new(),
             viewport: Rect::new(0, 0, 0, 0),
             slide_area: None,
+            slide_bg: Vec::new(),
             statusline_area: Rect::new(0, 0, 0, 0),
             back_button_hit: None,
             cloud_tab_hits: Vec::new(),
@@ -4129,6 +4134,20 @@ impl App {
         // before the `view` borrow so it can be read while `r` is held.
         let viewport_h = self.viewport.height as usize;
         if let View::Reader(r) = &mut self.view {
+            // A Marp slide with a left/right background wraps its text into the
+            // narrower content column, so the cache key is that effective width
+            // (comparing against `target_w` would re-render every frame).
+            let target_w = if r.marp_present() {
+                let (l, rr) = r
+                    .marp
+                    .as_ref()
+                    .and_then(|m| m.current())
+                    .map(|s| s.split_widths(target_w))
+                    .unwrap_or((0, 0));
+                target_w.saturating_sub(l + rr).max(1)
+            } else {
+                target_w
+            };
             let needs = match &r.rendered {
                 Some(rd) => rd.width != target_w || r.edit.is_some(),
                 None => true,
