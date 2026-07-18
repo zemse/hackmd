@@ -137,6 +137,10 @@ pub struct App {
     /// Both default to `Rect::default()` outside split-edit mode.
     pub edit_raw_area: Rect,
     pub edit_preview_area: Rect,
+    /// Screen cell of the raw-pane edit cursor as last drawn, used to anchor
+    /// the heading-anchor autocomplete popup just below it. `None` when the
+    /// cursor is off-screen or not in split-edit mode.
+    pub edit_cursor_screen: Option<(u16, u16)>,
     /// Machine-local read/unread tracking for the file browser.
     pub read_state: crate::tui::read_state::ReadState,
     /// HackMD connection + caches. Disconnected (and inert) without a token.
@@ -561,6 +565,32 @@ pub struct EditState {
     /// so the user can choose an action (`y` copy, Del delete) instead of
     /// the reader's copy-on-release behaviour.
     pub selection: Option<EditSelection>,
+    /// Heading-anchor autocomplete popup. `Some` while the cursor sits inside
+    /// a `[](…#…)` link destination after a `#`, offering the referenced
+    /// document's headings. Up/Down move the selection, Tab/Enter (or a click)
+    /// write the chosen anchor slug, Esc dismisses.
+    pub anchor_complete: Option<AnchorComplete>,
+}
+
+/// Live state for the heading-anchor autocomplete popup (see
+/// [`EditState::anchor_complete`]).
+#[derive(Clone, Debug)]
+pub struct AnchorComplete {
+    /// Byte offset of the `#` that opened the popup, in `Reader::raw`. The
+    /// anchor text being completed is `raw[hash + 1 .. cursor]`.
+    pub hash: usize,
+    /// Every heading of the referenced document (the current buffer when the
+    /// path before `#` is empty, else the linked file), built once on open.
+    pub candidates: Vec<crate::tui::links::DocHeading>,
+    /// Indices into `candidates` that match the current query, in order.
+    pub matches: Vec<usize>,
+    /// Selected position within `matches`.
+    pub selected: usize,
+    /// First visible entry, windowed around `selected` at draw time. Stored so
+    /// mouse clicks can map a screen row back to a match.
+    pub scroll: usize,
+    /// Screen rect of the popup as last drawn, for click hit-testing.
+    pub rect: Rect,
 }
 
 /// A drag-selection in the raw editor pane, as byte offsets into
@@ -1033,6 +1063,7 @@ impl App {
             images: crate::tui::images::ImageStore::new(),
             edit_raw_area: Rect::default(),
             edit_preview_area: Rect::default(),
+            edit_cursor_screen: None,
             read_state,
             cloud: CloudState::new(cloud),
             last_local: None,
@@ -3021,6 +3052,7 @@ impl App {
                 mode: EditMode::Split,
                 last_drawn_cursor: None,
                 selection: None,
+                anchor_complete: None,
             });
             r.rendered = None;
             r.scroll = 0;
@@ -3307,6 +3339,143 @@ impl App {
         e.cursor = pos + text.len();
         e.dirty = true;
         e.command = None;
+        r.rendered = None;
+    }
+
+    /// Recompute the heading-anchor autocomplete popup against the current
+    /// buffer/cursor. Called after every ordinary edit keystroke. When
+    /// `allow_open` is set (the user just typed `#`) a matching context opens
+    /// a fresh popup; otherwise it only refreshes/closes one already open, so
+    /// merely moving the cursor past an existing `#` never pops the list up.
+    pub fn edit_anchor_sync(&mut self, allow_open: bool) {
+        // Phase 1: read-only detection, producing owned data so the immutable
+        // borrow of `self.view` is dropped before we mutate below.
+        let prepared = {
+            let View::Reader(r) = &self.view else {
+                return;
+            };
+            let Some(e) = r.edit.as_ref() else {
+                return;
+            };
+            let cursor = floor_char_boundary(&r.raw, e.cursor.min(r.raw.len()));
+            match anchor_context(&r.raw, cursor) {
+                None => None,
+                Some((hash, path)) => {
+                    let same = e.anchor_complete.as_ref().map(|a| a.hash) == Some(hash);
+                    if !same && !allow_open {
+                        None
+                    } else {
+                        // The path can't change without moving the `#`, so an
+                        // already-open popup on this same `#` keeps its list.
+                        let candidates = if same {
+                            e.anchor_complete.as_ref().unwrap().candidates.clone()
+                        } else {
+                            build_anchor_candidates(r, &self.root, path)
+                        };
+                        // Preserve the highlighted slug across a re-filter.
+                        let prev_slug = e.anchor_complete.as_ref().and_then(|a| {
+                            a.matches
+                                .get(a.selected)
+                                .and_then(|&i| a.candidates.get(i))
+                                .map(|c| c.slug.clone())
+                        });
+                        let query = r.raw[hash + 1..cursor].to_ascii_lowercase();
+                        Some((hash, candidates, prev_slug, query))
+                    }
+                }
+            }
+        };
+        let Some((hash, candidates, prev_slug, query)) = prepared else {
+            self.edit_anchor_dismiss();
+            return;
+        };
+        let matches: Vec<usize> = candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                query.is_empty()
+                    || c.slug.contains(&query)
+                    || c.text.to_ascii_lowercase().contains(&query)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if matches.is_empty() {
+            self.edit_anchor_dismiss();
+            return;
+        }
+        let selected = prev_slug
+            .and_then(|s| matches.iter().position(|&i| candidates[i].slug == s))
+            .unwrap_or(0);
+        if let View::Reader(r) = &mut self.view {
+            if let Some(e) = r.edit.as_mut() {
+                e.anchor_complete = Some(AnchorComplete {
+                    hash,
+                    candidates,
+                    matches,
+                    selected,
+                    scroll: 0,
+                    rect: Rect::default(),
+                });
+            }
+        }
+    }
+
+    /// Move the anchor-autocomplete selection by `delta` rows, wrapping around.
+    pub fn edit_anchor_move(&mut self, delta: i32) {
+        if let View::Reader(r) = &mut self.view {
+            if let Some(ac) = r.edit.as_mut().and_then(|e| e.anchor_complete.as_mut()) {
+                let n = ac.matches.len() as i32;
+                if n > 0 {
+                    ac.selected = (ac.selected as i32 + delta).rem_euclid(n) as usize;
+                }
+            }
+        }
+    }
+
+    /// Close the anchor-autocomplete popup without inserting anything.
+    pub fn edit_anchor_dismiss(&mut self) {
+        if let View::Reader(r) = &mut self.view {
+            if let Some(e) = r.edit.as_mut() {
+                e.anchor_complete = None;
+            }
+        }
+    }
+
+    /// Accept the highlighted anchor: replace the typed query (`raw[hash + 1 ..
+    /// cursor]`) with the chosen slug, leaving the `#` in place, and close the
+    /// popup. No-op if the stored range no longer makes sense.
+    pub fn edit_anchor_accept(&mut self) {
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        let Some(e) = r.edit.as_ref() else {
+            return;
+        };
+        let Some(ac) = e.anchor_complete.as_ref() else {
+            return;
+        };
+        let Some(slug) = ac
+            .matches
+            .get(ac.selected)
+            .and_then(|&i| ac.candidates.get(i))
+            .map(|c| c.slug.clone())
+        else {
+            return;
+        };
+        let start = ac.hash + 1;
+        let cursor = floor_char_boundary(&r.raw, e.cursor.min(r.raw.len()));
+        if start > cursor || cursor > r.raw.len() {
+            // Stale range (buffer moved under the popup) — just close it.
+            r.edit.as_mut().unwrap().anchor_complete = None;
+            return;
+        }
+        push_undo(r);
+        r.raw.replace_range(start..cursor, &slug);
+        let e = r.edit.as_mut().unwrap();
+        e.cursor = start + slug.len();
+        e.dirty = true;
+        e.command = None;
+        e.anchor_complete = None;
         r.rendered = None;
     }
 
@@ -5131,6 +5300,85 @@ fn line_bounds_with_newline(s: &str, pos: usize) -> (usize, usize) {
         .map(|i| start + i + 1)
         .unwrap_or(s.len());
     (start, end)
+}
+
+/// If the edit cursor sits inside a markdown link destination `](…)` with a
+/// `#` before it, return `(hash_offset, path)` where `hash_offset` is the byte
+/// offset of that `#` in `raw` and `path` is the destination text between the
+/// opening `(` and the `#` (the referenced file, empty for the current doc).
+/// The query being typed is `raw[hash_offset + 1 .. cursor]`. Returns `None`
+/// when the cursor isn't in such a destination.
+///
+/// `cursor` must be a char boundary. Detection is delimiter-based on ASCII
+/// bytes, so it never splits a multi-byte char.
+fn anchor_context(raw: &str, cursor: usize) -> Option<(usize, &str)> {
+    let bytes = raw.as_bytes();
+    // Walk back to the enclosing '('. A ')' or newline first means we're not
+    // inside an open destination.
+    let mut i = cursor;
+    let open = loop {
+        if i == 0 {
+            return None;
+        }
+        i -= 1;
+        match bytes[i] {
+            b')' | b'\n' => return None,
+            b'(' => break i,
+            _ => {}
+        }
+    };
+    // The '(' must be immediately preceded by ']' — otherwise it's a bare
+    // parenthesis, not a link destination.
+    if open == 0 || bytes[open - 1] != b']' {
+        return None;
+    }
+    // Anchor starts at the first '#' inside the destination-so-far.
+    let dest = &raw[open + 1..cursor];
+    let hash_rel = dest.find('#')?;
+    let hash = open + 1 + hash_rel;
+    let path = &raw[open + 1..hash];
+    let query = &raw[hash + 1..cursor];
+    // A space (link title) or stray '#' in the query means this isn't a plain
+    // path#anchor destination we should complete.
+    if path.bytes().any(|b| b == b' ' || b == b'\t')
+        || query.bytes().any(|b| b == b' ' || b == b'\t' || b == b'#')
+    {
+        return None;
+    }
+    Some((hash, path))
+}
+
+/// Build the anchor candidates for a link destination `path`. Empty `path`
+/// means the current buffer; otherwise the path is resolved (relative to the
+/// current file, then the vault root) and that markdown file's headings are
+/// read from disk. Returns an empty list for non-markdown or missing targets.
+fn build_anchor_candidates(
+    r: &Reader,
+    root: &Path,
+    path: &str,
+) -> Vec<crate::tui::links::DocHeading> {
+    use crate::tui::links::{self, LinkTarget};
+    if path.is_empty() {
+        return links::extract_headings(&r.raw);
+    }
+    let base_dir = match &r.origin {
+        ReaderOrigin::File(p) => p.parent().map(|p| p.to_path_buf()),
+        _ => None,
+    };
+    let file = match links::resolve(path, base_dir.as_deref()) {
+        LinkTarget::LocalFile(p) => resolve_local_path(&p).or_else(|| vault_lookup(root, &p)),
+        _ => None,
+    };
+    let Some(file) = file else {
+        return Vec::new();
+    };
+    if !is_markdown_file(&file) {
+        return Vec::new();
+    }
+    match std::fs::read_to_string(&file) {
+        Ok(content) => links::extract_headings(&content),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Snap `pos` down to the nearest UTF-8 char boundary <= pos.
@@ -7309,6 +7557,7 @@ mod cloud_msg_tests {
             mode: EditMode::Split,
             last_drawn_cursor: None,
             selection: None,
+            anchor_complete: None,
         }
     }
 
@@ -7809,5 +8058,162 @@ mod cloud_msg_tests {
         assert_eq!(first_h1("just text\nmore text\n"), None);
         // `#nospace` is not a heading.
         assert_eq!(first_h1("#nospace\n"), None);
+    }
+
+    // ---- Heading-anchor autocomplete inside `[](…#…)` ----
+
+    /// A file-backed app dropped into edit mode over `raw`, cursor at byte
+    /// `cursor`. Stdin readers can't edit, so anchor-complete tests need a real
+    /// file origin; the returned `TempDir` keeps it alive for the test.
+    fn edit_app(raw: &str, cursor: usize) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("note.md");
+        std::fs::write(&path, "placeholder\n").unwrap();
+        let mut app = test_app();
+        open_file_reader(&mut app, &path);
+        edit_with(&mut app, raw, cursor);
+        (dir, app)
+    }
+
+    /// Drop an already-file-backed `app` into edit mode over `raw`.
+    fn edit_with(app: &mut App, raw: &str, cursor: usize) {
+        app.enter_edit();
+        if let View::Reader(r) = &mut app.view {
+            r.raw = raw.to_string();
+            let e = r.edit.as_mut().unwrap();
+            e.cursor = cursor;
+        }
+    }
+
+    fn popup_slugs(app: &App) -> Vec<String> {
+        let View::Reader(r) = &app.view else {
+            return Vec::new();
+        };
+        let Some(ac) = r.edit.as_ref().and_then(|e| e.anchor_complete.as_ref()) else {
+            return Vec::new();
+        };
+        ac.matches
+            .iter()
+            .map(|&i| ac.candidates[i].slug.clone())
+            .collect()
+    }
+
+    /// `anchor_context` only fires inside an open `](…)` destination that has a
+    /// `#` before the cursor.
+    #[test]
+    fn anchor_context_detects_link_destinations() {
+        // Current-doc anchor, empty path.
+        let raw = "[link](#se";
+        assert_eq!(
+            anchor_context(raw, raw.len()),
+            Some((raw.find('#').unwrap(), ""))
+        );
+        // Path + anchor.
+        let raw = "[x](other.md#in";
+        assert_eq!(
+            anchor_context(raw, raw.len()),
+            Some((raw.find('#').unwrap(), "other.md"))
+        );
+        // A markdown heading is not a link destination.
+        assert_eq!(anchor_context("# Title", 7), None);
+        // No `#` yet → nothing to complete.
+        assert_eq!(anchor_context("[x](other.md", 12), None);
+        // Bare parens (no preceding `]`) are not a destination.
+        assert_eq!(anchor_context("(#foo", 5), None);
+        // A closed destination before the cursor doesn't count.
+        assert_eq!(anchor_context("[x](#a) more", 12), None);
+        // A space after `#` (link title) disqualifies it.
+        assert_eq!(anchor_context("[x](#a b", 8), None);
+    }
+
+    /// Typing `#` inside a link destination opens the popup listing the current
+    /// document's headings.
+    #[test]
+    fn anchor_complete_lists_current_doc_headings() {
+        let raw = "# Hello World\n\n## Sub Section\n\n[link](#)\n";
+        let hash = raw.find("(#").unwrap() + 1;
+        let (_dir, mut app) = edit_app(raw, hash + 1);
+        app.edit_anchor_sync(true);
+        assert_eq!(popup_slugs(&app), vec!["hello-world", "sub-section"]);
+    }
+
+    /// The query after `#` filters the list.
+    #[test]
+    fn anchor_complete_filters_by_query() {
+        let raw = "# Hello World\n\n## Sub Section\n\n[link](#sub)\n";
+        let hash = raw.find("(#").unwrap() + 1;
+        // Cursor just past "sub".
+        let (_dir, mut app) = edit_app(raw, hash + 1 + 3);
+        app.edit_anchor_sync(true);
+        assert_eq!(popup_slugs(&app), vec!["sub-section"]);
+    }
+
+    /// Accepting writes the selected slug in place of the typed query and closes
+    /// the popup.
+    #[test]
+    fn anchor_complete_accept_writes_slug() {
+        let raw = "# Hello World\n\n## Sub Section\n\n[link](#su)\n";
+        let hash = raw.find("(#").unwrap() + 1;
+        let (_dir, mut app) = edit_app(raw, hash + 1 + 2);
+        app.edit_anchor_sync(true);
+        app.edit_anchor_accept();
+        let View::Reader(r) = &app.view else {
+            panic!("reader")
+        };
+        assert!(r.raw.contains("[link](#sub-section)"), "raw = {:?}", r.raw);
+        assert!(r.edit.as_ref().unwrap().anchor_complete.is_none());
+        assert!(r.edit.as_ref().unwrap().dirty);
+    }
+
+    /// Up/Down wrap around the match list.
+    #[test]
+    fn anchor_complete_move_wraps() {
+        let raw = "# One\n\n## Two\n\n[link](#)\n";
+        let hash = raw.find("(#").unwrap() + 1;
+        let (_dir, mut app) = edit_app(raw, hash + 1);
+        app.edit_anchor_sync(true);
+        app.edit_anchor_move(-1); // wrap from 0 to last
+        let View::Reader(r) = &app.view else {
+            panic!("reader")
+        };
+        assert_eq!(
+            r.edit
+                .as_ref()
+                .unwrap()
+                .anchor_complete
+                .as_ref()
+                .unwrap()
+                .selected,
+            1
+        );
+    }
+
+    /// A link to another file completes against that file's headings on disk.
+    #[test]
+    fn anchor_complete_lists_referenced_file_headings() {
+        let mut app = test_app();
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("other.md");
+        std::fs::write(&other, "# Far Away\n\n## Nested Bit\n").unwrap();
+        let here = dir.path().join("here.md");
+        std::fs::write(&here, "start\n").unwrap();
+        open_file_reader(&mut app, &here);
+
+        let raw = "See [x](other.md#)\n";
+        let hash = raw.find("(other.md#").unwrap() + "(other.md".len();
+        edit_with(&mut app, raw, hash + 1);
+        app.edit_anchor_sync(true);
+        assert_eq!(popup_slugs(&app), vec!["far-away", "nested-bit"]);
+    }
+
+    /// Only a typed `#` opens the popup; merely moving the cursor past an
+    /// existing `#` (allow_open = false) leaves it closed.
+    #[test]
+    fn anchor_complete_does_not_open_on_mere_motion() {
+        let raw = "# Hello\n\n[link](#)\n";
+        let hash = raw.find("(#").unwrap() + 1;
+        let (_dir, mut app) = edit_app(raw, hash + 1);
+        app.edit_anchor_sync(false);
+        assert!(popup_slugs(&app).is_empty());
     }
 }

@@ -857,6 +857,33 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
         return handle_edit_command_key(app, key);
     }
 
+    // Heading-anchor autocomplete popup (open inside a `[](…#…)` destination):
+    // Up/Down move the selection, Tab/Enter write the chosen slug, Esc closes
+    // it. Any other key falls through to normal editing and the popup is
+    // re-synced afterwards so the list keeps filtering as you type.
+    if matches!(&app.view, View::Reader(r) if r.edit.as_ref().map(|e| e.anchor_complete.is_some()).unwrap_or(false))
+    {
+        match key.code {
+            KeyCode::Up => {
+                app.edit_anchor_move(-1);
+                return Ok(());
+            }
+            KeyCode::Down => {
+                app.edit_anchor_move(1);
+                return Ok(());
+            }
+            KeyCode::Tab | KeyCode::Enter => {
+                app.edit_anchor_accept();
+                return Ok(());
+            }
+            KeyCode::Esc => {
+                app.edit_anchor_dismiss();
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
     // Shift + cursor motion grows the selection, macOS-style. Handled before
     // the active-selection key capture below so repeated Shift+arrow keeps
     // extending the selection instead of dropping it. Word-wise needs Alt/Ctrl
@@ -1158,6 +1185,12 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         _ => {}
     }
+    // Keep the heading-anchor autocomplete popup in sync: typing `#` inside a
+    // `[](…)` destination opens it, later keystrokes filter it, and editing or
+    // moving out of the destination closes it. Only `#` may open a fresh popup
+    // so ordinary cursor motion past an existing `#` doesn't pop it up.
+    let allow_open = matches!(key.code, KeyCode::Char('#')) && !ctrl && !alt;
+    app.edit_anchor_sync(allow_open);
     Ok(())
 }
 
@@ -2072,6 +2105,38 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
                 return Ok(());
             }
             MouseEventKind::Down(MouseButton::Left) => app.lookup = None,
+            _ => {}
+        }
+    }
+
+    // Heading-anchor autocomplete popup, while open. A left click on an entry
+    // selects and accepts it; a click elsewhere dismisses the popup (and then
+    // falls through to normal handling). The wheel moves the selection.
+    if let Some((rect, scroll, n)) = anchor_popup_geometry(app) {
+        let over = point_in(rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollUp if over => {
+                app.edit_anchor_move(-1);
+                return Ok(());
+            }
+            MouseEventKind::ScrollDown if over => {
+                app.edit_anchor_move(1);
+                return Ok(());
+            }
+            MouseEventKind::Down(MouseButton::Left) if over => {
+                // Rows sit inside the top border; map the click to a match.
+                if m.row > rect.y && m.row + 1 < rect.y + rect.height {
+                    let idx = scroll + (m.row - rect.y - 1) as usize;
+                    if idx < n {
+                        if let Some(ac) = anchor_complete_mut(app) {
+                            ac.selected = idx;
+                        }
+                        app.edit_anchor_accept();
+                    }
+                }
+                return Ok(());
+            }
+            MouseEventKind::Down(MouseButton::Left) => app.edit_anchor_dismiss(),
             _ => {}
         }
     }
@@ -3430,6 +3495,24 @@ fn point_in(rect: ratatui::layout::Rect, col: u16, row: u16) -> bool {
     col >= rect.x && col < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
 }
 
+/// The open anchor-autocomplete popup's `(rect, window_start, match_count)`,
+/// or `None` when no popup is showing. Used by mouse handling to hit-test.
+fn anchor_popup_geometry(app: &App) -> Option<(ratatui::layout::Rect, usize, usize)> {
+    let View::Reader(r) = &app.view else {
+        return None;
+    };
+    let ac = r.edit.as_ref().and_then(|e| e.anchor_complete.as_ref())?;
+    Some((ac.rect, ac.scroll, ac.matches.len()))
+}
+
+/// Mutable handle to the open anchor-autocomplete popup, if any.
+fn anchor_complete_mut(app: &mut App) -> Option<&mut crate::tui::app::AnchorComplete> {
+    let View::Reader(r) = &mut app.view else {
+        return None;
+    };
+    r.edit.as_mut().and_then(|e| e.anchor_complete.as_mut())
+}
+
 #[cfg(test)]
 mod keybind_tests {
     use super::handle_key;
@@ -3927,6 +4010,37 @@ mod keybind_tests {
         // NOT have appended a newline to the message.
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.commit.as_ref().unwrap().message, "ab\nc\nd");
+    }
+
+    /// Typing `#` inside a link destination pops the anchor list; further keys
+    /// filter it and Tab writes the chosen slug — all through the real key path.
+    #[test]
+    fn hash_in_link_opens_anchor_complete_and_tab_accepts() {
+        let mut app = app_with_headings("anchorkeys");
+        app.enter_edit();
+        // Prime an empty destination with the cursor between the parens.
+        if let View::Reader(r) = &mut app.view {
+            r.raw.push_str("\n[x]()\n");
+            let pos = r.raw.find("()").unwrap() + 1;
+            r.edit.as_mut().unwrap().cursor = pos;
+        }
+        press(&mut app, KeyCode::Char('#'));
+        assert!(
+            matches!(&app.view, View::Reader(r) if r.edit.as_ref().unwrap().anchor_complete.is_some()),
+            "the popup opens when '#' is typed inside a link destination"
+        );
+        // Narrow to "Three".
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Tab);
+        let View::Reader(r) = &app.view else {
+            panic!("reader")
+        };
+        assert!(r.raw.contains("[x](#three)"), "raw = {:?}", r.raw);
+        assert!(
+            r.edit.as_ref().unwrap().anchor_complete.is_none(),
+            "accepting closes the popup"
+        );
     }
 }
 

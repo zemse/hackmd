@@ -249,6 +249,59 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
+/// One heading pulled from a markdown document, for anchor autocomplete.
+/// `text` is the plain heading text (inline markup stripped); `slug` is the
+/// GitHub-style anchor it resolves to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocHeading {
+    pub level: u8,
+    pub text: String,
+    pub slug: String,
+}
+
+/// Extract every heading from `md` in document order. Uses the same parser and
+/// options as the renderer so detection (ATX, setext, code-fence skipping) and
+/// the resulting slugs match the anchors the reader actually jumps to. Blank
+/// headings are dropped. Duplicate slugs are kept as-is (the renderer does not
+/// de-duplicate them either).
+pub fn extract_headings(md: &str) -> Vec<DocHeading> {
+    use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+    let mut opts = Options::empty();
+    opts.insert(Options::ENABLE_TABLES);
+    opts.insert(Options::ENABLE_STRIKETHROUGH);
+    opts.insert(Options::ENABLE_TASKLISTS);
+    opts.insert(Options::ENABLE_FOOTNOTES);
+    opts.insert(Options::ENABLE_SMART_PUNCTUATION);
+    opts.insert(Options::ENABLE_WIKILINKS);
+
+    let mut out = Vec::new();
+    // (level, accumulated text) while inside a heading.
+    let mut cur: Option<(u8, String)> = None;
+    for ev in Parser::new_ext(md, opts) {
+        match ev {
+            Event::Start(Tag::Heading { level, .. }) => {
+                cur = Some((level as u8, String::new()));
+            }
+            Event::Text(t) | Event::Code(t) => {
+                if let Some((_, buf)) = cur.as_mut() {
+                    buf.push_str(&t);
+                }
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                if let Some((level, buf)) = cur.take() {
+                    let text = buf.trim().to_string();
+                    if !text.is_empty() {
+                        let slug = slugify(&text);
+                        out.push(DocHeading { level, text, slug });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Convert heading text to a GitHub-style anchor slug.
 pub fn slugify(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -270,4 +323,51 @@ pub fn slugify(s: &str) -> String {
         out.pop();
     }
     out
+}
+
+#[cfg(test)]
+mod heading_tests {
+    use super::{DocHeading, extract_headings};
+
+    fn slugs(md: &str) -> Vec<String> {
+        extract_headings(md).into_iter().map(|h| h.slug).collect()
+    }
+
+    #[test]
+    fn extracts_atx_headings_with_slugs() {
+        let hs = extract_headings("# Hello World\n\ntext\n\n## Sub-Section!\n");
+        assert_eq!(
+            hs,
+            vec![
+                DocHeading {
+                    level: 1,
+                    text: "Hello World".into(),
+                    slug: "hello-world".into(),
+                },
+                DocHeading {
+                    level: 2,
+                    text: "Sub-Section!".into(),
+                    slug: "sub-section".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn extracts_setext_headings() {
+        assert_eq!(slugs("Title\n=====\n\nSub\n---\n"), vec!["title", "sub"]);
+    }
+
+    #[test]
+    fn skips_headings_inside_code_fences() {
+        let md = "# Real\n\n```\n# Not A Heading\n```\n\n## Also Real\n";
+        assert_eq!(slugs(md), vec!["real", "also-real"]);
+    }
+
+    #[test]
+    fn keeps_inline_code_in_heading_text() {
+        let hs = extract_headings("# Use `cargo` now\n");
+        assert_eq!(hs[0].text, "Use cargo now");
+        assert_eq!(hs[0].slug, "use-cargo-now");
+    }
 }

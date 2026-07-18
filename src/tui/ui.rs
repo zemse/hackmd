@@ -171,6 +171,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         draw_lookup(f, app);
     }
 
+    // Heading-anchor autocomplete popup, anchored to the edit cursor.
+    if matches!(&app.view, View::Reader(r) if r.edit.as_ref().map(|e| e.anchor_complete.is_some()).unwrap_or(false))
+    {
+        draw_anchor_complete(f, app);
+    }
+
     // A blocking error modal trumps the popover.
     if app.error.is_some() {
         draw_error(f, app, area);
@@ -329,6 +335,99 @@ fn draw_toc(f: &mut Frame, app: &App, area: Rect) {
         .title(" Contents ")
         .border_style(Style::default().fg(theme.heading[0]));
     f.render_widget(Paragraph::new(lines).block(block), popup);
+}
+
+/// Heading-anchor autocomplete popup, anchored just under the edit cursor. Its
+/// entries are the referenced document's headings; the highlighted one is what
+/// Tab / Enter / a click will write. Records its rect + window start on the
+/// edit state so mouse handling can map a click back to a heading.
+fn draw_anchor_complete(f: &mut Frame, app: &mut App) {
+    use unicode_width::UnicodeWidthStr;
+    let area = app.viewport;
+    let Some((anchor_col, anchor_row)) = app.edit_cursor_screen else {
+        return;
+    };
+    // Gather the rows to draw, then drop the borrow before rendering/mutating.
+    let (labels, selected, total) = {
+        let View::Reader(r) = &app.view else {
+            return;
+        };
+        let Some(ac) = r.edit.as_ref().and_then(|e| e.anchor_complete.as_ref()) else {
+            return;
+        };
+        if ac.matches.is_empty() {
+            return;
+        }
+        let labels: Vec<String> = ac
+            .matches
+            .iter()
+            .map(|&i| {
+                let h = &ac.candidates[i];
+                let indent = "  ".repeat(h.level.saturating_sub(1) as usize);
+                format!(" {}{}", indent, h.text)
+            })
+            .collect();
+        (labels, ac.selected, ac.matches.len())
+    };
+    let border = app.opts.theme.heading[0];
+
+    // Width from the widest label, clamped into the viewport.
+    let content_w = labels.iter().map(|s| s.width()).max().unwrap_or(0) as u16;
+    let w = (content_w + 3)
+        .clamp(16, 52)
+        .min(area.width.saturating_sub(2).max(16));
+    let max_h = area.height.saturating_sub(2).clamp(3, 12);
+    let h = (total as u16 + 2).clamp(3, max_h);
+    let inner_h = h.saturating_sub(2) as usize;
+
+    // Window the list so the selection stays visible (same math as the TOC).
+    let start = selected
+        .saturating_sub(inner_h.saturating_sub(1) / 2)
+        .min(total.saturating_sub(inner_h.max(1)));
+
+    // Sit below the cursor when it fits, else above; clamp into the body.
+    let bottom = area.y + area.height;
+    let below = anchor_row.saturating_add(1);
+    let y = if below + h <= bottom {
+        below
+    } else {
+        anchor_row.saturating_sub(h)
+    }
+    .clamp(area.y, bottom.saturating_sub(h));
+    let max_x = (area.x + area.width).saturating_sub(w).max(area.x);
+    let x = anchor_col.clamp(area.x, max_x);
+    let popup = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, label) in labels.iter().enumerate().skip(start).take(inner_h.max(1)) {
+        let style = if i == selected {
+            Style::default()
+                .fg(border)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(label.clone(), style)));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" #anchor ")
+        .border_style(Style::default().fg(border));
+    f.render_widget(Clear, popup);
+    f.render_widget(Paragraph::new(lines).block(block), popup);
+
+    // Record geometry so a click can map a screen row to a heading.
+    if let View::Reader(r) = &mut app.view {
+        if let Some(ac) = r.edit.as_mut().and_then(|e| e.anchor_complete.as_mut()) {
+            ac.rect = popup;
+            ac.scroll = start;
+        }
+    }
 }
 
 /// Dictionary-definition popover, anchored under a double-clicked word. Sits
@@ -1146,10 +1245,12 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
 
     // Cursor: reverse-video cell at (cur_col, cur_padded - raw_scroll).
     let cy_view = cur_padded as i32 - raw_scroll as i32;
+    app.edit_cursor_screen = None;
     if cy_view >= 0 && (cy_view as u16) < raw_area.height {
         let row = raw_area.y + cy_view as u16;
         let col = raw_area.x + cur_col;
         if col < raw_area.x + raw_area.width {
+            app.edit_cursor_screen = Some((col, row));
             let buf = f.buffer_mut();
             let cell = &mut buf[(col, row)];
             cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
