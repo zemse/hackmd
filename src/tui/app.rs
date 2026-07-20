@@ -2230,6 +2230,49 @@ impl App {
         });
     }
 
+    /// For an open [`PromptKind::NewFile`] prompt, the grey ghost that
+    /// completes the segment currently being typed to an existing
+    /// sub-directory, so Tab nests the new file inside it. Returns the suffix
+    /// to append (including the trailing `/`), or `None` when nothing existing
+    /// extends what's typed. Only directories are offered, since the point is
+    /// to drop the file into a folder that already exists.
+    pub fn new_file_completion(&self) -> Option<String> {
+        let (base, input) = match &self.prompt {
+            Some(Prompt {
+                kind: PromptKind::NewFile { dir },
+                input,
+                ..
+            }) => (dir, input.as_str()),
+            _ => return None,
+        };
+        if input.is_empty() || input.starts_with('/') || input.contains('\\') {
+            return None;
+        }
+        // Complete only the final segment; everything before the last `/` must
+        // already resolve to a real directory for there to be anything to list.
+        let (parent, seg) = match input.rsplit_once('/') {
+            Some((p, s)) => (p, s),
+            None => ("", input),
+        };
+        let search = if parent.is_empty() {
+            base.clone()
+        } else {
+            base.join(parent)
+        };
+        let mut names: Vec<String> = std::fs::read_dir(&search)
+            .ok()?
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| !n.starts_with('.') && n.len() > seg.len() && n.starts_with(seg))
+            .collect();
+        names.sort();
+        names
+            .into_iter()
+            .next()
+            .map(|n| format!("{}/", &n[seg.len()..]))
+    }
+
     /// `c` / F2 in the local browser: prompt to rename the selected entry.
     /// Pre-fills the current name so the user edits rather than retypes.
     pub fn prompt_rename(&mut self) {
@@ -2382,17 +2425,45 @@ impl App {
                     self.status = "Cancelled — empty name".into();
                     return;
                 }
-                // Reject path separators so a stray `foo/bar` can't escape the
-                // browsed directory or create implicit subdirs the user didn't
-                // ask for.
-                if name.contains('/') || name.contains('\\') {
-                    self.status = "Name can't contain a path separator".into();
+                // `foo/bar.md` is allowed and creates `foo/` on the way, but a
+                // backslash, a leading slash, a trailing slash, or any `..`
+                // is refused so the file can't escape the browsed directory or
+                // resolve to a bare directory.
+                if name.contains('\\') {
+                    self.status = "Use / to nest, not \\".into();
                     return;
                 }
-                let path = dir.join(name);
+                if name.starts_with('/') {
+                    self.status = "Name can't be an absolute path".into();
+                    return;
+                }
+                if name.ends_with('/') {
+                    self.status = "Add a file name after the directory".into();
+                    return;
+                }
+                let rel = std::path::Path::new(name);
+                if rel.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                }) {
+                    self.status = "Name can't contain `..`".into();
+                    return;
+                }
+                let path = dir.join(rel);
                 if path.exists() {
                     self.status = format!("Already exists: {}", path.display());
                     return;
+                }
+                // Create any intermediate directories the name introduces.
+                if let Some(parent) = path.parent() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        self.status = format!("create {}: {e}", parent.display());
+                        return;
+                    }
                 }
                 // Create the (empty) file, then open it in the editor so the
                 // user can start writing immediately.
@@ -6440,6 +6511,70 @@ mod tests {
             );
         }
         assert!(names.iter().all(|n| !n.contains(".hidden")));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A new-file name with `/` in it creates the intermediate directories and
+    /// drops the file inside, then opens it in the editor.
+    #[test]
+    fn new_file_creates_intermediate_dirs() {
+        let dir = fresh_temp("new-file-nested");
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        let base = match &app.view {
+            View::Browser(b) => b.dir.clone(),
+            _ => panic!("expected browser"),
+        };
+        app.prompt_new_file();
+        let mut p = app.prompt.take().unwrap();
+        p.input = "sub/deep/note.md".into();
+        app.commit_prompt(p);
+
+        let created = base.join("sub").join("deep").join("note.md");
+        assert!(created.is_file(), "expected {created:?} to be created");
+        assert!(matches!(&app.view, View::Reader(r) if r.edit.is_some()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `..` in a new-file name is refused so the file can't escape the tree.
+    #[test]
+    fn new_file_rejects_parent_traversal() {
+        let dir = fresh_temp("new-file-escape");
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        app.prompt_new_file();
+        let mut p = app.prompt.take().unwrap();
+        p.input = "../escape.md".into();
+        app.commit_prompt(p);
+
+        assert!(!dir.parent().unwrap().join("escape.md").exists());
+        // Creation refused → still in the browser.
+        assert!(matches!(app.view, View::Browser(_)));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The new-file prompt ghost-completes the typed segment to an existing
+    /// sub-directory, and offers nothing when there's no such directory.
+    #[test]
+    fn new_file_completion_suggests_existing_dirs() {
+        let dir = fresh_temp("new-file-complete");
+        std::fs::create_dir_all(dir.join("guides")).unwrap();
+        std::fs::create_dir_all(dir.join("assets").join("img")).unwrap();
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        app.prompt_new_file();
+
+        // Prefix of an existing top-level dir.
+        app.prompt.as_mut().unwrap().input = "gui".into();
+        assert_eq!(app.new_file_completion(), Some("des/".into()));
+
+        // Complete a segment nested inside an existing dir.
+        app.prompt.as_mut().unwrap().input = "assets/i".into();
+        assert_eq!(app.new_file_completion(), Some("mg/".into()));
+
+        // A plain file name with no matching dir gets no ghost.
+        app.prompt.as_mut().unwrap().input = "README".into();
+        assert_eq!(app.new_file_completion(), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }

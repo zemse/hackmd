@@ -617,7 +617,7 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ))
     } else {
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 "▸ ",
                 Style::default()
@@ -626,7 +626,16 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
             ),
             Span::raw(p.input.clone()),
             Span::styled("█", Style::default().fg(theme.heading[0])),
-        ])
+        ];
+        // Grey ghost completing the typed segment to an existing directory.
+        if let Some(ghost) = app.new_file_completion() {
+            spans.push(Span::styled(ghost, Style::default().fg(Color::DarkGray)));
+            spans.push(Span::styled(
+                "  (Tab)",
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        Line::from(spans)
     };
     f.render_widget(Paragraph::new(line), inner);
 }

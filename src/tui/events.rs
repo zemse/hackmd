@@ -1851,6 +1851,14 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) -> Result<()> {
                 app.commit_prompt(p);
             }
         }
+        // Tab accepts the existing-directory completion in the new-file prompt.
+        KeyCode::Tab => {
+            if let Some(ghost) = app.new_file_completion() {
+                if let Some(p) = &mut app.prompt {
+                    p.input.push_str(&ghost);
+                }
+            }
+        }
         KeyCode::Backspace => {
             if let Some(p) = &mut app.prompt {
                 p.input.pop();
