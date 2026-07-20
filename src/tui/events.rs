@@ -2394,6 +2394,7 @@ fn handle_split_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
                         e.selection = Some(crate::tui::app::EditSelection {
                             anchor: e.cursor,
                             focus: e.cursor,
+                            origin: e.cursor,
                             dragged: false,
                         });
                     }
@@ -2448,10 +2449,19 @@ fn split_drag_raw(app: &mut App, col: u16, row: u16) {
     let local_col = (col - area.x) as usize;
     let rows = crate::tui::app::render_raw_pane(&r.raw, raw_w);
     let byte = crate::tui::app::raw_click_to_source(&rows, &r.raw, local_row, local_col);
+    let origin = r.edit.as_ref().unwrap().selection.as_ref().unwrap().origin;
+    // Cover the char under the pointer AND the mousedown char in either
+    // direction: span from the leftmost char's start to the rightmost char's
+    // far edge (`focus` is exclusive). Rebuilding from the fixed `origin` each
+    // event keeps this stable when the drag reverses. This mirrors shift-click
+    // (`edit_select_inclusive`) so a dragged copy / link keeps its last char.
+    let lo = origin.min(byte);
+    let hi = crate::tui::app::next_char_boundary(&r.raw, origin.max(byte));
     let e = r.edit.as_mut().unwrap();
     let sel = e.selection.as_mut().unwrap();
-    sel.focus = byte;
-    if !sel.dragged && sel.focus != sel.anchor {
+    sel.anchor = lo;
+    sel.focus = hi;
+    if !sel.dragged && byte != origin {
         sel.dragged = true;
     }
     // The cursor follows the drag focus so the auto-scroll keeps the
@@ -4054,6 +4064,54 @@ mod keybind_tests {
             raw[cursor..].starts_with("# Target"),
             "cursor should land on the heading, got {:?}",
             &raw[cursor..raw.len().min(cursor + 12)]
+        );
+    }
+
+    /// A mouse drag-selection must cover the character under the pointer (and
+    /// the mousedown character), in either direction. Regression guard for the
+    /// off-by-one where a dragged copy / paste-link dropped the last char.
+    #[test]
+    fn drag_selection_includes_char_under_pointer() {
+        let mut app = app_with_headings("dragsel");
+        app.enter_edit();
+        if let View::Reader(r) = &mut app.view {
+            r.raw = "hello world\n".to_string();
+            r.scroll = 0;
+            r.edit.as_mut().unwrap().cursor = 6;
+        }
+        app.edit_raw_area = ratatui::layout::Rect::new(0, 0, 40, 10);
+
+        // Rightward: mousedown on 'w' (byte 6), drag onto 'd' (col 10). The
+        // click row is the first content row (area.y + EDIT_PAD).
+        if let View::Reader(r) = &mut app.view {
+            r.edit.as_mut().unwrap().selection = Some(crate::tui::app::EditSelection {
+                anchor: 6,
+                focus: 6,
+                origin: 6,
+                dragged: false,
+            });
+        }
+        super::split_drag_raw(&mut app, 10, 1);
+        assert_eq!(
+            app.edit_selection_text().as_deref(),
+            Some("world"),
+            "rightward drag must include the char under the pointer"
+        );
+
+        // Leftward: mousedown on 'd' (byte 10), drag back onto 'w' (col 6).
+        if let View::Reader(r) = &mut app.view {
+            r.edit.as_mut().unwrap().selection = Some(crate::tui::app::EditSelection {
+                anchor: 10,
+                focus: 10,
+                origin: 10,
+                dragged: false,
+            });
+        }
+        super::split_drag_raw(&mut app, 6, 1);
+        assert_eq!(
+            app.edit_selection_text().as_deref(),
+            Some("world"),
+            "leftward drag must include the mousedown char"
         );
     }
 

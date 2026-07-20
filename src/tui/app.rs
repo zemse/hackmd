@@ -603,17 +603,26 @@ pub struct AnchorComplete {
 /// from the same click→byte mapping as the cursor).
 #[derive(Clone, Debug)]
 pub struct EditSelection {
-    /// Where the mouse went down.
+    /// Selection start (a char-boundary byte offset). Together with `focus`
+    /// this is the resolved `[start, end)` range: `focus` is EXCLUSIVE, so it
+    /// sits at the far edge of the last selected char, not on its first byte.
+    /// A mouse drag keeps this convention (see `origin`), so copy / link /
+    /// delete all include the final char.
     pub anchor: usize,
-    /// Where the mouse is / was released. May be before `anchor`.
+    /// Selection end, EXCLUSIVE. May be before `anchor` (left-going drag).
     pub focus: usize,
+    /// The byte the mouse first went down on (a char start). Held fixed for
+    /// the whole drag so each Drag event can rebuild the exclusive range from
+    /// (origin, pointer) without the anchor/focus it writes back drifting.
+    /// Unused by keyboard/shift-click selections (they set it to `anchor`).
+    pub origin: usize,
     /// True once a drag moved the focus off the anchor; a plain click
     /// never activates the selection.
     pub dragged: bool,
 }
 
 impl EditSelection {
-    /// Ordered `(start, end)` byte range.
+    /// Ordered `(start, end)` byte range, end-exclusive.
     pub fn range(&self) -> (usize, usize) {
         (self.anchor.min(self.focus), self.anchor.max(self.focus))
     }
@@ -3972,6 +3981,7 @@ impl App {
                 e.selection = Some(EditSelection {
                     anchor,
                     focus: before,
+                    origin: anchor,
                     dragged: true,
                 });
             }
@@ -4035,6 +4045,7 @@ impl App {
             Some(EditSelection {
                 anchor: lo,
                 focus: hi,
+                origin: lo,
                 dragged: true,
             })
         };
@@ -5526,7 +5537,7 @@ fn floor_char_boundary(s: &str, pos: usize) -> usize {
 
 /// Byte offset of the next char boundary strictly after `pos`. Returns
 /// `s.len()` if `pos` is already at end.
-fn next_char_boundary(s: &str, pos: usize) -> usize {
+pub(crate) fn next_char_boundary(s: &str, pos: usize) -> usize {
     if pos >= s.len() {
         return s.len();
     }
@@ -8056,6 +8067,7 @@ mod cloud_msg_tests {
         e.selection = Some(EditSelection {
             anchor: 6,
             focus: 11,
+            origin: 6,
             dragged: true,
         });
         r.edit = Some(e);
@@ -8082,6 +8094,7 @@ mod cloud_msg_tests {
         e.selection = Some(EditSelection {
             anchor: 3,
             focus: 3,
+            origin: 3,
             dragged: false,
         });
         r.edit = Some(e);
@@ -8105,6 +8118,7 @@ mod cloud_msg_tests {
         e.selection = Some(EditSelection {
             anchor: 4,
             focus: 10,
+            origin: 4,
             dragged: true,
         });
         r.edit = Some(e);
