@@ -2400,7 +2400,7 @@ fn handle_split_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
                 }
             } else if in_prev {
                 app.edit_clear_selection();
-                split_click_preview(app, m.column, m.row);
+                split_click_preview(app, m.column, m.row)?;
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -2543,27 +2543,61 @@ fn split_click_raw(app: &mut App, col: u16, row: u16) {
     }
 }
 
-/// Click in the preview pane: jump source cursor to that block's start.
-/// Useful for navigating to a section by clicking the rendered headline.
-fn split_click_preview(app: &mut App, col: u16, row: u16) {
+/// Click in the preview pane. A click on a rendered link follows it, exactly
+/// like the reader (URLs open externally, file links navigate, in-document
+/// anchors move the editor cursor to the target heading). A click that misses
+/// every link jumps the source cursor to that block's start, so clicking a
+/// rendered headline navigates the source to that section.
+fn split_click_preview(app: &mut App, col: u16, row: u16) -> Result<()> {
     let area = app.edit_preview_area;
-    if !point_in(area, col, row) {
-        return;
+    if !point_in(area, col, row) || col < area.x {
+        return Ok(());
     }
     let View::Reader(r) = &mut app.view else {
-        return;
+        return Ok(());
     };
     let Some(rendered) = r.rendered.as_ref() else {
-        return;
+        return Ok(());
     };
     let local_row = (row - area.y) as usize + r.preview_scroll as usize;
-    let _ = col;
+    let local_col = (col - area.x) as usize;
+    // The Marp preview paints a slide, not `rendered.lines`, so its link map
+    // and row mapping don't line up, so skip link-following there.
+    if r.marp.is_none() {
+        if let Some(li) = rendered.link_map.at(local_row, local_col) {
+            let target = rendered.link_map.links[li].target.clone();
+            // Same-document anchor: move the editor cursor to the target
+            // heading rather than scrolling the reader. `scroll_to_anchor`
+            // drives `r.scroll`, which in the split editor is the raw pane's
+            // scroll (a raw-row index, not a rendered-line index), so it would
+            // jump to the wrong place; jumping the cursor is both correct and
+            // more useful while editing.
+            if let crate::tui::links::LinkTarget::Anchor(slug) = &target {
+                match rendered.link_map.anchors.get(slug).copied() {
+                    Some(line) => {
+                        let offset = crate::tui::app::source_for_preview_row(rendered, line);
+                        if let Some(e) = r.edit.as_mut() {
+                            e.cursor = offset;
+                            e.command = None;
+                            r.rendered = None;
+                        }
+                        app.status = format!("→ #{slug}");
+                    }
+                    None => app.status = format!("Anchor not found: #{slug}"),
+                }
+                return Ok(());
+            }
+            app.follow(target)?;
+            return Ok(());
+        }
+    }
     let new_cursor = crate::tui::app::source_for_preview_row(rendered, local_row);
     if let Some(e) = r.edit.as_mut() {
         e.cursor = new_cursor;
         e.command = None;
         r.rendered = None;
     }
+    Ok(())
 }
 
 /// Convert a screen (col, row) to a body-local (line_index, display_col).
@@ -3956,6 +3990,71 @@ mod keybind_tests {
             View::Reader(r) => r.focus,
             _ => panic!("expected reader"),
         }
+    }
+
+    /// Clicking a rendered link in the split-editor preview pane follows it
+    /// like the reader. For a same-document anchor that means jumping the
+    /// editor's source cursor onto the target heading. This is the regression
+    /// guard for preview-pane links being dead in edit mode.
+    #[test]
+    fn preview_click_on_anchor_link_moves_editor_cursor() {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "md-tui-events-test-previewlink-{}.md",
+            std::process::id()
+        ));
+        std::fs::write(&p, "[go](#target)\n\n# Target\n\nbody text\n").unwrap();
+        let opts = Options {
+            width: 80,
+            line_numbers: false,
+            theme: Theme::dark(),
+        };
+        let mut app = App::new(Source::File(p), opts).unwrap();
+        app.enter_edit();
+        app.ensure_rendered(40);
+        // Preview pane occupies the right half of an 80-wide screen.
+        let area = ratatui::layout::Rect::new(40, 0, 40, 20);
+        app.edit_preview_area = area;
+        if let View::Reader(r) = &mut app.view {
+            r.preview_scroll = 0;
+        }
+
+        // Read the anchor link's rendered position straight from the link map
+        // so the click lands exactly on it regardless of wrapping.
+        let (line, col_start) = match &app.view {
+            View::Reader(r) => {
+                let rn = r.rendered.as_ref().unwrap();
+                let li = rn
+                    .link_map
+                    .links
+                    .iter()
+                    .position(|l| {
+                        matches!(&l.target, crate::tui::links::LinkTarget::Anchor(s) if s == "target")
+                    })
+                    .expect("anchor link present");
+                let l = &rn.link_map.links[li];
+                (l.line, l.col_start)
+            }
+            _ => panic!("expected reader"),
+        };
+
+        let col = area.x + col_start as u16;
+        let row = area.y + line as u16; // preview_scroll == 0
+        super::split_click_preview(&mut app, col, row).unwrap();
+
+        let cursor = match &app.view {
+            View::Reader(r) => r.edit.as_ref().unwrap().cursor,
+            _ => panic!("expected reader"),
+        };
+        let raw = match &app.view {
+            View::Reader(r) => r.raw.clone(),
+            _ => panic!("expected reader"),
+        };
+        assert!(
+            raw[cursor..].starts_with("# Target"),
+            "cursor should land on the heading, got {:?}",
+            &raw[cursor..raw.len().min(cursor + 12)]
+        );
     }
 
     #[test]
