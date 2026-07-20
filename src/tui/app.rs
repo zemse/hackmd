@@ -380,6 +380,11 @@ pub enum PromptKind {
     /// workspace), so ask before spending one: `y`/Enter fetches, any other
     /// key keeps the local copy.
     ConfirmFetchUpdate { path: PathBuf },
+    /// The editor was just left with the file still holding uncommitted
+    /// changes. Offer to commit it there and then: Enter commits `file` (only)
+    /// with the typed message, Esc skips (leaving it uncommitted). `root` is
+    /// the enclosing repo's worktree root.
+    CommitFile { root: PathBuf, file: PathBuf },
 }
 
 /// What to do once a dirty editor has been resolved through the
@@ -2411,6 +2416,20 @@ impl App {
                 self.status = "⟳ fetching from HackMD…".into();
                 self.sync_local_file(path);
             }
+            PromptKind::CommitFile { root, file } => {
+                let message = p.input.trim();
+                if message.is_empty() {
+                    self.status = "Commit skipped (empty message)".into();
+                    return;
+                }
+                match crate::tui::git::commit(&root, std::slice::from_ref(&file), message) {
+                    Ok(summary) => {
+                        self.refresh_git_status();
+                        self.status = summary;
+                    }
+                    Err(e) => self.status = e,
+                }
+            }
             PromptKind::RenameFile { from } => {
                 let name = p.input.trim();
                 if name.is_empty() {
@@ -3298,6 +3317,47 @@ impl App {
             r.edit = None;
             r.rendered = None;
         }
+        self.maybe_prompt_commit();
+    }
+
+    /// After leaving the editor with the file's on-disk state preserved (a
+    /// clean exit or a save-then-exit, never a discard), offer to commit it
+    /// right away if it now carries uncommitted changes. This turns editing a
+    /// file and committing it into one flow, so a finished edit (or a freshly
+    /// created file) can be landed without a separate trip to the commit
+    /// screen. A one-line message popup: Enter commits just this file, Esc
+    /// skips and leaves it uncommitted. No-op outside a git repo, for
+    /// non-file readers, when the file is already committed, or when another
+    /// overlay is already up.
+    fn maybe_prompt_commit(&mut self) {
+        if self.prompt.is_some() || self.commit.is_some() {
+            return;
+        }
+        let path = match &self.view {
+            View::Reader(r) => match &r.origin {
+                ReaderOrigin::File(p) => p.clone(),
+                _ => return,
+            },
+            _ => return,
+        };
+        // The buffer was just written (or was already on disk); rebuild the
+        // status so a file that only now became dirty is seen as uncommitted.
+        self.refresh_git_status();
+        let Some(root) = self.git_status.root.clone() else {
+            return;
+        };
+        if !self.git_status.is_uncommitted(&path) {
+            return;
+        }
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        self.prompt = Some(Prompt {
+            title: format!(" Commit {name} (Esc to skip) "),
+            input: String::new(),
+            kind: PromptKind::CommitFile { root, file: path },
+        });
     }
 
     /// Keep the editor buffer ending in a single trailing newline while a
@@ -7320,6 +7380,94 @@ mod cloud_msg_tests {
         app.view = View::Reader(Reader::from_file(path).expect("open reader"));
         // Fresh file → not yet handled by the open-file sync check.
         app.last_sync = None;
+    }
+
+    /// A fresh git repo (canonical root) with one committed `note.md`. The
+    /// returned `TempDir` keeps it alive for the test.
+    fn commit_repo() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        fn git(dir: &std::path::Path, args: &[&str]) {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        git(&root, &["init", "-q"]);
+        git(&root, &["config", "user.email", "t@example.com"]);
+        git(&root, &["config", "user.name", "Test"]);
+        git(&root, &["config", "commit.gpgsign", "false"]);
+        git(&root, &["config", "core.hooksPath", "/dev/null"]);
+        let path = root.join("note.md");
+        std::fs::write(&path, "one\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-q", "-m", "baseline"]);
+        (dir, root, path)
+    }
+
+    /// Leaving the editor with the file now differing from HEAD raises a
+    /// one-line commit popup scoped to that file; entering a message commits
+    /// just that file and clears its uncommitted state.
+    #[test]
+    fn exit_edit_offers_commit_for_uncommitted_file() {
+        let (_repo, _root, path) = commit_repo();
+        let mut app = test_app();
+        open_file_reader(&mut app, &path);
+
+        edit_with(&mut app, "one\ntwo\n", 0);
+        app.save_edit().unwrap();
+        app.exit_edit();
+
+        // Editor closed, commit popup up, scoped to this file.
+        assert!(matches!(&app.view, View::Reader(r) if r.edit.is_none()));
+        let prompt = app.prompt.as_ref().expect("expected commit prompt");
+        assert!(
+            matches!(&prompt.kind, PromptKind::CommitFile { file, .. } if file == &path),
+            "prompt not scoped to the edited file"
+        );
+
+        // Type a message and commit.
+        let mut p = app.prompt.take().unwrap();
+        p.input = "add two".into();
+        app.commit_prompt(p);
+
+        app.refresh_git_status();
+        assert!(!app.git_status.is_uncommitted(&path));
+    }
+
+    /// An empty message skips the commit and leaves the file uncommitted.
+    #[test]
+    fn exit_edit_commit_skipped_on_empty_message() {
+        let (_repo, _root, path) = commit_repo();
+        let mut app = test_app();
+        open_file_reader(&mut app, &path);
+        edit_with(&mut app, "one\ntwo\n", 0);
+        app.save_edit().unwrap();
+        app.exit_edit();
+
+        let p = app.prompt.take().expect("expected commit prompt");
+        app.commit_prompt(p); // empty input
+        app.refresh_git_status();
+        assert!(app.git_status.is_uncommitted(&path));
+    }
+
+    /// Leaving a clean, already-committed file raises no commit popup.
+    #[test]
+    fn exit_edit_no_commit_prompt_when_clean() {
+        let (_repo, _root, path) = commit_repo();
+        let mut app = test_app();
+        open_file_reader(&mut app, &path);
+        app.enter_edit(); // no changes
+        app.exit_edit();
+        assert!(app.prompt.is_none());
     }
 
     const LINKED_DOC: &str =
