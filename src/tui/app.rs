@@ -976,6 +976,15 @@ pub struct Browser {
     /// time, newest first, instead of the default name sort. `../` stays
     /// pinned at the top either way.
     pub sort_by_modified: bool,
+    /// Set while Shift is held down (kitty keyboard protocol only): each row
+    /// then shows a dimmed 1-based jump number and typing that number moves
+    /// the cursor straight to it, so a distant entry is reachable without a
+    /// run of `j`/`k`. The `String` buffers the digits typed so far this
+    /// hold, so multi-digit targets (e.g. `16`) accumulate and re-jump live.
+    /// `None` when Shift isn't held (labels hidden); legacy terminals that
+    /// can't report a lone modifier keypress leave it `None` and the feature
+    /// is simply absent.
+    pub jump_labels: Option<String>,
 }
 
 #[derive(Clone)]
@@ -5913,6 +5922,7 @@ impl Browser {
             find: None,
             show_all: false,
             sort_by_modified: false,
+            jump_labels: None,
         };
         b.rebuild()?;
         Ok(b)
@@ -7375,6 +7385,7 @@ index abc..def 100644\n\
             find: None,
             show_all: false,
             sort_by_modified: false,
+            jump_labels: None,
         };
         // Re-scan (rebuild discovers `..` if the dir has a parent — fine, just
         // assert the fallback never out-of-bounds).
@@ -7402,6 +7413,7 @@ index abc..def 100644\n\
             find: None,
             show_all: false,
             sort_by_modified: false,
+            jump_labels: None,
         }
     }
 

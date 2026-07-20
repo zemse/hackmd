@@ -29,14 +29,23 @@ pub fn setup_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    // Ask the terminal to disambiguate modified keys (kitty keyboard protocol)
-    // so combinations like Shift+Enter are reported distinctly — needed for
-    // multi-line commit messages. Legacy terminals collapse Shift+Enter into a
-    // plain Enter, so this is best-effort and only pushed where supported.
+    // Turn on the kitty keyboard protocol where the terminal supports it:
+    //  - DISAMBIGUATE_ESCAPE_CODES reports modified keys distinctly, so e.g.
+    //    Shift+Enter (multi-line commit messages) is legible.
+    //  - REPORT_EVENT_TYPES adds key-release (and autorepeat) events.
+    //  - REPORT_ALL_KEYS_AS_ESCAPE_CODES reports lone modifier keys.
+    // The last two are what let the browser see Shift being held and released
+    // on its own, which drives the Shift-to-jump row labels. Legacy terminals
+    // report none of this, so the feature is simply absent there (and the
+    // event loop still treats autorepeat like a press).
     if matches!(supports_keyboard_enhancement(), Ok(true)) {
         let _ = execute!(
             stdout,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            )
         );
     }
     let backend = CrosstermBackend::new(stdout);
@@ -1668,15 +1677,28 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
         .add_modifier(Modifier::BOLD);
     let now = std::time::SystemTime::now();
     let inner_w = inner.width as usize;
+    // While Shift is held, the 2-col cursor gutter shows each row's dimmed
+    // 1-based jump number instead of the `▶` marker. Both are width 2, so the
+    // name column doesn't shift. Rows past 99 get no number (blank gutter).
+    let jump_labels = b.jump_labels.is_some();
+    let label_style = Style::default().fg(theme.muted).add_modifier(Modifier::DIM);
     let items: Vec<ListItem> = b
         .entries
         .iter()
         .enumerate()
         .map(|(i, e)| {
             let selected = i == b.selected;
-            let prefix = if selected { "▶ " } else { "  " };
+            let prefix_span = if jump_labels {
+                if i < 99 {
+                    Span::styled(format!("{:<2}", i + 1), label_style)
+                } else {
+                    Span::raw("  ")
+                }
+            } else {
+                Span::raw(if selected { "▶ " } else { "  " })
+            };
             let mut spans = vec![
-                Span::raw(prefix),
+                prefix_span,
                 Span::styled(e.display.clone(), browser_entry_style(e.kind, theme)),
             ];
             let unread = match e.kind {
@@ -2540,6 +2562,9 @@ fn default_hint(app: &App) -> String {
                 )
             }
         },
+        View::Browser(b) if b.jump_labels.is_some() => {
+            "type a row number to jump there  (release Shift to cancel)".into()
+        }
         View::Browser(b) => {
             let all = if b.show_all { "A:filtered" } else { "A:all" };
             let sort = if b.sort_by_modified {
@@ -3038,6 +3063,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
         section(" Local files"),
         Line::from("  n                new file (browser)   c / F2  rename"),
+        Line::from("  hold Shift       browser: show row numbers, type one to jump"),
         Line::from("  A                browser: toggle showing all files & hidden"),
         Line::from("  U                publish to HackMD — links the file, then"),
         Line::from("                   pushes up on save; asks before fetching on open"),

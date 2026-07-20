@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::Result;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 
@@ -52,7 +52,15 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
             continue;
         }
         match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => handle_key(app, k)?,
+            // `Repeat` is autorepeat under the kitty keyboard protocol (which we
+            // request when the terminal supports it, and which reports it
+            // distinctly from the first `Press`); treat it like a press so
+            // holding j/k still scrolls. `Release` only matters for the
+            // browser's Shift-held jump labels.
+            Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                handle_key(app, k)?
+            }
+            Event::Key(k) if k.kind == KeyEventKind::Release => handle_key_release(app, k),
             Event::Mouse(m) => handle_mouse(app, m)?,
             Event::Resize(_, _) => {
                 if let View::Reader(r) = &mut app.view {
@@ -74,6 +82,17 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
+    // A lone Shift press (reported only under the kitty keyboard protocol) turns
+    // on the browser's jump-number labels. Intercepted before anything else so a
+    // held Shift — including its autorepeat — never disturbs a pending count or
+    // chord, nor clears the statusline. Release is handled in `handle_key_release`.
+    if matches!(
+        key.code,
+        KeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift)
+    ) {
+        set_browser_jump_labels(app, true);
+        return Ok(());
+    }
     // Any key press hides the mouse-driven cursor suppression so the keyboard
     // focus highlight reappears.
     app.mouse_recent = false;
@@ -217,6 +236,18 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     }
     if app.search.is_some() {
         return handle_search_key(app, key);
+    }
+    // Browser jump-to-number: while Shift is held every row shows a dimmed
+    // 1-based label; a digit addresses that row and moves the cursor straight
+    // there (digits accumulate, so `1` then `6` lands on row 16). Under the
+    // kitty protocol a Shift+digit arrives as its shifted symbol with the
+    // Shift bit stripped, so `shift_digit` maps `!@#…)` back to `1234…0`.
+    if let View::Browser(b) = &app.view {
+        if b.jump_labels.is_some() {
+            if let Some(d) = shift_digit(key.code) {
+                return browser_jump_digit(app, d);
+            }
+        }
     }
     // Browser type-ahead find (lf-style): once `f` arms it, characters extend
     // the query and the selection live-jumps. Captures all keys until dismissed.
@@ -738,6 +769,79 @@ fn keep_browser_selection_visible(app: &mut App) {
             b.scroll = (b.selected + 1 - h.max(1)) as u16;
         }
     }
+}
+
+/// Key release handler. Only `Release` events reach here (the kitty keyboard
+/// protocol, when the terminal supports it, reports them). The sole interest is
+/// a Shift release, which hides the browser's jump-number labels.
+fn handle_key_release(app: &mut App, key: KeyEvent) {
+    if matches!(
+        key.code,
+        KeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift)
+    ) {
+        set_browser_jump_labels(app, false);
+    }
+}
+
+/// Turn the browser's Shift-held jump labels on or off. Turning them on with a
+/// buffer already present (an autorepeated Shift) is a no-op so accumulated
+/// digits survive; turning them off clears the buffer. Harmless off the browser.
+fn set_browser_jump_labels(app: &mut App, on: bool) {
+    if let View::Browser(b) = &mut app.view {
+        if on {
+            if b.jump_labels.is_none() {
+                b.jump_labels = Some(String::new());
+            }
+        } else {
+            b.jump_labels = None;
+        }
+    }
+}
+
+/// Map a key to the jump digit it addresses while Shift is held. Accepts plain
+/// digits (terminals that keep the Shift bit) and, because the kitty protocol
+/// rewrites Shift+digit to the layout's shifted symbol, the US-QWERTY symbol row
+/// `)!@#$%^&*(` too. Returns `None` for anything else.
+fn shift_digit(code: KeyCode) -> Option<u32> {
+    let KeyCode::Char(c) = code else {
+        return None;
+    };
+    match c {
+        '0'..='9' => c.to_digit(10),
+        ')' => Some(0),
+        '!' => Some(1),
+        '@' => Some(2),
+        '#' => Some(3),
+        '$' => Some(4),
+        '%' => Some(5),
+        '^' => Some(6),
+        '&' => Some(7),
+        '*' => Some(8),
+        '(' => Some(9),
+        _ => None,
+    }
+}
+
+/// Append `d` to the browser's jump buffer and move the cursor to the row it
+/// now names (1-based). The buffer resets once it can no longer grow into
+/// another in-range row, so the next digit starts a fresh number instead of
+/// appending (e.g. with 8 rows, `1` jumps to row 1 and resets; with 20 rows,
+/// `1` then `6` reaches row 16).
+fn browser_jump_digit(app: &mut App, d: u32) -> Result<()> {
+    if let View::Browser(b) = &mut app.view {
+        let n = b.entries.len();
+        let buf = b.jump_labels.get_or_insert_with(String::new);
+        buf.push(char::from_digit(d, 10).unwrap());
+        let target: usize = buf.parse().unwrap_or(0);
+        if (1..=n).contains(&target) {
+            b.selected = target - 1;
+        }
+        if target == 0 || target.saturating_mul(10) > n {
+            buf.clear();
+        }
+    }
+    keep_browser_selection_visible(app);
+    Ok(())
 }
 
 /// Edit-mode key handler. Active while `Reader::edit.is_some()`. Plain text
@@ -3614,6 +3718,91 @@ mod keybind_tests {
             View::Reader(r) => r.scroll,
             _ => panic!("expected reader"),
         }
+    }
+
+    /// A browser over a temp dir holding `n` markdown files, focused on the
+    /// listing. The `../` row is stripped so entry indices line up with the
+    /// jump labels (1 == first file) regardless of where temp_dir sits.
+    fn browser_with_files(tag: &str, n: usize) -> App {
+        use crate::tui::app::View;
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("md-tui-jump-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for i in 0..n {
+            std::fs::write(dir.join(format!("f{i:02}.md")), "x").unwrap();
+        }
+        let opts = Options {
+            width: 80,
+            line_numbers: false,
+            theme: Theme::dark(),
+        };
+        let mut app = App::new(Source::Directory(dir), opts).unwrap();
+        app.viewport = ratatui::layout::Rect::new(0, 0, 80, 100);
+        if let View::Browser(b) = &mut app.view {
+            b.entries
+                .retain(|e| !matches!(e.kind, crate::tui::app::BrowserEntryKind::ParentDir));
+            b.selected = 0;
+        }
+        app
+    }
+
+    fn browser_selected(app: &App) -> usize {
+        match &app.view {
+            View::Browser(b) => b.selected,
+            _ => panic!("expected browser"),
+        }
+    }
+
+    fn shift(app: &mut App, down: bool) {
+        use crossterm::event::{KeyEventKind, ModifierKeyCode};
+        let ev = KeyEvent::new(
+            KeyCode::Modifier(ModifierKeyCode::LeftShift),
+            KeyModifiers::SHIFT,
+        );
+        if down {
+            handle_key(app, ev).unwrap();
+        } else {
+            super::handle_key_release(
+                app,
+                KeyEvent::new_with_kind(ev.code, ev.modifiers, KeyEventKind::Release),
+            );
+        }
+    }
+
+    #[test]
+    fn shift_shows_labels_and_jumps_single_digit() {
+        let mut app = browser_with_files("single", 8);
+        // No labels until Shift is held.
+        assert!(matches!(&app.view, View::Browser(b) if b.jump_labels.is_none()));
+        shift(&mut app, true);
+        assert!(matches!(&app.view, View::Browser(b) if b.jump_labels.is_some()));
+        // Shift+6 arrives as the shifted symbol `^`; it lands on row 6 (index 5).
+        press(&mut app, KeyCode::Char('^'));
+        assert_eq!(browser_selected(&app), 5);
+        // With only 8 rows, `6` can't grow into a valid target, so the buffer
+        // reset: a following `3` jumps to row 3, not row 63.
+        press(&mut app, KeyCode::Char('#'));
+        assert_eq!(browser_selected(&app), 2);
+        // Releasing Shift hides the labels.
+        shift(&mut app, false);
+        assert!(matches!(&app.view, View::Browser(b) if b.jump_labels.is_none()));
+    }
+
+    #[test]
+    fn shift_accumulates_two_digits() {
+        let mut app = browser_with_files("double", 30);
+        shift(&mut app, true);
+        // `1` then `6` accumulates to row 16 (index 15).
+        press(&mut app, KeyCode::Char('!'));
+        assert_eq!(browser_selected(&app), 0);
+        press(&mut app, KeyCode::Char('^'));
+        assert_eq!(browser_selected(&app), 15);
+        // `3` then `5` would be row 35, past the 30 rows: the out-of-range
+        // second digit is ignored, so the cursor stays where `3` put it (row 3).
+        press(&mut app, KeyCode::Char('#'));
+        assert_eq!(browser_selected(&app), 2);
+        press(&mut app, KeyCode::Char('%'));
+        assert_eq!(browser_selected(&app), 2);
     }
 
     fn heading_lines(app: &App) -> Vec<usize> {
