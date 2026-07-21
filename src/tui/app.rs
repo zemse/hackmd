@@ -119,6 +119,11 @@ pub struct App {
     /// on Up only if no Drag arrived in between (so drag-select doesn't
     /// also navigate).
     pub pending_click: Option<(u16, u16)>,
+    /// Anchor to scroll to once the freshly-opened document has been laid out.
+    /// A cross-file `path#anchor` link navigates first, and the new reader has
+    /// no render yet — the slug can only be resolved to a display line after
+    /// the next `ensure_rendered`, so it waits here.
+    pub pending_anchor: Option<String>,
     /// Sub-line accumulator for wheel-scroll dampening. Carries fractional
     /// lines across events so a halved scroll factor still produces smooth
     /// movement instead of "stuck" frames where nothing happens.
@@ -474,6 +479,10 @@ pub struct Reader {
     pub focus: Option<Focus>,
     pub hover_link: Option<usize>,
     pub hover_checkbox: Option<usize>,
+    /// Index into `Rendered::headings` for the heading under the mouse, so the
+    /// reader can advertise that clicking it copies a link to that section.
+    /// `None` whenever a link or checkbox owns the same cell — those win.
+    pub hover_heading: Option<usize>,
     pub doc_search: Option<DocSearch>,
     /// In-house edit mode. `Some` while the user is editing this buffer.
     pub edit: Option<EditState>,
@@ -1078,6 +1087,7 @@ impl App {
             mouse_enabled: true,
             selection: None,
             pending_click: None,
+            pending_anchor: None,
             git_lens: None,
             last_click: None,
             scroll_accum: 0.0,
@@ -2622,16 +2632,48 @@ impl App {
         }
     }
 
-    fn scroll_to_anchor(&mut self, slug: &str) {
-        if let View::Reader(r) = &mut self.view {
-            if let Some(rendered) = &r.rendered {
-                if let Some(&line) = rendered.link_map.anchors.get(slug) {
-                    r.scroll = line as u16;
-                    self.status = format!("→ #{}", slug);
-                } else {
-                    self.status = format!("Anchor not found: #{}", slug);
-                }
+    /// The link a heading in the current document should be shared as:
+    /// `/abs/path/to/file.md#slug` for a file, the publish URL plus `#slug`
+    /// for a published cloud note, and a bare `#slug` when there's nothing to
+    /// hang the anchor off (stdin, an unpublished note).
+    pub fn heading_link(&self, anchor: &str) -> String {
+        let View::Reader(r) = &self.view else {
+            return format!("#{anchor}");
+        };
+        match &r.origin {
+            ReaderOrigin::File(p) => {
+                let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                format!("{}#{}", abs.display(), anchor)
             }
+            ReaderOrigin::CloudNote { publish_link, .. } if !publish_link.is_empty() => {
+                format!("{publish_link}#{anchor}")
+            }
+            ReaderOrigin::CloudNote { .. } | ReaderOrigin::Stdin => format!("#{anchor}"),
+        }
+    }
+
+    /// Scroll the reader so `slug`'s heading sits at the top. A document that
+    /// hasn't been laid out yet (the usual case right after navigating to
+    /// another file) has no line for the slug, so the jump is parked in
+    /// `pending_anchor` and replayed by [`App::ensure_rendered`].
+    fn scroll_to_anchor(&mut self, slug: &str) {
+        let viewport_h = self.viewport.height.max(1) as usize;
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        let Some(rendered) = &r.rendered else {
+            self.pending_anchor = Some(slug.to_string());
+            return;
+        };
+        match rendered.link_map.anchors.get(slug) {
+            Some(&line) => {
+                // Clamp like `scroll_by` does: an anchor in the last screenful
+                // scrolls only as far as keeps the page full.
+                let page_max = rendered.lines.len().saturating_sub(viewport_h) as u16;
+                r.scroll = (line as u16).min(page_max);
+                self.status = format!("→ #{}", slug);
+            }
+            None => self.status = format!("Anchor not found: #{}", slug),
         }
     }
 
@@ -4571,6 +4613,14 @@ impl App {
                 }
             }
         }
+        // A cross-file `path#anchor` jump parked its slug while the new
+        // document was still unrendered; now that it has display lines, land
+        // on the heading.
+        if matches!(&self.view, View::Reader(r) if r.rendered.is_some())
+            && let Some(slug) = self.pending_anchor.take()
+        {
+            self.scroll_to_anchor(&slug);
+        }
     }
 }
 
@@ -4999,6 +5049,7 @@ impl Reader {
             focus: None,
             hover_link: None,
             hover_checkbox: None,
+            hover_heading: None,
             doc_search: None,
             edit: None,
             last_meta,
@@ -5161,6 +5212,7 @@ impl Reader {
             focus: None,
             hover_link: None,
             hover_checkbox: None,
+            hover_heading: None,
             doc_search: None,
             edit: None,
             last_meta: None,
@@ -6369,6 +6421,80 @@ mod tests {
             rows.iter().any(|r| r.line_no.is_none()),
             "expected an unnumbered wrapped continuation row"
         );
+    }
+
+    #[test]
+    fn heading_link_is_absolute_path_plus_anchor() {
+        let dir = fresh_temp("heading-link");
+        let note = dir.join("note.md");
+        std::fs::write(&note, "# Top\n\ntext\n\n## The Sub Section!\n\nmore\n").unwrap();
+
+        let mut app = App::new(Source::File(note.clone()), opts()).unwrap();
+        app.viewport = Rect::new(0, 0, 80, 20);
+        app.ensure_rendered(80);
+
+        let canon = std::fs::canonicalize(&note).unwrap();
+        assert_eq!(
+            app.heading_link("the-sub-section"),
+            format!("{}#the-sub-section", canon.display())
+        );
+
+        // The link a click produces is the one the reader can follow back.
+        let View::Reader(r) = &app.view else {
+            panic!("expected Reader view");
+        };
+        let rd = r.rendered.as_ref().unwrap();
+        let hi = rd
+            .headings
+            .iter()
+            .position(|h| h.text == "The Sub Section!");
+        let hi = hi.expect("sub heading missing from outline");
+        assert_eq!(rd.headings[hi].anchor, "the-sub-section");
+        // Clicking anywhere on the heading's glyphs hits it; clicking past
+        // the end of the text does not.
+        let line = rd.headings[hi].line;
+        assert_eq!(rd.heading_at(line, 0), Some(hi));
+        assert_eq!(rd.heading_at(line, 79), None);
+    }
+
+    #[test]
+    fn cross_file_anchor_link_lands_on_the_heading() {
+        let dir = fresh_temp("cross-file-anchor");
+        let target = dir.join("target.md");
+        // Enough filler that the anchor is well below the first screen.
+        let mut body = String::from("# Target Top\n\n");
+        for i in 0..40 {
+            body.push_str(&format!("filler line {i}\n\n"));
+        }
+        body.push_str("## Deep Section\n\npayload\n\n");
+        // Tail filler so the anchor isn't inside the last screenful, where the
+        // scroll clamp would legitimately stop short of putting it on row 0.
+        for i in 0..40 {
+            body.push_str(&format!("tail line {i}\n\n"));
+        }
+        std::fs::write(&target, &body).unwrap();
+
+        let from = dir.join("from.md");
+        std::fs::write(&from, "# From\n").unwrap();
+
+        let mut app = App::new(Source::File(from), opts()).unwrap();
+        app.viewport = Rect::new(0, 0, 80, 20);
+        app.ensure_rendered(80);
+
+        // The freshly-loaded target has no render yet, so the jump has to
+        // survive until after layout.
+        app.follow(LinkTarget::FileAnchor(target, "deep-section".into()))
+            .unwrap();
+        app.ensure_rendered(80);
+
+        let View::Reader(r) = &app.view else {
+            panic!("expected Reader view");
+        };
+        let rd = r.rendered.as_ref().unwrap();
+        let want = *rd.link_map.anchors.get("deep-section").unwrap();
+        assert!(want > 0, "anchor should not be the first line");
+        assert_eq!(r.scroll as usize, want);
+        assert!(app.pending_anchor.is_none());
     }
 
     #[test]

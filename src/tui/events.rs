@@ -3273,9 +3273,11 @@ fn paste_over_selection(app: &mut App) {
     }
 }
 
-/// If `s` is a single bare URL (no internal whitespace, a `scheme://host`
-/// form or a `www.` host), return the link target to use, normalising a
-/// `www.` host to an `https://` URL. `None` for anything that isn't a link.
+/// If `s` is a single bare link (no internal whitespace), return the link
+/// target to use. Accepts a `scheme://host` URL, a `www.` host (normalised to
+/// `https://`), and the document links a heading click copies: a bare
+/// `#anchor` or a `path#anchor` / markdown file path. `None` for anything
+/// else, so ordinary text still pastes as text.
 fn pasted_link_href(s: &str) -> Option<String> {
     if s.is_empty() || s.chars().any(char::is_whitespace) {
         return None;
@@ -3295,7 +3297,34 @@ fn pasted_link_href(s: &str) -> Option<String> {
             return Some(format!("https://{s}"));
         }
     }
+    if is_doc_link(s) {
+        return Some(s.to_string());
+    }
     None
+}
+
+/// True for the in-document / cross-document links a heading click produces:
+/// `#anchor`, `/abs/path.md#anchor`, `./rel.md`, `notes/page.md`. Deliberately
+/// narrow — a path only counts when it's markdown or carries an anchor, so
+/// pasting a word like `foo#bar` over a selection stays plain text.
+fn is_doc_link(s: &str) -> bool {
+    if let Some(anchor) = s.strip_prefix('#') {
+        return !anchor.is_empty();
+    }
+    let (path, anchor) = match s.split_once('#') {
+        Some((p, a)) => (p, Some(a)),
+        None => (s, None),
+    };
+    if path.is_empty() || anchor == Some("") {
+        return false;
+    }
+    let path_shaped = path.starts_with('/') || path.starts_with("./") || path.starts_with("../");
+    let is_md = std::path::Path::new(path)
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"));
+    // A slash-y path needs an anchor or an .md extension to read as a link;
+    // a bare `foo.md` is unambiguous on its own.
+    (path_shaped && (anchor.is_some() || is_md)) || is_md
 }
 
 fn osc52_copy(text: &str) {
@@ -3340,9 +3369,37 @@ mod paste_link_tests {
     }
 
     #[test]
+    fn accepts_heading_links() {
+        // What a heading click copies.
+        assert_eq!(
+            pasted_link_href("/notes/spec.md#the-heading").as_deref(),
+            Some("/notes/spec.md#the-heading")
+        );
+        assert_eq!(
+            pasted_link_href("#the-heading").as_deref(),
+            Some("#the-heading")
+        );
+        // Plain relative markdown paths are links too.
+        assert_eq!(
+            pasted_link_href("./other.md").as_deref(),
+            Some("./other.md")
+        );
+        assert_eq!(
+            pasted_link_href("notes/page.md").as_deref(),
+            Some("notes/page.md")
+        );
+    }
+
+    #[test]
     fn rejects_non_links() {
         assert!(pasted_link_href("just some text").is_none());
         assert!(pasted_link_href("hello world").is_none());
+        // A word with a `#` in it is not a document link.
+        assert!(pasted_link_href("issue#42").is_none());
+        assert!(pasted_link_href("#").is_none());
+        assert!(pasted_link_href("/tmp/notes.md#").is_none());
+        // A non-markdown path without an anchor stays plain text.
+        assert!(pasted_link_href("/usr/bin/env").is_none());
         // Whitespace inside means it isn't a single link.
         assert!(pasted_link_href("https://a b").is_none());
         // Degenerate scheme/host.
@@ -4719,6 +4776,7 @@ fn update_hover(app: &mut App, col: u16, row: u16) {
         if col < inner_x {
             r.hover_link = None;
             r.hover_checkbox = None;
+            r.hover_heading = None;
             r.hover_jsonl = None;
             return;
         }
@@ -4727,6 +4785,14 @@ fn update_hover(app: &mut App, col: u16, row: u16) {
         let line_idx = r.scroll as usize + local_row;
         r.hover_link = rendered.link_map.at(line_idx, local_col);
         r.hover_checkbox = rendered.checkbox_map.at(line_idx, local_col);
+        // A heading containing a link keeps the link's hover; clicking there
+        // follows the link rather than copying the section link.
+        r.hover_heading =
+            if r.hover_link.is_some() || r.hover_checkbox.is_some() || r.edit.is_some() {
+                None
+            } else {
+                rendered.heading_at(line_idx, local_col)
+            };
         r.hover_jsonl = r
             .jsonl_overlay
             .as_ref()
@@ -4839,6 +4905,17 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
                 r.toggle_table(id, hit);
                 return Ok(());
             }
+            // Clicking a heading copies a shareable link to it
+            // (`/path/to/file.md#the-slug`), which pastes back into any note
+            // as a link the reader can follow.
+            if let Some(hi) = rendered.heading_at(line_idx, local_col) {
+                let anchor = rendered.headings[hi].anchor.clone();
+                let link = app.heading_link(&anchor);
+                copy_to_clipboard(&link);
+                app.yank = Some(link.clone());
+                app.status = format!("Copied {link}");
+                return Ok(());
+            }
             None
         }
         View::Browser(b) => {
@@ -4898,6 +4975,39 @@ mod copy_tests {
                     .contains(needle)
             })
             .unwrap_or_else(|| panic!("no rendered line contains {needle:?}"))
+    }
+
+    #[test]
+    fn hovering_a_heading_marks_it_but_a_link_inside_wins() {
+        let mut app = render_app(
+            "hover-heading",
+            "# Plain Heading\n\nbody\n\n## [Linked](https://example.com) Heading\n",
+        );
+        let plain = line_containing(&app, "Plain Heading");
+        let linked = line_containing(&app, "Linked");
+
+        super::update_hover(&mut app, 2, plain as u16);
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader")
+        };
+        let hi = r.hover_heading.expect("heading should be hovered");
+        assert_eq!(
+            r.rendered.as_ref().unwrap().headings[hi].anchor,
+            "plain-heading"
+        );
+
+        // Past the end of the heading text is not the heading.
+        super::update_hover(&mut app, 70, plain as u16);
+        assert!(matches!(&app.view, View::Reader(r) if r.hover_heading.is_none()));
+
+        // A link inside a heading keeps the link's hover, so the click follows
+        // the link instead of copying the section link.
+        super::update_hover(&mut app, 2, linked as u16);
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader")
+        };
+        assert!(r.hover_link.is_some());
+        assert!(r.hover_heading.is_none());
     }
 
     fn sel(line: usize, from: u16, to: u16) -> Selection {

@@ -52,6 +52,27 @@ pub struct Rendered {
     pub src_spans: Vec<Vec<SrcSpan>>,
 }
 
+impl Rendered {
+    /// Index into [`Rendered::headings`] of the heading whose rendered glyphs
+    /// cover display `(line, col)`. Clicks in the empty space to the right of
+    /// a short heading miss, so they still fall through to whatever else owns
+    /// that row.
+    pub fn heading_at(&self, line: usize, col: usize) -> Option<usize> {
+        let i = self
+            .headings
+            .iter()
+            .position(|h| line >= h.line && line < h.line_end)?;
+        let w: usize = self
+            .lines
+            .get(line)?
+            .spans
+            .iter()
+            .map(|s| s.content.width())
+            .sum();
+        (col < w).then_some(i)
+    }
+}
+
 /// One source-mapped run of display columns on a single display line.
 /// `[col_start, col_end)` is the display-column span; `src` is the source
 /// byte range it came from. When `atomic` is set the run is one indivisible
@@ -72,8 +93,13 @@ pub struct HeadingInfo {
     pub level: u8,
     /// Plain heading text with inline markup stripped.
     pub text: String,
+    /// GitHub-style anchor slug this heading answers to.
+    pub anchor: String,
     /// Display line index into `Rendered::lines`.
     pub line: usize,
+    /// One past the last display line of the heading (a long heading soft-
+    /// wraps over several rows). Lets a click anywhere in the heading hit it.
+    pub line_end: usize,
 }
 
 /// Source-byte range + display-line range for one block. `display_start`/
@@ -1395,12 +1421,7 @@ fn layout(
                 text,
             } => {
                 let start_line = out_lines.len();
-                anchors.insert(anchor, start_line);
-                headings.push(HeadingInfo {
-                    level,
-                    text,
-                    line: start_line,
-                });
+                anchors.insert(anchor.clone(), start_line);
                 let prefix = Vec::new();
                 wrap_runs(
                     &runs,
@@ -1417,6 +1438,15 @@ fn layout(
                     &mut cursor_xy,
                     &mut src_acc,
                 );
+                headings.push(HeadingInfo {
+                    level,
+                    text,
+                    anchor,
+                    line: start_line,
+                    // A heading always emits at least one row; guard anyway so
+                    // the range stays non-empty and hit-testable.
+                    line_end: out_lines.len().max(start_line + 1),
+                });
             }
             Block::Paragraph {
                 runs,

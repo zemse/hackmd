@@ -765,6 +765,17 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
                 }
             }
         }
+        // Hovering a heading underlines it: the affordance for "click to copy
+        // a link to this section".
+        if let Some(hi) = r.hover_heading
+            && let Some(h) = rendered.headings.get(hi)
+            && idx >= h.line
+            && idx < h.line_end
+        {
+            for span in &mut line.spans {
+                span.style = span.style.add_modifier(Modifier::UNDERLINED);
+            }
+        }
         if let Some(bi) = r.hover_jsonl {
             if let Some(btn) = r.jsonl_overlay.as_ref().and_then(|o| o.buttons.get(bi)) {
                 if btn.line == idx {
@@ -2444,6 +2455,17 @@ fn compute_middle(app: &App) -> Mid {
                     };
                 }
             }
+            // Same idea for a hovered heading: show the link a click copies.
+            if let (Some(rendered), Some(hi)) = (r.rendered.as_ref(), r.hover_heading)
+                && let Some(h) = rendered.headings.get(hi)
+            {
+                let last_row_idx =
+                    r.scroll as usize + (app.viewport.height as usize).saturating_sub(1);
+                return Mid::Url {
+                    text: format!("click to copy {}", app.heading_link(&h.anchor)),
+                    on_last_row: h.line_end.saturating_sub(1) == last_row_idx,
+                };
+            }
         }
     }
     // Browser type-ahead find: show the live query and whether it matches.
@@ -3044,6 +3066,8 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from("  Tab / S-Tab      cycle focus across links + checkboxes"),
         Line::from("  Enter / →        follow link or toggle checkbox"),
         Line::from("  o                open focused link in system browser"),
+        Line::from("  click a heading  copy a link to it (/path/to/file.md#the-heading);"),
+        Line::from("                   paste it over selected text to link that section"),
         Line::from(""),
         section(" History"),
         Line::from("  h / l            back / forward       Ctrl-O  back (vim)"),
