@@ -4574,7 +4574,7 @@ impl App {
                         &r.jsonl_expanded,
                         pre_start,
                         target_w as usize,
-                        theme.heading[0],
+                        theme.accent,
                     );
                     r.jsonl_overlay = if overlay.buttons.is_empty() {
                         None

@@ -217,7 +217,7 @@ fn draw_error(f: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(Span::styled(
         "Press any key to dismiss",
         Style::default()
-            .fg(theme.heading[3])
+            .fg(theme.accent_warm)
             .add_modifier(Modifier::BOLD),
     )));
     let h = (lines.len() as u16 + 2)
@@ -235,7 +235,7 @@ fn draw_error(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Can't open file ")
-        .border_style(Style::default().fg(theme.heading[3]));
+        .border_style(Style::default().fg(theme.accent_warm));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -332,7 +332,7 @@ fn draw_toc(f: &mut Frame, app: &App, area: Rect) {
         let text = format!(" {}{}", indent, hd.text);
         let style = if i == toc.selected {
             Style::default()
-                .fg(theme.heading[0])
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD | Modifier::REVERSED)
         } else {
             Style::default()
@@ -342,7 +342,7 @@ fn draw_toc(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Contents ")
-        .border_style(Style::default().fg(theme.heading[0]));
+        .border_style(Style::default().fg(theme.accent));
     f.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
@@ -378,7 +378,7 @@ fn draw_anchor_complete(f: &mut Frame, app: &mut App) {
             .collect();
         (labels, ac.selected, ac.matches.len())
     };
-    let border = app.opts.theme.heading[0];
+    let border = app.opts.theme.accent;
 
     // Width from the widest label, clamped into the viewport.
     let content_w = labels.iter().map(|s| s.width()).max().unwrap_or(0) as u16;
@@ -460,7 +460,7 @@ fn draw_lookup(f: &mut Frame, app: &mut App) {
         LookupStatus::NotFound => vec![format!("No definition for “{word}”.")],
         LookupStatus::Ready(text) => wrap_text(text, text_w),
     };
-    let border = app.opts.theme.heading[0];
+    let border = app.opts.theme.accent;
 
     let max_h = area.height.saturating_sub(2).clamp(3, 16);
     let h = (body.len() as u16 + 2).clamp(3, max_h);
@@ -593,7 +593,7 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(p.title.clone())
-        .border_style(Style::default().fg(theme.heading[0]));
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -601,28 +601,28 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled(
             "y / Enter to delete — any other key cancels",
             Style::default()
-                .fg(theme.heading[3])
+                .fg(theme.accent_warm)
                 .add_modifier(Modifier::BOLD),
         ))
     } else if matches!(p.kind, app::PromptKind::ConfirmDiscardEdit { .. }) {
         Line::from(Span::styled(
             "s save · d discard · Esc keep editing",
             Style::default()
-                .fg(theme.heading[3])
+                .fg(theme.accent_warm)
                 .add_modifier(Modifier::BOLD),
         ))
     } else if matches!(p.kind, app::PromptKind::RecoverEdit { .. }) {
         Line::from(Span::styled(
             "r / Enter recover · d discard · Esc later",
             Style::default()
-                .fg(theme.heading[3])
+                .fg(theme.accent_warm)
                 .add_modifier(Modifier::BOLD),
         ))
     } else if matches!(p.kind, app::PromptKind::ConfirmFetchUpdate { .. }) {
         Line::from(Span::styled(
             "y / Enter fetch (1 API call) · any other key keeps local",
             Style::default()
-                .fg(theme.heading[3])
+                .fg(theme.accent_warm)
                 .add_modifier(Modifier::BOLD),
         ))
     } else {
@@ -630,11 +630,11 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(
                 "▸ ",
                 Style::default()
-                    .fg(theme.heading[0])
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(p.input.clone()),
-            Span::styled("█", Style::default().fg(theme.heading[0])),
+            Span::styled("█", Style::default().fg(theme.accent)),
         ];
         // Grey ghost completing the typed segment to an existing directory.
         if let Some(ghost) = app.new_file_completion() {
@@ -1227,7 +1227,7 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
         // keep the same styling as their head row.
         let style = match row.kind {
             app::RawRowKind::Heading => Style::default()
-                .fg(theme.heading[0])
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
             app::RawRowKind::Quote => Style::default().fg(theme.quote),
             app::RawRowKind::Normal => Style::default(),
@@ -1358,9 +1358,9 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
                 // colored to flag the active row.
                 let cell = &mut buf[(preview_area.x - 1, row)];
                 cell.set_char('┃');
-                cell.set_style(Style::default().fg(theme.heading[0]));
+                cell.set_style(Style::default().fg(theme.accent));
             } else {
-                let wash = theme.code_bg.unwrap_or(theme.heading[0]);
+                let wash = theme.code_bg.unwrap_or(theme.accent);
                 for col in preview_area.x..preview_area.x + preview_area.width {
                     buf[(col, row)].set_bg(wash);
                 }
@@ -1404,7 +1404,7 @@ fn draw_git_lens(f: &mut Frame, app: &App, area: Rect) {
             DiffRowKind::Added => Style::default().bg(added_bg),
             DiffRowKind::Removed => Style::default().bg(removed_bg),
             DiffRowKind::Hunk => Style::default()
-                .fg(theme.heading[0])
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
             DiffRowKind::Header => Style::default().fg(theme.muted),
             DiffRowKind::Info => Style::default()
@@ -1497,7 +1497,7 @@ fn draw_scrollbar(
     // the entire cell (padding included), so a space with `.bg()` produces a
     // visually continuous column.
     let track_style = Style::default().bg(theme.muted);
-    let thumb_style = Style::default().bg(theme.heading[0]);
+    let thumb_style = Style::default().bg(theme.accent);
 
     let (thumb_top, thumb_h) = {
         let h = ((track_h * visible_h) / total).max(1).min(track_h);
@@ -1674,7 +1674,7 @@ fn draw_browser(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(block, area);
 
     let badge_style = Style::default()
-        .fg(theme.heading[3])
+        .fg(theme.accent_warm)
         .add_modifier(Modifier::BOLD);
     // `[uncommitted]` uses the link colour to read as "action available here"
     // and to stay visually distinct from the bold `[unread]` badge.
@@ -1853,7 +1853,7 @@ fn draw_cloud_browser(f: &mut Frame, app: &mut App, area: Rect) {
             // bold, link-shared uses the link color, private is muted.
             let badge_style = match n.visibility {
                 "published" => Style::default()
-                    .fg(theme.heading[3])
+                    .fg(theme.accent_warm)
                     .add_modifier(Modifier::BOLD),
                 "only me" | "only team" => Style::default().fg(theme.muted),
                 _ => Style::default().fg(theme.link),
@@ -1886,7 +1886,7 @@ fn browser_entry_style(kind: BrowserEntryKind, theme: &crate::tui::theme::Theme)
     match kind {
         BrowserEntryKind::ParentDir => Style::default().fg(theme.muted),
         BrowserEntryKind::Dir => Style::default()
-            .fg(theme.heading[0])
+            .fg(theme.accent)
             .add_modifier(Modifier::BOLD),
         BrowserEntryKind::Markdown => Style::default(),
     }
@@ -1915,7 +1915,7 @@ fn draw_search(f: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(theme.heading[0]));
+        .border_style(Style::default().fg(theme.accent));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
 
@@ -1928,11 +1928,11 @@ fn draw_search(f: &mut Frame, app: &App, area: Rect) {
         Span::styled(
             "▸ ",
             Style::default()
-                .fg(theme.heading[0])
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(s.query.clone()),
-        Span::styled("█", Style::default().fg(theme.heading[0])),
+        Span::styled("█", Style::default().fg(theme.accent)),
         Span::styled(
             format!("   {}", short_root(&app.root)),
             Style::default().fg(theme.muted),
@@ -1946,7 +1946,7 @@ fn draw_search(f: &mut Frame, app: &App, area: Rect) {
         .map(|r| {
             let style = if r.is_dir {
                 Style::default()
-                    .fg(theme.heading[0])
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD)
             } else if app::is_markdown_file(&r.path) {
                 Style::default()
@@ -2072,7 +2072,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
             crate::tui::app::HackmdBadgeKind::Public => (
                 "●",
                 Style::default()
-                    .fg(theme.heading[3])
+                    .fg(theme.accent_warm)
                     .add_modifier(Modifier::BOLD),
             ),
             crate::tui::app::HackmdBadgeKind::Private => ("○", Style::default().fg(theme.muted)),
@@ -2105,7 +2105,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
                 format!(" ⚠ 429 · {ago} "),
                 Style::default()
                     .bg(theme.status_bg)
-                    .fg(theme.heading[0])
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             ))
         })
@@ -2130,7 +2130,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(
                 label.to_string(),
                 Style::default()
-                    .bg(theme.heading[0])
+                    .bg(theme.accent)
                     .fg(theme.status_fg)
                     .add_modifier(Modifier::BOLD),
             )
@@ -2142,7 +2142,7 @@ fn draw_statusline(f: &mut Frame, app: &mut App, area: Rect) {
         Some(Span::styled(
             " GIT LENS ".to_string(),
             Style::default()
-                .bg(theme.heading[1])
+                .bg(theme.accent_cool)
                 .fg(theme.status_fg)
                 .add_modifier(Modifier::BOLD),
         ))
@@ -2364,9 +2364,9 @@ impl Mid {
             Mid::Url { .. } => Style::default()
                 .fg(theme.link)
                 .add_modifier(Modifier::UNDERLINED),
-            Mid::Search(_) => Style::default().fg(theme.heading[0]),
+            Mid::Search(_) => Style::default().fg(theme.accent),
             Mid::Status(_) => Style::default()
-                .fg(theme.heading[0])
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
             Mid::Hint(_) => Style::default().fg(theme.muted),
         }
@@ -2401,7 +2401,7 @@ fn quota_badge(app: &App, theme: &crate::tui::theme::Theme) -> Option<Span<'stat
     let style = if low {
         Style::default()
             .bg(theme.status_bg)
-            .fg(theme.heading[0])
+            .fg(theme.accent)
             .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme.muted)
@@ -2754,7 +2754,7 @@ fn draw_conflict(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(Line::from(Span::styled(
             title,
             Style::default()
-                .fg(theme.heading[0])
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ))),
         title_area,
@@ -2814,11 +2814,11 @@ fn draw_conflict(f: &mut Frame, app: &App, area: Rect) {
                 let marker = if is_sel { "▶" } else { " " };
                 let header_style = if is_sel {
                     Style::default()
-                        .fg(theme.heading[1])
+                        .fg(theme.accent_cool)
                         .add_modifier(Modifier::BOLD | Modifier::REVERSED)
                 } else {
                     Style::default()
-                        .fg(theme.heading[1])
+                        .fg(theme.accent_cool)
                         .add_modifier(Modifier::BOLD)
                 };
                 lines.push(Line::from(Span::styled(
@@ -2862,7 +2862,7 @@ fn draw_conflict(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
-            Style::default().fg(theme.heading[1]),
+            Style::default().fg(theme.accent_cool),
         ))),
         hint_area,
     );
@@ -2913,7 +2913,7 @@ fn draw_commit(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(Line::from(Span::styled(
             title,
             Style::default()
-                .fg(theme.heading[0])
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ))),
         title_area,
@@ -2998,7 +2998,7 @@ fn draw_commit(f: &mut Frame, app: &App, area: Rect) {
         .map(|(i, text)| {
             let gutter = if i == 0 { " ▸ " } else { "   " };
             let mut spans = vec![
-                Span::styled(gutter, Style::default().fg(theme.heading[3])),
+                Span::styled(gutter, Style::default().fg(theme.accent_warm)),
                 Span::raw((*text).to_string()),
             ];
             if msg_focused && i == last {
@@ -3021,7 +3021,7 @@ fn draw_commit(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             hint,
-            Style::default().fg(theme.heading[1]),
+            Style::default().fg(theme.accent_cool),
         ))),
         hint_area,
     );
@@ -3044,7 +3044,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled(
             t.to_string(),
             Style::default()
-                .fg(theme.heading[1])
+                .fg(theme.accent_cool)
                 .add_modifier(Modifier::BOLD),
         ))
     };

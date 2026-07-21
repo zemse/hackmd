@@ -2557,7 +2557,7 @@ fn emit_runs_tracking_links(
         }
         let mut style = run.style;
         if is_header {
-            style = style.add_modifier(Modifier::BOLD).fg(theme.heading[1]);
+            style = style.add_modifier(Modifier::BOLD).fg(theme.accent_cool);
         }
         let w = run.text.width();
         spans.push(Span::styled(run.text.clone(), style));
