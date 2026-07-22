@@ -3672,8 +3672,9 @@ impl App {
 
     /// Enter in the editor. Inside a markdown list this auto-continues the
     /// list: a bullet, numbered, or checkbox line spawns the next marker on
-    /// the new line. Pressing Enter on an *empty* list item (just the marker)
-    /// instead terminates the list, clearing the marker and leaving a blank
+    /// the new line, and in a numbered list the items below shift up so the
+    /// sequence stays continuous. Pressing Enter on an *empty* list item (just
+    /// the marker) instead terminates the list, clearing it and leaving a blank
     /// line — the standard GitHub/Obsidian behaviour. Outside a list it's a
     /// plain newline.
     pub fn edit_newline(&mut self) {
@@ -3692,6 +3693,7 @@ impl App {
         match list_continuation(&line, cursor_at_end) {
             Some(ListContinue::Marker(marker)) => {
                 self.edit_insert(&format!("\n{marker}"));
+                self.edit_renumber_below(&marker);
             }
             Some(ListContinue::Empty) => {
                 // Terminate the list: blank the marker-only line, cursor at
@@ -3710,6 +3712,45 @@ impl App {
             }
             None => self.edit_insert("\n"),
         }
+    }
+
+    /// After Enter continued a numbered list, bump the numbers of the items
+    /// below so `1. 2. 3.` becomes `1. 2. 3. 4.` instead of `1. 2. 2. 3.`.
+    /// `marker` is the just-inserted `{indent}{n}{sep} ` prefix; anything else
+    /// (bullets, checkboxes, alphabetic markers) is a no-op.
+    ///
+    /// Runs after `edit_insert`, which already pushed the undo snapshot, so a
+    /// single Enter still undoes as one step.
+    fn edit_renumber_below(&mut self, marker: &str) {
+        let View::Reader(r) = &mut self.view else {
+            return;
+        };
+        let Some(e) = r.edit.as_ref() else { return };
+        let indent_len = marker
+            .find(|c: char| c != ' ' && c != '\t')
+            .unwrap_or(marker.len());
+        let (indent, rest) = marker.split_at(indent_len);
+        let Some((num, sep, _)) = ordered_marker(rest) else {
+            return;
+        };
+        // The inserted item ends at the next newline; the list below starts
+        // after it. The cursor sits before that, so it needs no adjusting.
+        let cursor = e.cursor.min(r.raw.len());
+        let Some(nl) = r.raw[cursor..].find('\n') else {
+            return;
+        };
+        let Some(next) = num.checked_add(1) else {
+            return;
+        };
+        let edits = renumber_edits(&r.raw, cursor + nl + 1, indent, sep, next);
+        if edits.is_empty() {
+            return;
+        }
+        // Apply back-to-front so the earlier offsets stay valid.
+        for (start, end, text) in edits.into_iter().rev() {
+            r.raw.replace_range(start..end, &text);
+        }
+        r.rendered = None;
     }
 
     /// Move the current source line up (`delta < 0`) or down (`delta > 0`),
@@ -5405,6 +5446,89 @@ fn next_alpha(c: char) -> char {
     }
 }
 
+/// Split a leading ordered-list marker (`12.`, `3)`) off `s`, returning its
+/// number, its separator, and the byte length of the digits. `None` when `s`
+/// doesn't start with digits followed by `.`/`)`, or when the number is too
+/// large for a `u64`.
+fn ordered_marker(s: &str) -> Option<(u64, char, usize)> {
+    let digits = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+    if digits == 0 {
+        return None;
+    }
+    let sep = s[digits..]
+        .chars()
+        .next()
+        .filter(|c| *c == '.' || *c == ')')?;
+    Some((s[..digits].parse().ok()?, sep, digits))
+}
+
+/// Byte edits that renumber the ordered-list items following a freshly
+/// inserted one, so the sequence stays continuous. `from` is the offset of the
+/// line after the inserted item; `indent`/`sep` describe the list being edited
+/// and `expected` is the number the first following item should take.
+///
+/// Only a run that was already consecutive gets shifted: each item must carry
+/// the number it would have had before the insertion (`expected - 1`), so a
+/// deliberately odd list (`1.` `1.` `1.`, or `1.` `5.` `9.`) is left alone.
+/// More deeply indented lines (nested lists, continuation paragraphs) are
+/// skipped without consuming a number. The scan stops at anything that ends
+/// the list: a shallower or differently indented line, a non-numbered line, or
+/// a second consecutive blank line.
+///
+/// Returns `(start, end, replacement)` triples over the digits of each item,
+/// in ascending order.
+fn renumber_edits(
+    raw: &str,
+    from: usize,
+    indent: &str,
+    sep: char,
+    mut expected: u64,
+) -> Vec<(usize, usize, String)> {
+    let mut edits = Vec::new();
+    let mut start = from;
+    let mut blank = false;
+    while start < raw.len() {
+        let end = raw[start..]
+            .find('\n')
+            .map(|i| start + i)
+            .unwrap_or(raw.len());
+        let line = &raw[start..end];
+        let line_start = start;
+        start = end + 1;
+        if line.trim().is_empty() {
+            // One blank line still sits inside a loose list; two end it.
+            if blank {
+                break;
+            }
+            blank = true;
+            continue;
+        }
+        blank = false;
+        let ind_len = line
+            .find(|c: char| c != ' ' && c != '\t')
+            .unwrap_or(line.len());
+        let (ind, rest) = line.split_at(ind_len);
+        if ind.len() > indent.len() && ind.starts_with(indent) {
+            continue; // Nested item or continuation paragraph, not ours.
+        }
+        if ind != indent {
+            break;
+        }
+        let Some((num, s, digits)) = ordered_marker(rest) else {
+            break;
+        };
+        // Require a space after the marker, same as `list_continuation`.
+        if s != sep || !rest[digits + 1..].starts_with(' ') || num.checked_add(1) != Some(expected)
+        {
+            break;
+        }
+        let num_start = line_start + ind_len;
+        edits.push((num_start, num_start + digits, expected.to_string()));
+        expected += 1;
+    }
+    edits
+}
+
 /// Inspect a full source `line` (no trailing newline) for a markdown list
 /// marker, deciding how Enter should behave. `cursor_at_end` is whether the
 /// edit cursor sits at the line's end — an empty item only terminates the
@@ -5446,17 +5570,15 @@ fn list_continuation(line: &str, cursor_at_end: bool) -> Option<ListContinue> {
     }
 
     // Numbered lists: one or more digits, then `.` or `)`, then a space.
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if !digits.is_empty() {
-        let after = &rest[digits.len()..];
-        let sep = after.chars().next().filter(|c| *c == '.' || *c == ')')?;
-        let after_sep = &after[1..];
+    if rest.starts_with(|c: char| c.is_ascii_digit()) {
+        let (num, sep, digits) = ordered_marker(rest)?;
+        let after_sep = &rest[digits + 1..];
         let sp = count_spaces(after_sep);
         if sp == 0 {
             return None;
         }
         let content = &after_sep[sp..];
-        let next = digits.parse::<u64>().unwrap_or(0).saturating_add(1);
+        let next = num.saturating_add(1);
         return Some(empty_or(content, format!("{indent}{next}{sep} ")));
     }
 
@@ -6379,6 +6501,96 @@ mod list_continuation_tests {
 }
 
 #[cfg(test)]
+mod renumber_tests {
+    use super::renumber_edits;
+
+    /// Renumber the items below `marker_line` (0-based) in `raw`, mimicking
+    /// what `edit_renumber_below` does after Enter inserted that line.
+    fn renumber(raw: &str, marker_line: usize) -> String {
+        let mut offset = 0;
+        for _ in 0..=marker_line {
+            offset += raw[offset..].find('\n').unwrap() + 1;
+        }
+        let line = raw.lines().nth(marker_line).unwrap();
+        let ind = line.find(|c: char| c != ' ').unwrap_or(0);
+        let (num, sep, _) = super::ordered_marker(&line[ind..]).unwrap();
+        let edits = renumber_edits(raw, offset, &line[..ind], sep, num + 1);
+        let mut out = raw.to_string();
+        for (start, end, text) in edits.into_iter().rev() {
+            out.replace_range(start..end, &text);
+        }
+        out
+    }
+
+    #[test]
+    fn following_items_shift_up_by_one() {
+        let raw = "1. a\n2. \n2. b\n3. c\n4. d\n";
+        assert_eq!(renumber(raw, 1), "1. a\n2. \n3. b\n4. c\n5. d\n");
+    }
+
+    #[test]
+    fn multi_digit_rollover_rewrites_widening_markers() {
+        let raw = "8. a\n9. \n9. b\n10. c\n";
+        assert_eq!(renumber(raw, 1), "8. a\n9. \n10. b\n11. c\n");
+    }
+
+    #[test]
+    fn stops_at_the_end_of_the_list() {
+        // Prose after the list is untouched.
+        let raw = "1. a\n2. \n2. b\nplain text\n3. later\n";
+        assert_eq!(renumber(raw, 1), "1. a\n2. \n3. b\nplain text\n3. later\n");
+        // So is a bullet list.
+        let raw = "1. a\n2. \n2. b\n- bullet\n";
+        assert_eq!(renumber(raw, 1), "1. a\n2. \n3. b\n- bullet\n");
+        // And a different separator.
+        let raw = "1. a\n2. \n2) b\n";
+        assert_eq!(renumber(raw, 1), raw);
+    }
+
+    #[test]
+    fn deliberately_odd_numbering_is_left_alone() {
+        // An all-`1.` list is a legitimate markdown style.
+        let raw = "1. a\n2. \n1. b\n1. c\n";
+        assert_eq!(renumber(raw, 1), raw);
+        // So is a list whose numbers were never consecutive.
+        let raw = "1. a\n2. \n5. b\n9. c\n";
+        assert_eq!(renumber(raw, 1), raw);
+        // A run that goes off-sequence stops there, keeping the tail intact.
+        let raw = "1. a\n2. \n2. b\n7. c\n4. d\n";
+        assert_eq!(renumber(raw, 1), "1. a\n2. \n3. b\n7. c\n4. d\n");
+    }
+
+    #[test]
+    fn nested_items_and_continuations_are_skipped() {
+        let raw = "1. a\n2. \n   - sub\n   more text\n2. b\n";
+        assert_eq!(
+            renumber(raw, 1),
+            "1. a\n2. \n   - sub\n   more text\n3. b\n"
+        );
+        // Nested numbering renumbers within its own indent level.
+        let raw = "1. top\n   1. a\n   2. \n   2. b\n2. next\n";
+        assert_eq!(
+            renumber(raw, 2),
+            "1. top\n   1. a\n   2. \n   3. b\n2. next\n"
+        );
+    }
+
+    #[test]
+    fn one_blank_line_stays_inside_a_loose_list_two_end_it() {
+        let raw = "1. a\n2. \n\n2. b\n";
+        assert_eq!(renumber(raw, 1), "1. a\n2. \n\n3. b\n");
+        let raw = "1. a\n2. \n\n\n2. b\n";
+        assert_eq!(renumber(raw, 1), raw);
+    }
+
+    #[test]
+    fn last_line_without_a_trailing_newline_is_renumbered() {
+        let raw = "1. a\n2. \n2. b";
+        assert_eq!(renumber(raw, 1), "1. a\n2. \n3. b");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::tui::theme::Theme;
@@ -7100,6 +7312,37 @@ mod tests {
         let e = r.edit.as_ref().unwrap();
         assert!(e.dirty);
         assert_eq!(e.cursor, 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn edit_newline_in_a_numbered_list_renumbers_the_items_below() {
+        let dir = fresh_temp("edit-newline-renumber");
+        let path = dir.join("doc.md");
+        std::fs::write(&path, "1. one\n2. two\n3. three\n").unwrap();
+
+        let mut app = App::new(Source::File(path.clone()), opts()).unwrap();
+        app.ensure_rendered(80);
+        app.enter_edit();
+        // Cursor at the end of "1. one".
+        match &mut app.view {
+            View::Reader(r) => r.edit.as_mut().unwrap().cursor = "1. one".len(),
+            _ => panic!("expected reader"),
+        }
+        app.edit_newline();
+
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader")
+        };
+        assert_eq!(r.raw, "1. one\n2. \n3. two\n4. three\n");
+        // Cursor sits just after the inserted marker, untouched by renumbering.
+        assert_eq!(r.edit.as_ref().unwrap().cursor, "1. one\n2. ".len());
+
+        // One Enter undoes as a single step, renumbering included.
+        app.edit_undo();
+        let View::Reader(r) = &app.view else { panic!() };
+        assert_eq!(r.raw, "1. one\n2. two\n3. three\n");
 
         std::fs::remove_dir_all(&dir).ok();
     }
