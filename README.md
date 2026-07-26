@@ -6,7 +6,7 @@
 
 Terminal markdown editor for [HackMD](https://hackmd.io) — plus a full CLI and async Rust SDK.
 
-![Split live-preview editor](https://raw.githubusercontent.com/zemse/hackmd/main/assets/editor-split-view.png)
+![Split live-preview editor with a mermaid diagram rendered as Unicode art](https://raw.githubusercontent.com/zemse/hackmd/main/assets/editor-split-view.png)
 
 ## Install
 
