@@ -427,10 +427,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             View::Browser(_) => app.prompt_new_file(),
             _ => app.doc_search_step(true),
         },
-        // `c` / F2 renames the selected entry in the local browser.
-        KeyCode::Char('c') | KeyCode::F(2) if matches!(app.view, View::Browser(_)) => {
+        // `r` / F2 renames the selected entry in the local browser, `m` moves it.
+        KeyCode::Char('r') | KeyCode::F(2) if matches!(app.view, View::Browser(_)) => {
             app.prompt_rename();
         }
+        KeyCode::Char('m') if matches!(app.view, View::Browser(_)) => app.prompt_move(),
+        // `c` opens the commit screen (the `gc` chord does the same).
+        KeyCode::Char('c') => app.open_commit(),
         KeyCode::Char('N') => app.doc_search_step(false),
         KeyCode::Char('m') => toggle_mouse(app),
         // `e` and vim's `i` both open the editor (which starts in insert
@@ -587,6 +590,10 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             View::Reader(_) => scroll_viewport_relative(app, ViewportTarget::Top),
             View::Browser(_) | View::Cloud(_) => app.toggle_cloud_mode(),
         },
+        // `m` is the mouse toggle everywhere except the local browser, where it
+        // moves the selected entry; `M` covers the toggle there (the vim
+        // viewport motion it shadows only means anything in the Reader).
+        KeyCode::Char('M') if matches!(app.view, View::Browser(_)) => toggle_mouse(app),
         KeyCode::Char('M') => scroll_viewport_relative(app, ViewportTarget::Middle),
         KeyCode::Char('L') => scroll_viewport_relative(app, ViewportTarget::Bottom),
 
@@ -608,11 +615,12 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             app.refresh_cloud_lists();
         }
 
-        // Browser only: mark the selected entry read. On a directory this marks
-        // every text file under it read recursively, clearing its `[unread]`
-        // badge (and those of its descendants). `../` is a deliberate no-op so
-        // the whole parent subtree can't be cleared by accident.
-        KeyCode::Char('r') => {
+        // Browser only: `R` marks the selected entry read (`r` renames). On a
+        // directory this marks every text file under it read recursively,
+        // clearing its `[unread]` badge (and those of its descendants). `../`
+        // is a deliberate no-op so the whole parent subtree can't be cleared by
+        // accident.
+        KeyCode::Char('R') => {
             let target = if let View::Browser(b) = &app.view {
                 b.entries
                     .get(b.selected)
@@ -1957,7 +1965,7 @@ fn handle_prompt_key(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         // Tab accepts the existing-directory completion in the new-file prompt.
         KeyCode::Tab => {
-            if let Some(ghost) = app.new_file_completion() {
+            if let Some(ghost) = app.path_completion() {
                 if let Some(p) = &mut app.prompt {
                     p.input.push_str(&ghost);
                 }
@@ -2029,7 +2037,13 @@ fn toggle_mouse(app: &mut App) {
     if app.mouse_enabled {
         let _ = execute!(out, DisableMouseCapture);
         app.mouse_enabled = false;
-        app.status = "Mouse off — drag to select text (m to re-enable)".into();
+        // The re-enable key differs in the browser, where `m` is move.
+        let key = if matches!(app.view, View::Browser(_)) {
+            "M"
+        } else {
+            "m"
+        };
+        app.status = format!("Mouse off — drag to select text ({key} to re-enable)");
     } else {
         let _ = execute!(out, EnableMouseCapture);
         app.mouse_enabled = true;
@@ -3824,6 +3838,37 @@ mod keybind_tests {
                 KeyEvent::new_with_kind(ev.code, ev.modifiers, KeyEventKind::Release),
             );
         }
+    }
+
+    /// Browser keymap: `r` renames, `m` moves, `M` covers the mouse toggle
+    /// that `m` displaces, and `R` (not `r`) marks read.
+    #[test]
+    fn browser_rename_move_and_mouse_keys() {
+        let mut app = browser_with_files("keys", 3);
+
+        press(&mut app, KeyCode::Char('r'));
+        assert!(
+            matches!(&app.prompt, Some(p) if matches!(p.kind, crate::tui::app::PromptKind::RenameFile { .. })),
+            "r should open the rename prompt"
+        );
+        app.prompt = None;
+
+        press(&mut app, KeyCode::Char('m'));
+        assert!(
+            matches!(&app.prompt, Some(p) if matches!(p.kind, crate::tui::app::PromptKind::MoveEntry { .. })),
+            "m should open the move prompt"
+        );
+        app.prompt = None;
+
+        // `m` no longer toggles the mouse here, `M` does.
+        let before = app.mouse_enabled;
+        press(&mut app, KeyCode::Char('M'));
+        assert_ne!(app.mouse_enabled, before, "M should toggle mouse capture");
+        assert!(app.prompt.is_none());
+
+        // `R` marks read; it must not be mistaken for a rename.
+        press(&mut app, KeyCode::Char('R'));
+        assert!(app.prompt.is_none(), "R should not open a prompt");
     }
 
     #[test]

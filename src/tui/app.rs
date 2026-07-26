@@ -366,11 +366,15 @@ pub enum PromptKind {
         team_path: Option<String>,
     },
     /// `n` in the local browser — create a file with the typed name under
-    /// `dir`, then open it in the editor.
+    /// `dir`, then open it in the editor. A name ending in `/` creates a
+    /// directory instead and browses into it.
     NewFile { dir: PathBuf },
-    /// `c` / F2 in the local browser — rename the entry at `from` to the
+    /// `r` / F2 in the local browser — rename the entry at `from` to the
     /// typed name (kept in the same parent directory).
     RenameFile { from: PathBuf },
+    /// `m` in the local browser — move the entry at `from` to the typed
+    /// destination, read relative to `dir` (the browsed directory).
+    MoveEntry { from: PathBuf, dir: PathBuf },
     /// A dirty editor is about to be abandoned (second Esc / `:q` / Ctrl-C).
     /// Rather than silently dropping the buffer, ask first: `s` saves, `d`
     /// discards, Esc keeps editing. `after` is what to do once resolved.
@@ -985,6 +989,12 @@ pub struct Browser {
     /// time, newest first, instead of the default name sort. `../` stays
     /// pinned at the top either way.
     pub sort_by_modified: bool,
+    /// `(path, mtime)` of every sub-directory eligible for listing at the last
+    /// poll, *before* the "does it hold anything openable" filter. Whether a
+    /// sub-directory is shown depends on its contents, and adding a file inside
+    /// one doesn't touch the browsed directory's own mtime, so `last_meta`
+    /// alone can't see such a change. Refreshed by [`Browser::rebuild`].
+    pub child_dirs: Vec<(PathBuf, Option<std::time::SystemTime>)>,
     /// Set while Shift is held down (kitty keyboard protocol only): each row
     /// then shows a dimmed 1-based jump number and typing that number moves
     /// the cursor straight to it, so a distant entry is reachable without a
@@ -2245,29 +2255,60 @@ impl App {
     }
 
     /// `n` in the local browser: prompt for a new file's name. The file is
-    /// created under the current directory and opened in the editor.
+    /// created under the current directory and opened in the editor. A name
+    /// ending in `/` creates a directory and browses into it instead.
     pub fn prompt_new_file(&mut self) {
         let View::Browser(b) = &self.view else {
             return;
         };
         let dir = b.dir.clone();
         self.prompt = Some(Prompt {
-            title: " New file — name ".into(),
+            title: " New file (end the name with / for a folder) ".into(),
             input: String::new(),
             kind: PromptKind::NewFile { dir },
         });
     }
 
-    /// For an open [`PromptKind::NewFile`] prompt, the grey ghost that
-    /// completes the segment currently being typed to an existing
-    /// sub-directory, so Tab nests the new file inside it. Returns the suffix
-    /// to append (including the trailing `/`), or `None` when nothing existing
-    /// extends what's typed. Only directories are offered, since the point is
-    /// to drop the file into a folder that already exists.
-    pub fn new_file_completion(&self) -> Option<String> {
+    /// `m` in the local browser: prompt for where to move the selected entry.
+    /// The destination is read relative to the browsed directory; a trailing
+    /// `/` (or a name that already is a directory) means "into there, keep the
+    /// name", anything else is the full new path, so one keystroke can move
+    /// and rename at once.
+    pub fn prompt_move(&mut self) {
+        let View::Browser(b) = &self.view else {
+            return;
+        };
+        let dir = b.dir.clone();
+        let Some(entry) = b
+            .entries
+            .get(b.selected)
+            .filter(|e| !matches!(e.kind, BrowserEntryKind::ParentDir))
+        else {
+            return;
+        };
+        let from = entry.path.clone();
+        let name = from
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        self.prompt = Some(Prompt {
+            title: format!(" Move {name} to "),
+            input: String::new(),
+            kind: PromptKind::MoveEntry { from, dir },
+        });
+    }
+
+    /// For an open new-file or move prompt, the grey ghost that completes the
+    /// segment currently being typed to an existing sub-directory, so Tab
+    /// nests inside it. Returns the suffix to append (including the trailing
+    /// `/`), or `None` when nothing existing extends what's typed. Only
+    /// directories are offered, since the point is to reach a folder that
+    /// already exists.
+    pub fn path_completion(&self) -> Option<String> {
         let (base, input) = match &self.prompt {
             Some(Prompt {
-                kind: PromptKind::NewFile { dir },
+                kind: PromptKind::NewFile { dir } | PromptKind::MoveEntry { dir, .. },
                 input,
                 ..
             }) => (dir, input.as_str()),
@@ -2301,7 +2342,7 @@ impl App {
             .map(|n| format!("{}/", &n[seg.len()..]))
     }
 
-    /// `c` / F2 in the local browser: prompt to rename the selected entry.
+    /// `r` / F2 in the local browser: prompt to rename the selected entry.
     /// Pre-fills the current name so the user edits rather than retypes.
     pub fn prompt_rename(&mut self) {
         let View::Browser(b) = &self.view else {
@@ -2325,6 +2366,87 @@ impl App {
             input: name,
             kind: PromptKind::RenameFile { from },
         });
+    }
+
+    /// HackMD sync bases to carry across a pending rename/move of `path`, as
+    /// `(note id, current cache path, path relative to `path`)`.
+    ///
+    /// [`crate::tui::sync::base_path`] hashes the file's *canonical* path, so
+    /// the old cache name can only be computed while the file is still where
+    /// it is: this must run before the rename, and its result is handed to
+    /// [`Self::after_move`] afterwards. A directory contributes one entry per
+    /// linked markdown file beneath it.
+    fn linked_bases(&self, path: &Path) -> Vec<(String, PathBuf, PathBuf)> {
+        let linked = |file: &Path| -> Option<(String, PathBuf)> {
+            let content = std::fs::read_to_string(file).ok()?;
+            let meta = crate::tui::hackmd_meta::parse(&content)?;
+            let base = crate::tui::sync::base_path(&self.root, &meta.id, file);
+            Some((meta.id, base))
+        };
+        let is_markdown = |p: &Path| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+        };
+        if path.is_dir() {
+            // Hidden and gitignored files count: a linked note that happens to
+            // be ignored still has a base worth keeping.
+            ignore::WalkBuilder::new(path)
+                .hidden(false)
+                .git_ignore(false)
+                .git_exclude(false)
+                .git_global(false)
+                .require_git(false)
+                .build()
+                .flatten()
+                .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+                .filter(|e| is_markdown(e.path()))
+                .filter_map(|e| {
+                    let rel = e.path().strip_prefix(path).ok()?.to_path_buf();
+                    let (id, base) = linked(e.path())?;
+                    Some((id, base, rel))
+                })
+                .collect()
+        } else {
+            linked(path)
+                .into_iter()
+                .map(|(id, base)| (id, base, PathBuf::new()))
+                .collect()
+        }
+    }
+
+    /// Bookkeeping that has to follow an entry when it is renamed or moved:
+    /// the read-state key (else the file reappears as `[unread]`), the HackMD
+    /// sync base snapshots collected by [`Self::linked_bases`] (else the next
+    /// sync has no common ancestor and explodes into a whole-file conflict),
+    /// and any history entry still pointing at the old path.
+    fn after_move(&mut self, from: &Path, to: &Path, bases: Vec<(String, PathBuf, PathBuf)>) {
+        self.read_state.move_path(from, to);
+        for (id, old_base, rel) in bases {
+            let file = if rel.as_os_str().is_empty() {
+                to.to_path_buf()
+            } else {
+                to.join(&rel)
+            };
+            let _ = crate::tui::sync::rehome_base(&self.root, &id, &old_base, &file);
+        }
+        let remap = |p: &Path| -> Option<PathBuf> {
+            if p == from {
+                Some(to.to_path_buf())
+            } else {
+                p.strip_prefix(from).ok().map(|rest| to.join(rest))
+            }
+        };
+        for e in self.history.iter_mut().chain(self.forward.iter_mut()) {
+            match &mut e.kind {
+                EntryKind::File(p) | EntryKind::Directory(p) => {
+                    if let Some(next) = remap(p) {
+                        *p = next;
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     /// `S` on a cloud note: prompt for the local filename (defaults to the
@@ -2453,10 +2575,10 @@ impl App {
                     self.status = "Cancelled — empty name".into();
                     return;
                 }
-                // `foo/bar.md` is allowed and creates `foo/` on the way, but a
-                // backslash, a leading slash, a trailing slash, or any `..`
-                // is refused so the file can't escape the browsed directory or
-                // resolve to a bare directory.
+                // `foo/bar.md` is allowed and creates `foo/` on the way; a
+                // trailing `/` creates a directory instead of a file. A
+                // backslash, a leading slash, or any `..` is refused so the
+                // entry can't escape the browsed directory.
                 if name.contains('\\') {
                     self.status = "Use / to nest, not \\".into();
                     return;
@@ -2465,8 +2587,10 @@ impl App {
                     self.status = "Name can't be an absolute path".into();
                     return;
                 }
-                if name.ends_with('/') {
-                    self.status = "Add a file name after the directory".into();
+                let make_dir = name.ends_with('/');
+                let name = name.trim_end_matches('/');
+                if name.is_empty() {
+                    self.status = "Cancelled — empty name".into();
                     return;
                 }
                 let rel = std::path::Path::new(name);
@@ -2484,6 +2608,21 @@ impl App {
                 let path = dir.join(rel);
                 if path.exists() {
                     self.status = format!("Already exists: {}", path.display());
+                    return;
+                }
+                if make_dir {
+                    if let Err(e) = std::fs::create_dir_all(&path) {
+                        self.status = format!("create {}: {e}", path.display());
+                        return;
+                    }
+                    // Browse into the new folder, mirroring how creating a file
+                    // drops you into the editor: `n` always lands you inside
+                    // whatever it just made.
+                    if let Err(e) = self.navigate_to(EntryKind::Directory(path.clone()), 0) {
+                        self.status = format!("open {}: {e}", path.display());
+                        return;
+                    }
+                    self.status = format!("New folder {}", path.display());
                     return;
                 }
                 // Create any intermediate directories the name introduces.
@@ -2552,10 +2691,14 @@ impl App {
                     self.status = format!("Already exists: {}", to.display());
                     return;
                 }
+                // Collected before the rename: the sync cache name hashes the
+                // file's canonical path, which stops resolving once it moves.
+                let bases = self.linked_bases(&from);
                 if let Err(e) = std::fs::rename(&from, &to) {
                     self.status = format!("rename: {e}");
                     return;
                 }
+                self.after_move(&from, &to, bases);
                 // Rebuild the listing and re-select the renamed entry so the
                 // cursor follows it rather than snapping to the top.
                 if let View::Browser(b) = &mut self.view {
@@ -2565,6 +2708,77 @@ impl App {
                     }
                 }
                 self.status = format!("Renamed to {name}");
+            }
+            PromptKind::MoveEntry { from, dir } => {
+                let dest = p.input.trim();
+                if dest.is_empty() {
+                    self.status = "Cancelled — empty destination".into();
+                    return;
+                }
+                if dest.contains('\\') {
+                    self.status = "Use / to nest, not \\".into();
+                    return;
+                }
+                let Some(name) = from.file_name() else {
+                    self.status = "Can't move this entry".into();
+                    return;
+                };
+                // Relative destinations resolve against the browsed directory;
+                // `../` is allowed because the browser itself isn't fenced to
+                // the search root.
+                let rel = std::path::Path::new(dest);
+                let mut to = if rel.is_absolute() {
+                    rel.to_path_buf()
+                } else {
+                    dir.join(rel)
+                };
+                // `mv` semantics: an explicit trailing `/`, or a destination
+                // that already is a directory, means "into there, keep the
+                // name". Anything else is the full new path, so a move can
+                // rename in the same keystroke.
+                if dest.ends_with('/') || to.is_dir() {
+                    to = to.join(name);
+                }
+                let to = normalize_path(&to);
+                let from_norm = normalize_path(&from);
+                if to == from_norm {
+                    self.status = "Already there".into();
+                    return;
+                }
+                if from.is_dir() && to.starts_with(&from_norm) {
+                    self.status = "Can't move a folder into itself".into();
+                    return;
+                }
+                if to.exists() {
+                    self.status = format!("Already exists: {}", to.display());
+                    return;
+                }
+                if let Some(parent) = to.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    self.status = format!("create {}: {e}", parent.display());
+                    return;
+                }
+                // Captured before the move, for the same reason as in rename.
+                let bases = self.linked_bases(&from);
+                if let Err(e) = std::fs::rename(&from, &to) {
+                    // A cross-filesystem move fails here rather than silently
+                    // degrading to copy-then-delete, which is not atomic and
+                    // would need recursive handling for directories.
+                    self.status = format!("move: {e}");
+                    return;
+                }
+                self.after_move(&from, &to, bases);
+                // The entry usually left this directory, so only re-select it
+                // when it's still listed here; otherwise the rebuild keeps the
+                // cursor at a sane neighbouring row.
+                if let View::Browser(b) = &mut self.view {
+                    let _ = b.rebuild();
+                    if let Some(i) = b.entries.iter().position(|e| e.path == to) {
+                        b.selected = i;
+                    }
+                }
+                self.status = format!("Moved to {}", crate::tui::ui::display_path(&to, &self.root));
             }
         }
     }
@@ -2734,15 +2948,22 @@ impl App {
     /// place (preserving the highlighted path when it survives). Returns `true`
     /// when a rebuild happened. No-op outside the Browser view.
     ///
+    /// The listed sub-directories are stat'd too, because whether one is shown
+    /// at all depends on its contents (see `dir_has_listable`): dropping the
+    /// first markdown file into an otherwise unlistable folder doesn't touch
+    /// the browsed directory's own mtime, so without this the folder would
+    /// stay hidden until something else moved.
+    ///
     /// Unread badges don't need this — `draw_browser` recomputes them from disk
     /// every frame, so they're already live; only the entry list itself goes
-    /// stale, and that only changes when the directory's own stat changes.
+    /// stale.
     pub fn poll_browser_change(&mut self) -> bool {
         let View::Browser(b) = &mut self.view else {
             return false;
         };
         let new_meta = file_meta(&b.dir);
-        if b.last_meta == new_meta {
+        let new_children = child_dir_meta(&b.dir, b.show_all);
+        if b.last_meta == new_meta && b.child_dirs == new_children {
             return false;
         }
         // rebuild() refreshes last_meta, so a transient stat failure just retries
@@ -4801,6 +5022,33 @@ pub fn file_is_valid_utf8(path: &Path) -> bool {
 /// with nothing we can open are hidden from the default listing. Honours the
 /// same gitignore/hidden rules as the listing and short-circuits on the first
 /// hit.
+/// `(path, mtime)` for every sub-directory of `dir` that survives the same
+/// hidden/gitignore filtering as the listing itself, sorted by path so the
+/// result compares equal across calls. Deliberately *not* filtered by
+/// `dir_has_listable`: this is what detects a folder whose contents just made
+/// it (un)listable. Dot and ignored directories are skipped, which also keeps
+/// `.git`'s constant churn from forcing a rebuild on every tick.
+fn child_dir_meta(dir: &Path, show_all: bool) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+    let mut out: Vec<_> = ignore::WalkBuilder::new(dir)
+        .max_depth(Some(1))
+        .hidden(!show_all)
+        .git_ignore(!show_all)
+        .git_exclude(!show_all)
+        .git_global(!show_all)
+        .require_git(false)
+        .build()
+        .flatten()
+        .filter(|e| e.path() != dir)
+        .filter(|e| e.file_type().is_some_and(|t| t.is_dir()))
+        .map(|e| {
+            let mtime = e.metadata().ok().and_then(|m| m.modified().ok());
+            (e.path().to_path_buf(), mtime)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
 fn dir_has_listable(dir: &Path) -> bool {
     let walker = ignore::WalkBuilder::new(dir)
         .hidden(true)
@@ -4809,16 +5057,21 @@ fn dir_has_listable(dir: &Path) -> bool {
         .git_global(true)
         .require_git(false)
         .build();
+    let mut empty = true;
     for result in walker {
         let Ok(entry) = result else { continue };
         if entry.path() == dir {
             continue;
         }
+        empty = false;
         if entry.file_type().map(|t| t.is_file()).unwrap_or(false) && is_text_file(entry.path()) {
             return true;
         }
     }
-    false
+    // An empty directory is listed even though it holds nothing to read: it's
+    // a place to put things, and hiding it makes a folder just created (here
+    // with `n`, or outside the app with `mkdir`) look like it failed.
+    empty
 }
 
 /// Map a path to a syntect language token. Returns an empty string for
@@ -6076,6 +6329,42 @@ fn source_offset_for(s: &str, line: usize, col: usize) -> usize {
 /// Cheap stat read; returns `None` if the file is gone or unstatable. Called
 /// every event-loop tick — must not allocate or do anything beyond a single
 /// `metadata` syscall (kernel serves this from the inode cache).
+/// Resolve `.` and `..` lexically, without touching the filesystem.
+///
+/// `std::fs::canonicalize` can't be used for a move destination (it requires
+/// the path to exist) and would also resolve symlinks, which would make a move
+/// land somewhere other than where the user typed. A purely textual clean-up
+/// is what's needed here: it keeps `starts_with` checks and status messages
+/// honest for inputs like `../notes/x.md`. Leading `..` that would climb past
+/// the start of a relative path are preserved.
+pub fn normalize_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Only pop a real name; `..` after a root or another `..` has
+                // nothing to cancel out and has to stay.
+                let pops = out
+                    .components()
+                    .next_back()
+                    .is_some_and(|last| matches!(last, Component::Normal(_)));
+                if pops {
+                    out.pop();
+                } else {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        out.push(".");
+    }
+    out
+}
+
 pub fn file_meta(path: &Path) -> Option<(std::time::SystemTime, u64)> {
     let md = std::fs::metadata(path).ok()?;
     Some((md.modified().ok()?, md.len()))
@@ -6096,6 +6385,7 @@ impl Browser {
             find: None,
             show_all: false,
             sort_by_modified: false,
+            child_dirs: Vec::new(),
             jump_labels: None,
         };
         b.rebuild()?;
@@ -6155,6 +6445,7 @@ impl Browser {
         // Record the directory fingerprint this listing reflects, so the
         // tick-driven poll only rebuilds when the dir actually changes.
         self.last_meta = file_meta(&self.dir);
+        self.child_dirs = child_dir_meta(&self.dir, self.show_all);
         Ok(())
     }
 
@@ -6853,11 +7144,18 @@ mod tests {
         let b = Browser::scan(&dir).unwrap();
         let names: Vec<&str> = b.entries.iter().map(|e| e.display.as_str()).collect();
 
-        for want in ["withmd/", "a.md", "b.markdown", "note.txt", "NOTES"] {
+        // An empty directory is listed (it's a place to put things); one that
+        // holds only unopenable files is not.
+        for want in [
+            "withmd/",
+            "empty/",
+            "a.md",
+            "b.markdown",
+            "note.txt",
+            "NOTES",
+        ] {
             assert!(names.contains(&want), "missing {want}, got {names:?}");
         }
-        // A directory with nothing openable, or only binaries, is hidden.
-        assert!(!names.contains(&"empty/"), "empty/ shown, got {names:?}");
         assert!(
             !names.contains(&"binonly/"),
             "binonly/ shown, got {names:?}"
@@ -6896,6 +7194,182 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A new-file name ending in `/` makes a directory (nesting as needed) and
+    /// browses into it instead of opening the editor.
+    #[test]
+    fn new_file_trailing_slash_creates_dir() {
+        let dir = fresh_temp("new-dir-trailing-slash");
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        let base = match &app.view {
+            View::Browser(b) => b.dir.clone(),
+            _ => panic!("expected browser"),
+        };
+        app.prompt_new_file();
+        let mut p = app.prompt.take().unwrap();
+        p.input = "notes/drafts/".into();
+        app.commit_prompt(p);
+
+        let created = base.join("notes").join("drafts");
+        assert!(created.is_dir(), "expected {created:?} to be a directory");
+        // Landed inside the new folder, not in the editor.
+        match &app.view {
+            View::Browser(b) => assert_eq!(b.dir, created),
+            _ => panic!("expected to browse into the new folder"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A freshly created (so empty) directory is listed. It holds nothing to
+    /// read, but hiding it would make creating one look like a no-op.
+    #[test]
+    fn browser_lists_empty_directories() {
+        let dir = fresh_temp("browser-empty-dir");
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::write(dir.join("a.md"), "# a").unwrap();
+        let app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        match &app.view {
+            View::Browser(b) => assert!(
+                b.entries.iter().any(|e| e.display == "empty/"),
+                "empty dir missing from listing"
+            ),
+            _ => panic!("expected browser"),
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `m` moves the selected entry: into a directory when the destination
+    /// names one, and renaming on the way when it names a file.
+    #[test]
+    fn move_entry_into_directory_and_with_rename() {
+        let dir = fresh_temp("move-entry");
+        std::fs::create_dir_all(dir.join("archive")).unwrap();
+        std::fs::write(dir.join("note.md"), "# note").unwrap();
+        std::fs::write(dir.join("other.md"), "# other").unwrap();
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        let base = match &app.view {
+            View::Browser(b) => b.dir.clone(),
+            _ => panic!("expected browser"),
+        };
+
+        let select = |app: &mut App, name: &str| match &mut app.view {
+            View::Browser(b) => {
+                b.selected = b.entries.iter().position(|e| e.display == name).unwrap();
+            }
+            _ => panic!("expected browser"),
+        };
+
+        // Into an existing directory: the file keeps its name.
+        select(&mut app, "note.md");
+        app.prompt_move();
+        let mut p = app.prompt.take().unwrap();
+        p.input = "archive".into();
+        app.commit_prompt(p);
+        assert!(base.join("archive").join("note.md").is_file());
+        assert!(!base.join("note.md").exists());
+
+        // A destination naming a file moves and renames in one go, creating
+        // the intermediate directory.
+        select(&mut app, "other.md");
+        app.prompt_move();
+        let mut p = app.prompt.take().unwrap();
+        p.input = "sub/renamed.md".into();
+        app.commit_prompt(p);
+        assert!(base.join("sub").join("renamed.md").is_file());
+        assert!(!base.join("other.md").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A move onto an existing path is refused rather than clobbering it, and
+    /// a directory can't be moved inside itself.
+    #[test]
+    fn move_entry_refuses_clobber_and_self_nesting() {
+        let dir = fresh_temp("move-entry-refuse");
+        std::fs::create_dir_all(dir.join("box")).unwrap();
+        std::fs::write(dir.join("box").join("taken.md"), "# taken").unwrap();
+        std::fs::write(dir.join("taken.md"), "# mine").unwrap();
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        let base = match &app.view {
+            View::Browser(b) => b.dir.clone(),
+            _ => panic!("expected browser"),
+        };
+
+        let select = |app: &mut App, name: &str| match &mut app.view {
+            View::Browser(b) => {
+                b.selected = b.entries.iter().position(|e| e.display == name).unwrap();
+            }
+            _ => panic!("expected browser"),
+        };
+
+        select(&mut app, "taken.md");
+        app.prompt_move();
+        let mut p = app.prompt.take().unwrap();
+        p.input = "box/".into();
+        app.commit_prompt(p);
+        assert!(base.join("taken.md").is_file(), "source must survive");
+        assert_eq!(
+            std::fs::read_to_string(base.join("box").join("taken.md")).unwrap(),
+            "# taken",
+            "destination must not be clobbered"
+        );
+
+        select(&mut app, "box/");
+        app.prompt_move();
+        let mut p = app.prompt.take().unwrap();
+        p.input = "box/inner".into();
+        app.commit_prompt(p);
+        assert!(base.join("box").is_dir());
+        assert!(!base.join("box").join("inner").exists());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A rename or move carries the sync base snapshot across, so the next
+    /// sync of a HackMD-linked file still has its common ancestor. Without
+    /// this the path-keyed cache orphans and a clean pull turns into a
+    /// whole-file conflict.
+    #[test]
+    fn move_carries_the_sync_base_cache() {
+        let dir = fresh_temp("move-sync-base");
+        std::fs::create_dir_all(dir.join("archive")).unwrap();
+        let body =
+            "# linked\n\n<!-- hackmd-sync\nid: note123\nurl: https://hackmd.io/note123\n-->\n";
+        std::fs::write(dir.join("linked.md"), body).unwrap();
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        let base = match &app.view {
+            View::Browser(b) => b.dir.clone(),
+            _ => panic!("expected browser"),
+        };
+        crate::tui::sync::write_base(&app.root, "note123", &base.join("linked.md"), body).unwrap();
+
+        match &mut app.view {
+            View::Browser(b) => {
+                b.selected = b
+                    .entries
+                    .iter()
+                    .position(|e| e.display == "linked.md")
+                    .unwrap();
+            }
+            _ => panic!("expected browser"),
+        }
+        app.prompt_move();
+        let mut p = app.prompt.take().unwrap();
+        p.input = "archive/".into();
+        app.commit_prompt(p);
+
+        let moved = base.join("archive").join("linked.md");
+        assert!(moved.is_file());
+        assert_eq!(
+            crate::tui::sync::read_base(&app.root, "note123", &moved).as_deref(),
+            Some(body),
+            "the base snapshot should follow the file"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// `..` in a new-file name is refused so the file can't escape the tree.
     #[test]
     fn new_file_rejects_parent_traversal() {
@@ -6925,15 +7399,15 @@ mod tests {
 
         // Prefix of an existing top-level dir.
         app.prompt.as_mut().unwrap().input = "gui".into();
-        assert_eq!(app.new_file_completion(), Some("des/".into()));
+        assert_eq!(app.path_completion(), Some("des/".into()));
 
         // Complete a segment nested inside an existing dir.
         app.prompt.as_mut().unwrap().input = "assets/i".into();
-        assert_eq!(app.new_file_completion(), Some("mg/".into()));
+        assert_eq!(app.path_completion(), Some("mg/".into()));
 
         // A plain file name with no matching dir gets no ghost.
         app.prompt.as_mut().unwrap().input = "README".into();
-        assert_eq!(app.new_file_completion(), None);
+        assert_eq!(app.path_completion(), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -7117,6 +7591,47 @@ mod tests {
             _ => panic!("expected browser view"),
         }
         // No further changes → no further rebuild.
+        assert!(!app.poll_browser_change());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A change one level down is picked up too. Dropping the first markdown
+    /// file into a folder that held nothing openable makes that folder listable
+    /// without touching the browsed directory's own mtime, so the listing would
+    /// otherwise stay stale until something else changed.
+    #[test]
+    fn poll_browser_change_notices_a_subdir_becoming_listable() {
+        let dir = fresh_temp("browser-watch-nested");
+        std::fs::write(dir.join("a.md"), "# a").unwrap();
+        std::fs::create_dir_all(dir.join("binonly")).unwrap();
+        std::fs::write(dir.join("binonly").join("blob.bin"), &[0u8, 1, 2][..]).unwrap();
+
+        let mut app = App::new(Source::Directory(dir.clone()), opts()).unwrap();
+        assert!(!app.poll_browser_change());
+        match &app.view {
+            View::Browser(b) => assert!(
+                !b.entries.iter().any(|e| e.display == "binonly/"),
+                "a dir holding only binaries starts hidden"
+            ),
+            _ => panic!("expected browser view"),
+        }
+
+        // Sleep past the coarsest mtime granularity we might be sitting on.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(dir.join("binonly").join("now.md"), "# now").unwrap();
+
+        assert!(
+            app.poll_browser_change(),
+            "expected a rebuild after a subdir gained a markdown file"
+        );
+        match &app.view {
+            View::Browser(b) => assert!(
+                b.entries.iter().any(|e| e.display == "binonly/"),
+                "the subdir should now be listed"
+            ),
+            _ => panic!("expected browser view"),
+        }
         assert!(!app.poll_browser_change());
 
         std::fs::remove_dir_all(&dir).ok();
@@ -7754,6 +8269,7 @@ index abc..def 100644\n\
             find: None,
             show_all: false,
             sort_by_modified: false,
+            child_dirs: Vec::new(),
             jump_labels: None,
         };
         // Re-scan (rebuild discovers `..` if the dir has a parent — fine, just
@@ -7782,6 +8298,7 @@ index abc..def 100644\n\
             find: None,
             show_all: false,
             sort_by_modified: false,
+            child_dirs: Vec::new(),
             jump_labels: None,
         }
     }

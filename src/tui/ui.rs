@@ -637,7 +637,7 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
             Span::styled("█", Style::default().fg(theme.accent)),
         ];
         // Grey ghost completing the typed segment to an existing directory.
-        if let Some(ghost) = app.new_file_completion() {
+        if let Some(ghost) = app.path_completion() {
             spans.push(Span::styled(ghost, Style::default().fg(Color::DarkGray)));
             spans.push(Span::styled(
                 "  (Tab)",
@@ -650,7 +650,7 @@ fn draw_prompt(f: &mut Frame, app: &App, area: Rect) {
 }
 
 /// Render `p` shortened against the launch root (or `~/`) when one is a prefix.
-fn display_path(p: &std::path::Path, root: &std::path::Path) -> String {
+pub(crate) fn display_path(p: &std::path::Path, root: &std::path::Path) -> String {
     if let Ok(rel) = p.strip_prefix(root) {
         let s = rel.display().to_string();
         if s.is_empty() {
@@ -2595,12 +2595,12 @@ fn default_hint(app: &App) -> String {
                 "s:by-recent"
             };
             let commit = if app.git_status.count() > 0 {
-                "  gc:commit"
+                "  c:commit"
             } else {
                 ""
             };
             format!(
-                "j/k  Enter:open  n:new  c:rename  f:find  {sort}  {all}{commit}  H:hackmd  ?:help"
+                "j/k  Enter:open  n:new  r:rename  m:move  f:find  {sort}  {all}{commit}  H:hackmd  ?:help"
             )
         }
         View::Cloud(c) => {
@@ -3086,15 +3086,17 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from("                   :%s/…/…/g all lines · ↑/↓ command history"),
         Line::from(""),
         section(" Local files"),
-        Line::from("  n                new file (browser)   c / F2  rename"),
+        Line::from("  n                new file (browser); end the name with / for a folder"),
+        Line::from("  r / F2           rename            m  move (Tab completes folders)"),
         Line::from("  hold Shift       browser: show row numbers, type one to jump"),
         Line::from("  A                browser: toggle showing all files & hidden"),
         Line::from("  U                publish to HackMD — links the file, then"),
         Line::from("                   pushes up on save; asks before fetching on open"),
         Line::from("  conflicts        l:local u:upstream b:both n:drop Enter:apply"),
         Line::from("  Ctrl-G           git lens (diff vs HEAD; staged + unstaged)"),
-        Line::from("  gc               git commit (file / folder / repo; Space picks)"),
-        Line::from("  r                mark read (browser; dirs recurse)"),
+        Line::from("  c / gc           git commit (file / folder / repo; Space picks)"),
+        Line::from("  R                mark read (browser; dirs recurse)"),
+        Line::from("  M                browser: mouse capture on / off (m elsewhere)"),
         Line::from(""),
         section(if app.cloud.is_connected() {
             " HackMD cloud"

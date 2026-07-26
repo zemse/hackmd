@@ -80,6 +80,26 @@ pub fn write_base(root: &Path, id: &str, file: &Path, content: &str) -> std::io:
     std::fs::write(path, content)
 }
 
+/// Re-file a note's base snapshot after its linked file is renamed or moved.
+///
+/// The cache name hashes the file's *canonical* path, so without this a rename
+/// orphans the snapshot and the next sync has no common ancestor to merge
+/// against, turning an otherwise clean pull into a whole-file conflict.
+///
+/// `old_base` must be captured with [`base_path`] **before** the rename (the
+/// tag can only be computed while the file is still there to canonicalize);
+/// `file` is the new location, already moved. A missing cache is a no-op.
+pub fn rehome_base(root: &Path, id: &str, old_base: &Path, file: &Path) -> std::io::Result<()> {
+    let new = base_path(root, id, file);
+    if new == old_base || !old_base.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = new.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::rename(old_base, new)
+}
+
 /// Normalise line endings to `\n`. HackMD may return `\r\n` while the local
 /// file is `\n`; [`merge3`] compares exact strings, so without this every line
 /// would read as changed and a first sync would explode into a whole-file

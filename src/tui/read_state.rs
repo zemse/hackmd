@@ -94,6 +94,32 @@ impl ReadState {
         }
     }
 
+    /// Re-key the state after `from` is renamed or moved to `to`, so the entry
+    /// doesn't come back as `[unread]` at its new path. `fs::rename` leaves
+    /// mtimes untouched, so carrying the recorded value across is exact. When
+    /// `from` is a directory every key beneath it is rewritten too.
+    pub fn move_path(&mut self, from: &Path, to: &Path) {
+        let moved: Vec<(PathBuf, u64)> = self
+            .map
+            .iter()
+            .filter_map(|(p, &mt)| {
+                if p == from {
+                    Some((to.to_path_buf(), mt))
+                } else {
+                    // `starts_with` is component-wise, so `a/bc` is not treated
+                    // as living under `a/b`.
+                    p.strip_prefix(from).ok().map(|rest| (to.join(rest), mt))
+                }
+            })
+            .collect();
+        if moved.is_empty() {
+            return;
+        }
+        self.map.retain(|p, _| p != from && !p.starts_with(from));
+        self.map.extend(moved);
+        self.flush();
+    }
+
     /// Snapshot every text file under `root` as read (first-run seeding).
     fn seed(&mut self, root: &Path) {
         if !root.exists() {

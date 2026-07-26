@@ -52,6 +52,35 @@
   cancels. The message box is multi-line: `Shift+Enter` (or `Alt+Enter` where
   the terminal can't report Shift+Enter) inserts a newline and the box grows to
   fit. Commits touch only the checked paths, leaving other changes untouched.
+- **Create folders and move entries in the browser** — ending a `n` (new) name
+  with `/` creates a folder instead of a file and browses straight into it, so
+  `notes/drafts/` makes both levels at once. `m` moves the selected file or
+  folder: the destination is read relative to the browsed directory, Tab
+  ghost-completes existing folders, a trailing `/` (or a name that already is a
+  folder) means "into there, keep the name", and anything else is the full new
+  path, so a move can rename in the same keystroke. Existing destinations are
+  never clobbered and a folder can't be moved inside itself.
+
+### Changed
+
+- **Browser keys**: `r` renames (was `c`, `F2` still works), `m` moves, `c`
+  commits (the `gc` chord is unchanged), and `R` marks read (was `r`). `m` still
+  toggles mouse capture everywhere outside the browser, where `M` now does it.
+- Empty directories are listed in the browser. They hold nothing to read, but
+  hiding them made a folder just created (with `n`, or with `mkdir` outside the
+  app) look like it had failed.
+
+### Fixed
+
+- Renaming or moving a HackMD-linked file no longer orphans its sync base
+  snapshot. The cache is keyed by the file's path, so the next sync used to find
+  no common ancestor and turn a clean pull into a whole-file conflict.
+- Renaming or moving a file no longer resets it to `[unread]`, and history
+  entries pointing at it are rewritten so `h`/Back doesn't dead-end on the old
+  path.
+- The browser now notices a change one level down (a folder gaining its first
+  markdown file), which previously left the folder hidden until something else
+  in the listed directory happened to change.
 
 ## 0.1.0 (2026-06-25)
 
