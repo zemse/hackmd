@@ -113,6 +113,10 @@ const TITLE_MAX_CHARS: usize = 96;
 /// top, since that names the note better than `2024-notes-final-v2.md` does;
 /// otherwise the file name. Cloud notes already carry a server-side title,
 /// and the browser views name the directory / host instead.
+///
+/// Just the document — no `- hackmd` suffix. Terminals that want the app
+/// named there already append the running process themselves (Terminal.app
+/// does by default), and doubling it up reads as a bug.
 pub fn terminal_title(app: &App) -> String {
     let name = match &app.view {
         View::Reader(r) => match &r.origin {
@@ -126,7 +130,7 @@ pub fn terminal_title(app: &App) -> String {
         View::Browser(b) => format!("{}/", file_label(&b.dir)),
         View::Cloud(_) => "hackmd.io".to_string(),
     };
-    format!("{} - hackmd", sanitize_title(&name))
+    sanitize_title(&name)
 }
 
 /// The last path component, falling back to the whole path for roots like `/`.
@@ -3235,11 +3239,11 @@ mod tests {
     #[test]
     fn terminal_title_prefers_a_leading_h1() {
         let app = app_on("heading.md", "# Real Title\n\nbody\n");
-        assert_eq!(terminal_title(&app), "Real Title - hackmd");
+        assert_eq!(terminal_title(&app), "Real Title");
 
         // Front matter doesn't count against the line budget.
         let app = app_on("fm.md", "---\ntitle: Front\ntags: [a]\n---\n\n# Body H1\n");
-        assert_eq!(terminal_title(&app), "Body H1 - hackmd");
+        assert_eq!(terminal_title(&app), "Body H1");
 
         // An H1 buried past the scan window is a section heading, not a title.
         let deep = format!("{}# Too Deep\n", "filler\n".repeat(TITLE_H1_SCAN_LINES + 1));
@@ -3252,7 +3256,7 @@ mod tests {
 
         // No H1 at all falls back to the file name too.
         let app = app_on("plain.md", "## Sub only\n\ntext\n");
-        assert!(terminal_title(&app).ends_with("plain.md - hackmd"));
+        assert!(terminal_title(&app).ends_with("plain.md"));
 
         // A directory listing is named after the directory.
         let opts = Options {
@@ -3265,7 +3269,7 @@ mod tests {
         let app = App::new(Source::Directory(dir.clone()), opts).unwrap();
         assert_eq!(
             terminal_title(&app),
-            format!("md-tui-title-dir-{}/ - hackmd", std::process::id())
+            format!("md-tui-title-dir-{}/", std::process::id())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
