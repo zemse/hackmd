@@ -23,6 +23,8 @@ fn consume_count(prefix: &mut Option<u32>) -> i32 {
 }
 
 pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
+    // Last window title we pushed, so the per-tick sync stays a string compare.
+    let mut term_title = String::new();
     while !app.should_quit {
         // Detect external edits to the open file. One stat syscall per tick
         // (≤4/sec when idle, served from the kernel inode cache) — far
@@ -43,6 +45,8 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
         // one-shot prompt to pull upstream edits (no background polling — each
         // fetch costs an API call against a quota as low as 400/month).
         app.maybe_sync();
+        // Name the terminal tab after whatever the frame is about to show.
+        ui::sync_terminal_title(term, &mut term_title, ui::terminal_title(app));
         term.draw(|f| ui::draw(f, app))?;
         // Flush trailing unsaved edits to the recovery mirror on idle ticks,
         // so edits made just before the user stops typing aren't left only in

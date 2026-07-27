@@ -4891,6 +4891,14 @@ impl App {
 /// front-matter block (`---` … `---`) so a `title:` key there doesn't shadow
 /// the heading scan. `## Sub` and deeper are ignored — only a true H1 counts.
 fn first_h1(content: &str) -> Option<String> {
+    first_h1_within(content, usize::MAX)
+}
+
+/// [`first_h1`], but only looking at the first `max_lines` lines of the body
+/// (front matter doesn't count against the budget). The terminal title uses a
+/// small budget: an H1 near the top names the document, while one buried
+/// halfway down is just a section heading.
+pub(crate) fn first_h1_within(content: &str, max_lines: usize) -> Option<String> {
     let mut lines = content.lines().peekable();
     // Skip YAML front matter if the very first line is `---`.
     if lines.peek().map(|l| l.trim_end()) == Some("---") {
@@ -4901,7 +4909,7 @@ fn first_h1(content: &str) -> Option<String> {
             }
         }
     }
-    for line in lines {
+    for line in lines.take(max_lines) {
         let t = line.trim_start();
         // H1 is `#` followed by whitespace then text; `##`+ is not an H1.
         if let Some(rest) = t.strip_prefix('#') {

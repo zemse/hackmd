@@ -1,4 +1,4 @@
-use std::io::{self, Stdout};
+use std::io::{self, Stdout, Write};
 
 use anyhow::Result;
 use crossterm::event::{
@@ -7,7 +7,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
     supports_keyboard_enhancement,
 };
 use ratatui::Frame;
@@ -25,10 +25,18 @@ use crate::tui::links::LinkTarget;
 
 pub type Term = Terminal<CrosstermBackend<Stdout>>;
 
+/// xterm window-manipulation: push the current window title onto the
+/// terminal's title stack (CSI 22;2t) so we can restore it on exit, and pop
+/// it back (CSI 23;2t). Terminals without the extension ignore both.
+const PUSH_TITLE: &str = "\x1b[22;2t";
+const POP_TITLE: &str = "\x1b[23;2t";
+
 pub fn setup_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Borrow the window title for the session; popped in `restore_terminal`.
+    let _ = write!(stdout, "{PUSH_TITLE}");
     // Turn on the kitty keyboard protocol where the terminal supports it:
     //  - DISAMBIGUATE_ESCAPE_CODES reports modified keys distinctly, so e.g.
     //    Shift+Enter (multi-line commit messages) is legible.
@@ -56,6 +64,7 @@ pub fn setup_terminal() -> Result<Term> {
 pub fn restore_terminal(term: &mut Term) -> Result<()> {
     disable_raw_mode()?;
     let _ = execute!(term.backend_mut(), PopKeyboardEnhancementFlags);
+    let _ = write!(term.backend_mut(), "{POP_TITLE}");
     execute!(
         term.backend_mut(),
         LeaveAlternateScreen,
@@ -70,8 +79,80 @@ pub fn restore_raw() -> Result<()> {
     let _ = disable_raw_mode();
     let mut out = io::stdout();
     let _ = execute!(out, PopKeyboardEnhancementFlags);
+    let _ = write!(out, "{POP_TITLE}");
     let _ = execute!(out, LeaveAlternateScreen, DisableMouseCapture);
     Ok(())
+}
+
+/// Push `title` to the terminal, if it differs from what we last set.
+///
+/// Called once per tick: the title is derived from live buffer contents, so
+/// typing over a heading retitles the tab, but the common case is a no-op
+/// string compare with no bytes written.
+pub fn sync_terminal_title(term: &mut Term, last: &mut String, title: String) {
+    if *last == title {
+        return;
+    }
+    if execute!(term.backend_mut(), SetTitle(&title)).is_ok() {
+        *last = title;
+    }
+}
+
+/// How far into a document to look for the H1 that names it. An H1 on line 3
+/// is the document's title; one on line 200 is just a section heading, and
+/// letting it win would make the terminal title lie about what's open.
+const TITLE_H1_SCAN_LINES: usize = 10;
+
+/// Longest terminal title we emit. Long enough for a real heading, short
+/// enough that a tab bar isn't swamped by a runaway one.
+const TITLE_MAX_CHARS: usize = 96;
+
+/// Text for the terminal's window/tab title, given what's on screen.
+///
+/// For a document that means its own `# Heading` when one appears near the
+/// top, since that names the note better than `2024-notes-final-v2.md` does;
+/// otherwise the file name. Cloud notes already carry a server-side title,
+/// and the browser views name the directory / host instead.
+pub fn terminal_title(app: &App) -> String {
+    let name = match &app.view {
+        View::Reader(r) => match &r.origin {
+            ReaderOrigin::File(p) => {
+                app::first_h1_within(&r.raw, TITLE_H1_SCAN_LINES).unwrap_or_else(|| file_label(p))
+            }
+            ReaderOrigin::Stdin => app::first_h1_within(&r.raw, TITLE_H1_SCAN_LINES)
+                .unwrap_or_else(|| "stdin".to_string()),
+            ReaderOrigin::CloudNote { title, .. } => title.clone(),
+        },
+        View::Browser(b) => format!("{}/", file_label(&b.dir)),
+        View::Cloud(_) => "hackmd.io".to_string(),
+    };
+    format!("{} - hackmd", sanitize_title(&name))
+}
+
+/// The last path component, falling back to the whole path for roots like `/`.
+fn file_label(p: &std::path::Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+/// Make arbitrary document text safe to put inside an OSC title sequence:
+/// control bytes (notably ESC and BEL) would terminate or extend the escape
+/// and corrupt the screen, so they're dropped rather than escaped.
+fn sanitize_title(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return "untitled".to_string();
+    }
+    if cleaned.chars().count() <= TITLE_MAX_CHARS {
+        return cleaned.to_string();
+    }
+    let head: String = cleaned.chars().take(TITLE_MAX_CHARS - 1).collect();
+    format!("{}…", head.trim_end())
 }
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -3135,6 +3216,69 @@ mod tests {
         // A token longer than the box is hard-split rather than overflowing.
         let hard = wrap_text("supercalifragilistic", 6);
         assert!(hard.len() > 1 && hard.iter().all(|l| l.chars().count() <= 6));
+    }
+
+    fn app_on(name: &str, body: &str) -> App {
+        let mut p = std::env::temp_dir();
+        p.push(format!("md-tui-title-{}-{name}", std::process::id()));
+        std::fs::write(&p, body).unwrap();
+        let opts = Options {
+            width: 80,
+            line_numbers: false,
+            theme: Theme::dark(),
+        };
+        App::new(Source::File(p), opts).unwrap()
+    }
+
+    // The document's own H1 titles the terminal when it sits near the top;
+    // otherwise the file name does.
+    #[test]
+    fn terminal_title_prefers_a_leading_h1() {
+        let app = app_on("heading.md", "# Real Title\n\nbody\n");
+        assert_eq!(terminal_title(&app), "Real Title - hackmd");
+
+        // Front matter doesn't count against the line budget.
+        let app = app_on("fm.md", "---\ntitle: Front\ntags: [a]\n---\n\n# Body H1\n");
+        assert_eq!(terminal_title(&app), "Body H1 - hackmd");
+
+        // An H1 buried past the scan window is a section heading, not a title.
+        let deep = format!("{}# Too Deep\n", "filler\n".repeat(TITLE_H1_SCAN_LINES + 1));
+        let app = app_on("deep.md", &deep);
+        assert!(
+            terminal_title(&app).starts_with("md-tui-title-"),
+            "{}",
+            terminal_title(&app)
+        );
+
+        // No H1 at all falls back to the file name too.
+        let app = app_on("plain.md", "## Sub only\n\ntext\n");
+        assert!(terminal_title(&app).ends_with("plain.md - hackmd"));
+
+        // A directory listing is named after the directory.
+        let opts = Options {
+            width: 80,
+            line_numbers: false,
+            theme: Theme::dark(),
+        };
+        let dir = std::env::temp_dir().join(format!("md-tui-title-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = App::new(Source::Directory(dir.clone()), opts).unwrap();
+        assert_eq!(
+            terminal_title(&app),
+            format!("md-tui-title-dir-{}/ - hackmd", std::process::id())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Heading text is arbitrary user input: control bytes would break out of
+    // the OSC sequence, and a runaway heading would swamp a tab bar.
+    #[test]
+    fn sanitize_title_strips_controls_and_truncates() {
+        assert_eq!(sanitize_title("a\x1b]0;evil\x07b"), "a ]0;evil b");
+        assert_eq!(sanitize_title("  \n\t "), "untitled");
+        let long = sanitize_title(&"x".repeat(TITLE_MAX_CHARS + 40));
+        assert_eq!(long.chars().count(), TITLE_MAX_CHARS);
+        assert!(long.ends_with('…'));
     }
 
     fn app_with_link() -> App {
