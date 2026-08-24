@@ -7,6 +7,7 @@ use crate::tui::cloud::{CachedNote, CloudContext, CloudMsg, CloudState, FetchedN
 use crate::tui::jsonl::{self, JsonlOverlay};
 use crate::tui::links::LinkTarget;
 use crate::tui::markdown::{self, Rendered};
+use crate::tui::natsort::natural_cmp;
 use crate::tui::theme::Theme;
 use ratatui_image::picker::Picker;
 use std::collections::HashSet;
@@ -5221,7 +5222,7 @@ fn push_children(dir: &Path, out: &mut Vec<BrowserEntry>, show_all: bool) {
             files.push((name, path, modified));
         }
     }
-    let by_name = |a: &Row, b: &Row| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase());
+    let by_name = |a: &Row, b: &Row| natural_cmp(&a.0, &b.0);
     dirs.sort_by(by_name);
     files.sort_by(by_name);
     for (name, path, modified) in dirs {
@@ -6424,11 +6425,9 @@ impl Browser {
                 Some(BrowserEntryKind::ParentDir)
             ));
             entries[start..].sort_by(|a, b| {
-                b.modified.cmp(&a.modified).then_with(|| {
-                    a.display
-                        .to_ascii_lowercase()
-                        .cmp(&b.display.to_ascii_lowercase())
-                })
+                b.modified
+                    .cmp(&a.modified)
+                    .then_with(|| natural_cmp(&a.display, &b.display))
             });
         }
         self.entries = entries;
@@ -6579,11 +6578,9 @@ impl Search {
                 });
             }
             self.results.sort_by(|a, b| {
-                b.is_dir.cmp(&a.is_dir).then(
-                    a.display
-                        .to_ascii_lowercase()
-                        .cmp(&b.display.to_ascii_lowercase()),
-                )
+                b.is_dir
+                    .cmp(&a.is_dir)
+                    .then_with(|| natural_cmp(&a.display, &b.display))
             });
         } else {
             for ip in &self.paths {
@@ -6597,11 +6594,9 @@ impl Search {
                 }
             }
             self.results.sort_by(|a, b| {
-                b.score.cmp(&a.score).then(
-                    a.display
-                        .to_ascii_lowercase()
-                        .cmp(&b.display.to_ascii_lowercase()),
-                )
+                b.score
+                    .cmp(&a.score)
+                    .then_with(|| natural_cmp(&a.display, &b.display))
             });
         }
         if self.selected >= self.results.len() {
@@ -7483,6 +7478,30 @@ mod tests {
         // Toggle back → name order again.
         b.toggle_sort_by_modified();
         assert_eq!(md_names(&b), vec!["mid.md", "new.md", "old.md"]);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn listing_orders_numbered_names_by_value() {
+        let dir = fresh_temp("browser-natural-order");
+        for i in 0..12 {
+            std::fs::write(dir.join(format!("week{i}.md")), "x").unwrap();
+            std::fs::create_dir(dir.join(format!("week{i}"))).unwrap();
+            std::fs::write(dir.join(format!("week{i}/note.md")), "x").unwrap();
+        }
+        let b = Browser::scan(&dir).unwrap();
+        let names: Vec<String> = b
+            .entries
+            .iter()
+            .filter(|e| e.kind != BrowserEntryKind::ParentDir)
+            .map(|e| e.display.clone())
+            .collect();
+        let expect: Vec<String> = (0..12)
+            .map(|i| format!("week{i}/"))
+            .chain((0..12).map(|i| format!("week{i}.md")))
+            .collect();
+        assert_eq!(names, expect);
 
         std::fs::remove_dir_all(&dir).ok();
     }

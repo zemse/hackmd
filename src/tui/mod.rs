@@ -18,6 +18,7 @@ mod markdown;
 pub mod marp;
 mod md_config;
 mod mermaid;
+pub mod natsort;
 mod palette;
 mod read_state;
 pub mod recovery;
