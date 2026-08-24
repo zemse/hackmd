@@ -896,20 +896,32 @@ impl CloudBrowser {
                 published: matches!(n.read_permission, crate::types::NotePermissionRole::Guest),
                 visibility: n.visibility(),
             };
+            // The API hands notes back in an order the UI can't show or
+            // explain (no date column), and that order reshuffles as notes are
+            // edited. Sort by title instead: predictable to scan, natural about
+            // numbers, and stable across refetches so the cursor doesn't jump.
+            // `Untitled` is common enough that the id tiebreak matters.
+            let sort_rows = |rows: &mut Vec<CloudNoteRow>| {
+                rows.sort_by(|a, b| natural_cmp(&a.title, &b.title).then_with(|| a.id.cmp(&b.id)));
+            };
+            let mut own: Vec<CloudNoteRow> = l.notes.iter().map(|n| note_row(n, None)).collect();
+            sort_rows(&mut own);
             tabs.push(CloudTab {
                 label: "My notes".to_string(),
-                notes: l.notes.iter().map(|n| note_row(n, None)).collect(),
+                notes: own,
                 selected: 0,
                 scroll: 0,
             });
             for t in &l.teams {
+                let mut notes: Vec<CloudNoteRow> = t
+                    .notes
+                    .iter()
+                    .map(|n| note_row(n, Some(&t.team.path)))
+                    .collect();
+                sort_rows(&mut notes);
                 tabs.push(CloudTab {
                     label: t.team.name.clone(),
-                    notes: t
-                        .notes
-                        .iter()
-                        .map(|n| note_row(n, Some(&t.team.path)))
-                        .collect(),
+                    notes,
                     selected: 0,
                     scroll: 0,
                 });
@@ -8844,6 +8856,35 @@ mod cloud_msg_tests {
             teams: Vec::new(),
         }));
         assert!(!solo.show_tab_bar());
+    }
+
+    #[test]
+    fn cloud_rows_sort_by_title_regardless_of_api_order() {
+        let lists = CloudLists {
+            notes: vec![
+                list_note("n1", "week10"),
+                list_note("n2", "week2"),
+                list_note("n3", "Untitled"),
+                list_note("n4", "week1"),
+                list_note("n5", "untitled"),
+            ],
+            teams: vec![crate::tui::cloud::TeamNotes {
+                team: team("demo", "Demo Team"),
+                notes: vec![list_note("t2", "week10"), list_note("t1", "week9")],
+            }],
+        };
+        let c = CloudBrowser::from_lists(Some(&lists));
+        let titles: Vec<&str> = c.tabs[0].notes.iter().map(|n| n.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec!["Untitled", "untitled", "week1", "week2", "week10"]
+        );
+        // Same-title notes fall back to id order, so the row a refetch lands on
+        // is the row that was there before.
+        let ids: Vec<&str> = c.tabs[0].notes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec!["n3", "n5", "n4", "n2", "n1"]);
+        let team_titles: Vec<&str> = c.tabs[1].notes.iter().map(|n| n.title.as_str()).collect();
+        assert_eq!(team_titles, vec!["week9", "week10"], "teams sort too");
     }
 
     #[test]
