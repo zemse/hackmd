@@ -323,6 +323,9 @@ pub struct Fragment {
     pub emph: Emphasis,
     /// `href` of the enclosing `<a>`, if any.
     pub href: Option<String>,
+    /// CSS colour in force, as written (`red`, `#ff8800`). The renderer maps
+    /// it to a terminal colour.
+    pub color: Option<String>,
 }
 
 /// Horizontal cell alignment from an `align=` attribute or a `text-align`
@@ -489,7 +492,7 @@ fn parse_row(tokens: &[Token], start: usize) -> (RawRow, usize) {
                 let align = align_of(attrs);
                 let colspan = span_attr(attrs, "colspan");
                 let rowspan = span_attr(attrs, "rowspan");
-                let (frags, next) = cell_fragments(tokens, i + 1);
+                let (frags, next) = cell_fragments(tokens, i);
                 i = next;
                 row.push(RawCell {
                     frags,
@@ -538,9 +541,29 @@ fn align_of(attrs: &[(String, String)]) -> Option<Align> {
     }
 }
 
-/// Collect a cell's inline content, stopping at its own close tag or at the
-/// next cell / row / table boundary (cells are routinely left unclosed).
-fn cell_fragments(tokens: &[Token], start: usize) -> (Vec<Fragment>, usize) {
+/// The text colour an element sets, from `color="…"` or a `color:` in its
+/// `style`. HackMD notes colour text this way, since markdown has no syntax
+/// for it.
+pub fn text_color(attrs: &[(String, String)]) -> Option<String> {
+    if let Some(c) = attr(attrs, "color") {
+        return (!c.trim().is_empty()).then(|| c.trim().to_string());
+    }
+    let style = attr(attrs, "style")?;
+    for decl in style.split(';') {
+        let (prop, value) = decl.split_once(':')?;
+        if prop.trim().eq_ignore_ascii_case("color") && !value.trim().is_empty() {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+/// Collect the inline content of the cell opening at `open`, stopping at its
+/// own close tag or at the next cell / row / table boundary (cells are
+/// routinely left unclosed). The `<td>` itself is included in the fragment
+/// pass, so a `style="color:…"` on the cell reaches its text.
+fn cell_fragments(tokens: &[Token], open: usize) -> (Vec<Fragment>, usize) {
+    let start = open + 1;
     let mut end = start;
     while end < tokens.len() {
         let stop = match &tokens[end] {
@@ -556,7 +579,7 @@ fn cell_fragments(tokens: &[Token], start: usize) -> (Vec<Fragment>, usize) {
         }
         end += 1;
     }
-    let mut frags = fragments(&tokens[start..end]);
+    let mut frags = fragments(&tokens[open..end]);
     trim_fragments(&mut frags);
     // Step past our own `</td>`; leave any other boundary for the caller.
     let next = match tokens.get(end) {
@@ -637,8 +660,9 @@ fn resolve_spans(rows: Vec<RawRow>) -> Vec<Vec<Cell>> {
 pub fn fragments(tokens: &[Token]) -> Vec<Fragment> {
     let mut out: Vec<Fragment> = Vec::new();
     let mut emph = Emphasis::default();
-    let mut stack: Vec<(String, Emphasis, Option<String>)> = Vec::new();
+    let mut stack: Vec<(String, Emphasis, Option<String>, Option<String>)> = Vec::new();
     let mut href: Option<String> = None;
+    let mut color: Option<String> = None;
     let mut pre = 0usize;
     // Set right after a `<br>` so the next run doesn't start with the
     // whitespace that followed it in the source.
@@ -655,7 +679,7 @@ pub fn fragments(tokens: &[Token]) -> Vec<Fragment> {
                     continue;
                 }
                 at_line_start = text.ends_with('\n');
-                push_frag(&mut out, text, emph, href.clone());
+                push_frag(&mut out, text, emph, href.clone(), color.clone());
             }
             Token::Open {
                 name,
@@ -668,7 +692,13 @@ pub fn fragments(tokens: &[Token]) -> Vec<Fragment> {
                         // invisible in HTML; keeping it would pad the cell.
                         trim_line_end(&mut out);
                         at_line_start = true;
-                        push_frag(&mut out, "\n".to_string(), emph, href.clone());
+                        push_frag(
+                            &mut out,
+                            "\n".to_string(),
+                            emph,
+                            href.clone(),
+                            color.clone(),
+                        );
                     }
                     "wbr" => {}
                     "img" => {
@@ -679,7 +709,13 @@ pub fn fragments(tokens: &[Token]) -> Vec<Fragment> {
                             .or_else(|| attr(attrs, "src").map(str::to_string))
                             .unwrap_or_default();
                         if !label.is_empty() {
-                            push_frag(&mut out, format!("[image: {label}]"), emph, href.clone());
+                            push_frag(
+                                &mut out,
+                                format!("[image: {label}]"),
+                                emph,
+                                href.clone(),
+                                color.clone(),
+                            );
                         }
                     }
                     _ => {}
@@ -687,7 +723,8 @@ pub fn fragments(tokens: &[Token]) -> Vec<Fragment> {
                 if *self_closing {
                     continue;
                 }
-                stack.push((name.clone(), emph, href.clone()));
+                stack.push((name.clone(), emph, href.clone(), color.clone()));
+                color = text_color(attrs).or(color);
                 match name.as_str() {
                     "b" | "strong" => emph.bold = true,
                     "i" | "em" | "cite" | "var" | "dfn" => emph.italic = true,
@@ -706,13 +743,14 @@ pub fn fragments(tokens: &[Token]) -> Vec<Fragment> {
             Token::Close(name) => {
                 // Unwind to the matching open tag; a stray `</x>` with no open
                 // is ignored.
-                if let Some(at) = stack.iter().rposition(|(n, _, _)| n == name) {
+                if let Some(at) = stack.iter().rposition(|(n, _, _, _)| n == name) {
                     if name == "pre" {
                         pre = pre.saturating_sub(1);
                     }
-                    let (_, e, h) = stack[at].clone();
+                    let (_, e, h, c) = stack[at].clone();
                     emph = e;
                     href = h;
+                    color = c;
                     stack.truncate(at);
                 }
             }
@@ -738,15 +776,27 @@ fn trim_line_end(out: &mut Vec<Fragment>) {
     }
 }
 
-fn push_frag(out: &mut Vec<Fragment>, text: String, emph: Emphasis, href: Option<String>) {
+fn push_frag(
+    out: &mut Vec<Fragment>,
+    text: String,
+    emph: Emphasis,
+    href: Option<String>,
+    color: Option<String>,
+) {
     if let Some(last) = out.last_mut()
         && last.emph == emph
         && last.href == href
+        && last.color == color
     {
         last.text.push_str(&text);
         return;
     }
-    out.push(Fragment { text, emph, href });
+    out.push(Fragment {
+        text,
+        emph,
+        href,
+        color,
+    });
 }
 
 /// Collapse every run of whitespace (newlines included — HTML source wraps
@@ -892,6 +942,15 @@ mod tests {
         let frags = fragments(&tokenize("x<sup>2</sup>H<sub>2</sub>O"));
         assert!(frags[1].emph.sup && !frags[1].emph.sub);
         assert!(frags[3].emph.sub);
+    }
+
+    #[test]
+    fn fragments_record_colour_from_style_or_attr() {
+        let frags = fragments(&tokenize(
+            "<span style=\"font-weight:bold; color: #ff8800\">warm</span><font color=\"red\">hot</font>",
+        ));
+        assert_eq!(frags[0].color.as_deref(), Some("#ff8800"));
+        assert_eq!(frags[1].color.as_deref(), Some("red"));
     }
 
     #[test]

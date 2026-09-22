@@ -589,6 +589,9 @@ impl Builder {
                         }
                         _ => {}
                     }
+                    if let Some(c) = html::text_color(&attrs).as_deref().and_then(css_color) {
+                        style = style.fg(c);
+                    }
                     self.inline_html_stack.push(InlineHtmlFrame {
                         name,
                         script: self.inline_script,
@@ -683,6 +686,7 @@ impl Builder {
                             text: "Details".to_string(),
                             emph: html::Emphasis::default(),
                             href: None,
+                            color: None,
                         }]
                     });
                     let summary = self.html_runs(&summary);
@@ -1027,6 +1031,11 @@ impl Builder {
                 style = style
                     .fg(self.theme.link)
                     .add_modifier(self.theme.link_modifier);
+            }
+            // An explicit colour wins over the style the tag would otherwise
+            // give the text — that's the point of writing it.
+            if let Some(c) = f.color.as_deref().and_then(css_color) {
+                style = style.fg(c);
             }
             let mut text = script_text(&f.text, e);
             if e.code || e.kbd {
@@ -2855,6 +2864,48 @@ fn trim_run_ends(runs: &mut Vec<Run>) {
     }
 }
 
+/// Map a CSS colour to a terminal colour: `#rgb`/`#rrggbb` and the named
+/// colours a note is likely to use. Anything else is left to the theme.
+fn css_color(value: &str) -> Option<Color> {
+    let v = value.trim().to_ascii_lowercase();
+    if let Some(hex) = v.strip_prefix('#') {
+        let parse = |s: &str| u8::from_str_radix(s, 16).ok();
+        return match hex.len() {
+            3 => {
+                let d: Vec<u8> = hex
+                    .chars()
+                    .filter_map(|c| parse(&format!("{c}{c}")))
+                    .collect();
+                (d.len() == 3).then(|| Color::Rgb(d[0], d[1], d[2]))
+            }
+            6 => {
+                let r = parse(&hex[0..2])?;
+                let g = parse(&hex[2..4])?;
+                let b = parse(&hex[4..6])?;
+                Some(Color::Rgb(r, g, b))
+            }
+            _ => None,
+        };
+    }
+    Some(match v.as_str() {
+        "black" => Color::Black,
+        "red" | "crimson" | "firebrick" => Color::Red,
+        "green" | "darkgreen" | "forestgreen" => Color::Green,
+        "yellow" | "gold" => Color::Yellow,
+        "blue" | "navy" | "royalblue" => Color::Blue,
+        "magenta" | "fuchsia" | "purple" | "violet" => Color::Magenta,
+        "cyan" | "aqua" | "teal" => Color::Cyan,
+        "white" | "ivory" | "snow" => Color::White,
+        "gray" | "grey" | "silver" | "darkgray" | "darkgrey" => Color::DarkGray,
+        "orange" | "darkorange" => Color::Rgb(255, 165, 0),
+        "pink" | "hotpink" => Color::Rgb(255, 105, 180),
+        "brown" | "maroon" => Color::Rgb(165, 42, 42),
+        "lime" | "lightgreen" => Color::LightGreen,
+        "skyblue" | "lightblue" => Color::LightBlue,
+        _ => return None,
+    })
+}
+
 /// `<h1>`…`<h6>`.
 fn is_heading_tag(name: &str) -> bool {
     matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
@@ -3841,6 +3892,41 @@ mod tests {
             line_text_of(&r.lines[r.images[0].line]),
             "See [image: a pic (pic.png)] here"
         );
+    }
+
+    #[test]
+    fn html_color_paints_the_text() {
+        let r = render(
+            "<span style=\"color: #ff8800\">warm</span> and <font color=\"red\">hot</font>\n",
+            None,
+            60,
+            &Theme::dark(),
+        );
+        let line = &r.lines[0];
+        let warm = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("warm"))
+            .unwrap();
+        assert_eq!(warm.style.fg, Some(Color::Rgb(255, 136, 0)));
+        let hot = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("hot"))
+            .unwrap();
+        assert_eq!(hot.style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn html_color_in_a_block_carries_to_the_cell() {
+        let src = "<table><tr><td style=\"color:red\">hot</td></tr></table>\n";
+        let r = render(src, None, 40, &Theme::dark());
+        let painted = r.lines.iter().any(|l| {
+            l.spans
+                .iter()
+                .any(|s| s.content.contains("hot") && s.style.fg == Some(Color::Red))
+        });
+        assert!(painted, "cell colour was dropped");
     }
 
     fn rendered_text(r: &Rendered) -> String {
