@@ -3929,6 +3929,34 @@ mod tests {
         assert!(painted, "cell colour was dropped");
     }
 
+    #[test]
+    fn a_table_inside_a_fold_hides_and_shows_with_it() {
+        let src = "<details>\n<summary>Numbers</summary>\n\n\
+                   <table><tr><th>n</th></tr><tr><td>42</td></tr></table>\n\n\
+                   </details>\n";
+        let r = render(src, None, 40, &Theme::dark());
+        assert!(!rendered_text(&r).contains("42"));
+        assert!(
+            r.table_map.regions.is_empty(),
+            "hidden table shouldn't be hit-testable"
+        );
+
+        let mut folds = Folds::new();
+        folds.insert(r.fold_map.regions[0].id, true);
+        let open = render_folds(src, &folds);
+        assert!(rendered_text(&open).contains("42"));
+        assert_eq!(open.table_map.regions.len(), 1);
+    }
+
+    #[test]
+    fn malformed_html_still_renders_its_text() {
+        // Unclosed tags, a stray `<`, an attribute with no value.
+        let src = "<table><tr><td>cell<p>after <b>bold and 3 < 4\n";
+        let text = rendered_text(&render(src, None, 40, &Theme::dark()));
+        assert!(text.contains("cell"), "{text}");
+        assert!(text.contains("3 < 4"), "{text}");
+    }
+
     fn rendered_text(r: &Rendered) -> String {
         r.lines
             .iter()
