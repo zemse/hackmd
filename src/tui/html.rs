@@ -556,7 +556,8 @@ fn cell_fragments(tokens: &[Token], start: usize) -> (Vec<Fragment>, usize) {
         }
         end += 1;
     }
-    let frags = fragments(&tokens[start..end]);
+    let mut frags = fragments(&tokens[start..end]);
+    trim_fragments(&mut frags);
     // Step past our own `</td>`; leave any other boundary for the caller.
     let next = match tokens.get(end) {
         Some(Token::Close(n)) if n == "td" || n == "th" => end + 1,
@@ -718,8 +719,6 @@ pub fn fragments(tokens: &[Token]) -> Vec<Fragment> {
         }
     }
 
-    // Leading/trailing whitespace belongs to the markup, not the content.
-    trim_fragments(&mut out);
     out
 }
 
@@ -772,7 +771,9 @@ fn collapse_ws(s: &str) -> String {
     out
 }
 
-fn trim_fragments(frags: &mut Vec<Fragment>) {
+/// Drop the whitespace the markup's own line breaks and indentation leave at
+/// the ends of a run of fragments.
+pub fn trim_fragments(frags: &mut Vec<Fragment>) {
     while let Some(first) = frags.first_mut() {
         let trimmed = first.text.trim_start().to_string();
         if trimmed.is_empty() {
@@ -869,7 +870,8 @@ mod tests {
 
     #[test]
     fn fragments_collapse_whitespace_and_break_on_br() {
-        let frags = fragments(&tokenize("  one\n  two  <br>three "));
+        let mut frags = fragments(&tokenize("  one\n  two  <br>three "));
+        trim_fragments(&mut frags);
         assert_eq!(fragments_text(&frags), "one two\nthree");
     }
 
@@ -877,6 +879,12 @@ mod tests {
     fn fragments_keep_pre_whitespace() {
         let frags = fragments(&tokenize("<pre>a\n  b</pre>"));
         assert_eq!(fragments_text(&frags), "a\n  b");
+    }
+
+    #[test]
+    fn fragments_keep_the_spaces_between_inline_tags() {
+        let frags = fragments(&tokenize("see <b>this</b> now"));
+        assert_eq!(fragments_text(&frags), "see this now");
     }
 
     #[test]

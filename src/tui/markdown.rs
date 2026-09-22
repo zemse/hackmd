@@ -710,6 +710,113 @@ impl Builder {
                     self.push_block(Block::Rule, range.clone());
                     i += 1;
                 }
+                html::Token::Open { name, attrs, .. } if name == "img" => {
+                    // An `<img>` in an html block is a real embed, not just
+                    // its alt text — README badges and hero images live here.
+                    // It stays in line with any text around it.
+                    let src = html::attr(attrs, "src").unwrap_or("").to_string();
+                    let alt = html::attr(attrs, "alt").unwrap_or("").to_string();
+                    self.absorb_html_text(&mut loose);
+                    self.push_html_image(&src, &alt, range.clone());
+                    i += 1;
+                }
+                html::Token::Open { name, .. } if is_heading_tag(name) => {
+                    self.flush_html_text(&mut loose, &range);
+                    let level = name[1..].parse::<u8>().unwrap_or(1);
+                    let close = name.clone();
+                    let start = i + 1;
+                    let mut end = start;
+                    while end < tokens.len() && !tokens[end].closes(&close) {
+                        end += 1;
+                    }
+                    let mut frags = html::fragments(&tokens[start..end]);
+                    html::trim_fragments(&mut frags);
+                    let text = frags.iter().map(|f| f.text.as_str()).collect::<String>();
+                    let lvl = (level as usize - 1).min(5);
+                    let style = Style::default()
+                        .fg(self.theme.heading[lvl])
+                        .add_modifier(self.theme.heading_modifier);
+                    let mut runs = self.html_runs(&frags);
+                    for r in runs.iter_mut() {
+                        r.style = style.patch(r.style);
+                    }
+                    self.push_blank();
+                    self.push_block(
+                        Block::Heading {
+                            anchor: links::slugify(&text),
+                            runs,
+                            level,
+                            text,
+                        },
+                        range.clone(),
+                    );
+                    self.push_blank();
+                    i = (end + 1).min(tokens.len());
+                }
+                html::Token::Open { name, .. } if name == "pre" => {
+                    self.flush_html_text(&mut loose, &range);
+                    let mut end = i + 1;
+                    while end < tokens.len() && !tokens[end].closes("pre") {
+                        end += 1;
+                    }
+                    // The `<pre>` itself goes in: it is what tells the
+                    // fragment pass to keep the whitespace.
+                    let frags = html::fragments(&tokens[i..end]);
+                    let text = frags.iter().map(|f| f.text.as_str()).collect::<String>();
+                    self.push_html_pre(&text, range.clone());
+                    i = (end + 1).min(tokens.len());
+                }
+                html::Token::Open { name, .. } if name == "ul" || name == "ol" => {
+                    self.flush_html_text(&mut loose, &range);
+                    self.list_stack.push(ListFrame {
+                        ordered: (name == "ol").then_some(1),
+                    });
+                    i += 1;
+                }
+                html::Token::Close(n) if n == "ul" || n == "ol" => {
+                    self.flush_html_text(&mut loose, &range);
+                    self.list_stack.pop();
+                    if self.list_stack.is_empty() {
+                        self.push_blank();
+                    }
+                    i += 1;
+                }
+                html::Token::Open { name, .. } if name == "li" => {
+                    // The text of the previous `<li>` (unclosed lists are the
+                    // norm) belongs to that item, not this one.
+                    self.flush_html_text(&mut loose, &range);
+                    let (prefix, hanging) = self.list_prefixes();
+                    self.cur_prefix = prefix;
+                    self.cur_hanging = hanging;
+                    i += 1;
+                }
+                html::Token::Close(n) if n == "li" => {
+                    self.flush_html_text(&mut loose, &range);
+                    i += 1;
+                }
+                html::Token::Open { name, .. } if name == "blockquote" => {
+                    self.flush_html_text(&mut loose, &range);
+                    self.quote_depth += 1;
+                    i += 1;
+                }
+                html::Token::Close(n) if n == "blockquote" => {
+                    self.flush_html_text(&mut loose, &range);
+                    self.quote_depth = self.quote_depth.saturating_sub(1);
+                    if self.quote_depth == 0 {
+                        self.push_blank();
+                    }
+                    i += 1;
+                }
+                // Container tags carry no styling of their own here, but they
+                // do end the paragraph that ran up to them.
+                html::Token::Open { name, .. } if is_block_tag(name) => {
+                    self.flush_html_text(&mut loose, &range);
+                    i += 1;
+                }
+                html::Token::Close(n) if is_block_tag(n) => {
+                    self.flush_html_text(&mut loose, &range);
+                    i += 1;
+                }
                 // A stray `<summary>` outside any fold is just its text.
                 _ => {
                     loose.push(tokens[i].clone());
@@ -724,16 +831,58 @@ impl Builder {
     /// paragraph. Whitespace-only leftovers (the newlines between `<tr>`s of a
     /// table, say) produce nothing.
     fn flush_html_text(&mut self, loose: &mut Vec<html::Token>, range: &std::ops::Range<usize>) {
+        self.absorb_html_text(loose);
+        self.flush_html_runs(range);
+    }
+
+    /// Turn the pending inline tokens into runs on the current paragraph,
+    /// without ending it — text on either side of an `<img>` or a nested tag
+    /// stays on one line.
+    fn absorb_html_text(&mut self, loose: &mut Vec<html::Token>) {
         if loose.is_empty() {
             return;
         }
         let frags = html::fragments(&std::mem::take(loose));
         if frags.iter().all(|f| f.text.trim().is_empty()) {
+            // Nothing but the line breaks between tags. A gap mid-sentence
+            // still separates the words around it.
+            if !self.cur_runs.is_empty() && !frags.is_empty() {
+                self.cur_runs.push(Run {
+                    text: " ".to_string(),
+                    style: self.cur_style(),
+                    link: None,
+                    checkbox: None,
+                    image: None,
+                    inline_range: None,
+                    text_range: None,
+                    cursor_at: None,
+                });
+            }
             return;
         }
         let runs = self.html_runs(&frags);
-        let prefix = self.quote_prefix();
-        let hanging = self.quote_prefix();
+        self.cur_runs.extend(runs);
+    }
+
+    /// Emit whatever runs have piled up as a paragraph, carrying the block
+    /// quote bars and list markers in force. A list item keeps its siblings
+    /// tight; everything else gets a blank line after it.
+    fn flush_html_runs(&mut self, range: &std::ops::Range<usize>) {
+        if self.cur_runs.is_empty() {
+            return;
+        }
+        let mut runs = std::mem::take(&mut self.cur_runs);
+        trim_run_ends(&mut runs);
+        if runs.is_empty() {
+            self.cur_prefix.clear();
+            self.cur_hanging.clear();
+            return;
+        }
+        let in_list = !self.cur_prefix.is_empty();
+        let mut prefix = self.quote_prefix();
+        prefix.extend(self.cur_prefix.drain(..));
+        let mut hanging = self.quote_prefix();
+        hanging.extend(self.cur_hanging.drain(..));
         self.push_block(
             Block::Paragraph {
                 runs,
@@ -741,6 +890,41 @@ impl Builder {
                 hanging,
             },
             range.clone(),
+        );
+        if !in_list {
+            self.push_blank();
+        }
+    }
+
+    /// A `<pre>` block, rendered like a fenced code block with no language.
+    fn push_html_pre(&mut self, text: &str, range: std::ops::Range<usize>) {
+        let style = Style::default()
+            .fg(self.theme.code_fg)
+            .bg_opt(self.theme.code_bg);
+        let lines: Vec<Vec<Run>> = text
+            .trim_matches('\n')
+            .split('\n')
+            .map(|l| {
+                vec![Run {
+                    text: l.to_string(),
+                    style,
+                    link: None,
+                    checkbox: None,
+                    image: None,
+                    inline_range: None,
+                    text_range: None,
+                    cursor_at: None,
+                }]
+            })
+            .collect();
+        self.push_block(
+            Block::Pre {
+                lines,
+                prefix: self.quote_prefix(),
+                flat: false,
+                line_sources: Vec::new(),
+            },
+            range,
         );
         self.push_blank();
     }
@@ -2648,6 +2832,55 @@ impl StyleExt for Style {
 // HTML helpers
 // ---------------------------------------------------------------------------
 
+/// Drop the leading and trailing whitespace an html paragraph picks up from
+/// the newlines between its tags.
+fn trim_run_ends(runs: &mut Vec<Run>) {
+    while let Some(first) = runs.first_mut() {
+        let trimmed = first.text.trim_start().to_string();
+        if trimmed.is_empty() {
+            runs.remove(0);
+        } else {
+            first.text = trimmed;
+            break;
+        }
+    }
+    while let Some(last) = runs.last_mut() {
+        let trimmed = last.text.trim_end().to_string();
+        if trimmed.is_empty() {
+            runs.pop();
+        } else {
+            last.text = trimmed;
+            break;
+        }
+    }
+}
+
+/// `<h1>`…`<h6>`.
+fn is_heading_tag(name: &str) -> bool {
+    matches!(name, "h1" | "h2" | "h3" | "h4" | "h5" | "h6")
+}
+
+/// Tags that break the flow of a paragraph without styling their contents.
+fn is_block_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "p" | "div"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+            | "main"
+            | "aside"
+            | "nav"
+            | "center"
+            | "figure"
+            | "figcaption"
+            | "dl"
+            | "dt"
+            | "dd"
+    )
+}
+
 fn html_align(a: html::Align) -> Alignment {
     match a {
         html::Align::Left => Alignment::Left,
@@ -2673,7 +2906,8 @@ fn html_summary(tokens: &[html::Token], start: usize) -> (Option<Vec<html::Fragm
     while i < tokens.len() && !tokens[i].closes("summary") {
         i += 1;
     }
-    let frags = html::fragments(&tokens[content..i]);
+    let mut frags = html::fragments(&tokens[content..i]);
+    html::trim_fragments(&mut frags);
     if i < tokens.len() {
         i += 1;
     }
@@ -3535,6 +3769,77 @@ mod tests {
                 .iter()
                 .all(|s| !s.style.add_modifier.contains(Modifier::BOLD)),
             "bold leaked past its paragraph"
+        );
+    }
+
+    #[test]
+    fn html_headings_join_the_outline() {
+        let src = "<h2>Section One</h2>\n\n<p>body</p>\n";
+        let r = render(src, None, 60, &Theme::dark());
+        assert_eq!(r.headings.len(), 1);
+        assert_eq!(r.headings[0].level, 2);
+        assert_eq!(r.headings[0].text, "Section One");
+        assert_eq!(r.headings[0].anchor, "section-one");
+        assert_eq!(
+            r.link_map.anchors.get("section-one"),
+            Some(&r.headings[0].line)
+        );
+    }
+
+    #[test]
+    fn html_lists_get_markers_and_numbering() {
+        let src = "<ul><li>first</li><li>second</li></ul>\n\n<ol><li>one</li><li>two</li></ol>\n";
+        let text = rendered_text(&render(src, None, 60, &Theme::dark()));
+        assert!(text.contains("• first"), "{text}");
+        assert!(text.contains("• second"), "{text}");
+        assert!(text.contains("1. one") && text.contains("2. two"), "{text}");
+    }
+
+    #[test]
+    fn html_blockquote_gets_the_quote_bar() {
+        let text = rendered_text(&render(
+            "<blockquote>quoted line</blockquote>\n",
+            None,
+            60,
+            &Theme::dark(),
+        ));
+        assert!(text.contains("│ quoted line"), "{text}");
+    }
+
+    #[test]
+    fn html_pre_keeps_its_whitespace_and_line_breaks() {
+        let src = "<pre>\nkeep   spaces\n  and indent\n</pre>\n";
+        let text = rendered_text(&render(src, None, 60, &Theme::dark()));
+        assert!(text.contains("keep   spaces"), "{text}");
+        assert!(text.contains("  and indent"), "{text}");
+    }
+
+    #[test]
+    fn html_paragraph_tags_separate_their_text() {
+        let src = "<p>first para</p>\n<p>second para</p>\n";
+        let r = render(src, None, 60, &Theme::dark());
+        let first = r
+            .lines
+            .iter()
+            .position(|l| line_text_of(l).contains("first para"))
+            .unwrap();
+        let second = r
+            .lines
+            .iter()
+            .position(|l| line_text_of(l).contains("second para"))
+            .unwrap();
+        assert!(second > first + 1, "paragraphs should not share a line");
+    }
+
+    #[test]
+    fn html_image_embeds_and_stays_inline_with_its_text() {
+        let src = "<p>See <img src=\"pic.png\" alt=\"a pic\"> here</p>\n";
+        let r = render(src, None, 60, &Theme::dark());
+        assert_eq!(r.images.len(), 1);
+        assert_eq!(r.images[0].source, PathBuf::from("pic.png"));
+        assert_eq!(
+            line_text_of(&r.lines[r.images[0].line]),
+            "See [image: a pic (pic.png)] here"
         );
     }
 
