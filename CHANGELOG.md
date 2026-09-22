@@ -52,6 +52,21 @@
   cancels. The message box is multi-line: `Shift+Enter` (or `Alt+Enter` where
   the terminal can't report Shift+Enter) inserts a newline and the box grows to
   fit. Commits touch only the checked paths, leaving other changes untouched.
+- **HTML in markdown renders** — the HTML a document falls back to when
+  markdown's own syntax runs out is now parsed and laid out instead of being
+  dropped. `<table>` grids render with `colspan`/`rowspan` honoured (a spanning
+  header draws across its columns with no divider through it) and per-cell
+  `align`, sharing the click-to-expand behaviour of markdown tables.
+  `<details>`/`<summary>` becomes a fold: `▸` closed, `▾` open, toggled by
+  click or by `Enter` on the focused summary, starting from the document's own
+  `open` state. Structure carries too — `<h1>`–`<h6>` join the outline and
+  anchor list, `<ul>`/`<ol>`/`<li>` get markers, numbering and nesting,
+  `<blockquote>` takes the quote bar, `<pre>` keeps its whitespace, and `<img>`
+  is a real image embed inline with its text. Inline tags style their contents
+  (`<b>`, `<i>`, `<u>`, `<s>`, `<mark>`, `<code>`, `<kbd>`, `<a href>`, `<br>`,
+  with `<sub>`/`<sup>` folding to unicode glyphs where they exist: H₂O, x²),
+  and `<span style="color: …">` / `<font color>` paint the text. Unrecognized
+  tags contribute their text rather than vanishing.
 - **Create folders and move entries in the browser** — ending a `n` (new) name
   with `/` creates a folder instead of a file and browses straight into it, so
   `notes/drafts/` makes both levels at once. `m` moves the selected file or

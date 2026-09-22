@@ -11,6 +11,7 @@ A terminal markdown editor for local files and your [HackMD](https://hackmd.io) 
 **Features**
 
 - **Mermaid diagrams** render as Unicode box-drawing art instead of raw source
+- **HTML tables and `<details>` folds** render, with `colspan`/`rowspan`, inline styling and colour
 - **Split live preview**, markdown on the left, rendered on the right, scroll-synced
 - **Your HackMD notes** open, edit and browse in the terminal; `H` toggles local and cloud
 - **Two-way sync** on every `Ctrl-S`, 3-way merged, with a per-hunk resolver only when edits truly collide
