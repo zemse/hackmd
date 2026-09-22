@@ -514,6 +514,9 @@ pub struct Reader {
     /// expands that column; a body cell expands just that cell. Threaded into
     /// the renderer so expanded parts show full, untruncated content.
     pub tables: crate::tui::links::TableExpansions,
+    /// Per-`<details>` open state, keyed by the fold's source byte offset.
+    /// Absent means the fold shows as the document wrote it.
+    pub folds: crate::tui::links::Folds,
     /// Present when the document is a Marp deck. Drives slide-at-a-time
     /// presentation mode; `None` for ordinary documents.
     pub marp: Option<MarpView>,
@@ -4831,6 +4834,7 @@ impl App {
                     &theme,
                     edit_ctx,
                     &r.tables,
+                    &r.folds,
                 );
                 // Inject the gutter buttons + record their hit boxes. The
                 // Pre block sits inside `rendered.blocks` — pick the first
@@ -5373,6 +5377,7 @@ impl Reader {
             jsonl_overlay: None,
             hover_jsonl: None,
             tables: crate::tui::links::TableExpansions::new(),
+            folds: crate::tui::links::Folds::new(),
             marp,
         })
     }
@@ -5426,6 +5431,13 @@ impl Reader {
         if st.is_empty() {
             self.tables.remove(&id);
         }
+        self.rendered = None;
+    }
+
+    /// Open or close the `<details>` fold identified by source byte offset
+    /// `id`, and force a re-render so its body appears or disappears.
+    pub fn toggle_fold(&mut self, id: u64, currently_open: bool) {
+        self.folds.insert(id, !currently_open);
         self.rendered = None;
     }
 
@@ -5536,6 +5548,7 @@ impl Reader {
             jsonl_overlay: None,
             hover_jsonl: None,
             tables: crate::tui::links::TableExpansions::new(),
+            folds: crate::tui::links::Folds::new(),
             marp: None,
         }
     }

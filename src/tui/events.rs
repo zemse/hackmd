@@ -4948,6 +4948,15 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
                 app.follow(target)?;
                 return Ok(());
             }
+            // `<details>` summary line → open/close the fold.
+            if let Some(fi) = rendered.fold_map.at(line_idx, local_col) {
+                let (id, open) = {
+                    let f = &rendered.fold_map.regions[fi];
+                    (f.id, f.open)
+                };
+                r.toggle_fold(id, open);
+                return Ok(());
+            }
             // Table click-to-expand: border → whole table, header cell →
             // column, body cell → that cell.
             if let Some((id, hit)) = rendered.table_map.hit(line_idx, local_col) {

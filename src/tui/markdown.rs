@@ -11,9 +11,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
+use crate::tui::html;
 use crate::tui::links::{
-    self, CheckboxMap, CheckboxSpan, ImageRef, LinkMap, LinkSpan, LinkTarget, TableExpand,
-    TableExpansions, TableMap, TableRegion,
+    self, CheckboxMap, CheckboxSpan, FoldMap, FoldRegion, Folds, ImageRef, LinkMap, LinkSpan,
+    LinkTarget, TableExpand, TableExpansions, TableMap, TableRegion,
 };
 use crate::tui::mermaid;
 use crate::tui::syntax;
@@ -26,6 +27,8 @@ pub struct Rendered {
     pub checkbox_map: CheckboxMap,
     /// Click-to-expand hit-test geometry for every table in the document.
     pub table_map: TableMap,
+    /// Click-to-toggle hit-test geometry for every `<details>` fold.
+    pub fold_map: FoldMap,
     pub images: Vec<ImageRef>,
     pub width: u16,
     /// One entry per block in document order. Lets edit mode locate the
@@ -130,6 +133,7 @@ pub fn render(source: &str, base_dir: Option<&Path>, width: u16, theme: &Theme) 
         theme,
         None,
         &TableExpansions::new(),
+        &Folds::new(),
     )
 }
 
@@ -140,6 +144,7 @@ pub fn render_with_edit(
     theme: &Theme,
     edit: Option<EditCtx>,
     tables: &TableExpansions,
+    folds: &Folds,
 ) -> Rendered {
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
@@ -157,6 +162,7 @@ pub fn render_with_edit(
         source.to_string(),
         edit,
         tables.clone(),
+        folds.clone(),
     );
     for (ev, range) in parser {
         b.event(ev, range);
@@ -191,6 +197,28 @@ struct Run {
     /// run; the layout pass watches for it and records the resulting display
     /// (col, line) in `Rendered::cursor_xy`.
     cursor_at: Option<usize>,
+}
+
+/// One cell of a rendered table. Markdown tables are all `span == 1`; an HTML
+/// table widens a cell for `colspan` and leaves an empty cell of the same
+/// width wherever a `rowspan` reaches into a later row.
+#[derive(Clone, Debug)]
+struct TableCell {
+    runs: Vec<Run>,
+    span: usize,
+    /// Per-cell `align=` from HTML. `None` takes the column's alignment.
+    align: Option<Alignment>,
+}
+
+impl TableCell {
+    /// A plain one-column cell, as every markdown table cell is.
+    fn plain(runs: Vec<Run>) -> Self {
+        Self {
+            runs,
+            span: 1,
+            align: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -230,12 +258,27 @@ enum Block {
         flat: bool,
         line_sources: Vec<Option<std::ops::Range<usize>>>,
     },
-    /// Table — column-aligned with box-drawing borders.
+    /// Table — column-aligned with box-drawing borders. `header` holds one
+    /// row for a markdown table; an HTML `<thead>` may stack several.
     Table {
+        /// Stable click-to-expand key. Markdown tables use their source
+        /// offset; several HTML tables can share one html block, so those
+        /// offset by their index within it.
+        id: u64,
         alignments: Vec<Alignment>,
-        header: Vec<Vec<Run>>,
-        rows: Vec<Vec<Vec<Run>>>,
+        header: Vec<Vec<TableCell>>,
+        rows: Vec<Vec<TableCell>>,
     },
+    /// `<details>` summary line. Everything up to the matching `FoldEnd` is
+    /// hidden while the fold is closed.
+    FoldStart {
+        id: u64,
+        summary: Vec<Run>,
+        /// `<details open>` — shown expanded until the reader says otherwise.
+        default_open: bool,
+    },
+    /// Matching `</details>`.
+    FoldEnd,
     /// Horizontal rule.
     Rule,
     /// Empty line.
@@ -282,18 +325,27 @@ struct Builder {
     // stack tags every Run created while inside via `Run::inline_range`.
     inline_range_stack: Vec<std::ops::Range<usize>>,
 
+    // html block state: raw text of the block being accumulated, and the
+    // source offset of each `<details>` still open (they nest, and their
+    // bodies are ordinary markdown blocks parsed between the html blocks).
+    html_buf: String,
+    in_html_block: bool,
+    fold_stack: Vec<u64>,
+
     // table state
     table: Option<TableState>,
     /// Per-table click-to-expand state, keyed by source byte offset. Threaded
     /// into the layout pass so expanded cells/columns/tables render full.
     tables: TableExpansions,
+    /// Per-fold open state, keyed the same way.
+    folds: Folds,
 }
 
 struct TableState {
     alignments: Vec<Alignment>,
-    header: Vec<Vec<Run>>,
-    rows: Vec<Vec<Vec<Run>>>,
-    current_row: Vec<Vec<Run>>,
+    header: Vec<Vec<TableCell>>,
+    rows: Vec<Vec<TableCell>>,
+    current_row: Vec<TableCell>,
     cell_start: usize,
 }
 
@@ -320,6 +372,7 @@ impl Builder {
         source: String,
         edit: Option<EditCtx>,
         tables: TableExpansions,
+        folds: Folds,
     ) -> Self {
         let width = if width == 0 { 80 } else { width };
         Self {
@@ -345,8 +398,12 @@ impl Builder {
             in_code_block: false,
             open_link: None,
             inline_range_stack: Vec::new(),
+            html_buf: String::new(),
+            in_html_block: false,
+            fold_stack: Vec::new(),
             table: None,
             tables,
+            folds,
         }
     }
 
@@ -436,6 +493,222 @@ impl Builder {
             cursor_at: None,
         }];
         (prefix, hanging)
+    }
+
+    /// Turn one HTML block's raw text into blocks. Recognized structure —
+    /// `<table>`, `<details>`/`<summary>`, `<hr>` — becomes the matching
+    /// rendered block; anything else contributes its styled text as a
+    /// paragraph, so an unknown tag costs its markup, not its content.
+    fn flush_html_block(&mut self, range: std::ops::Range<usize>) {
+        self.in_html_block = false;
+        let html = std::mem::take(&mut self.html_buf);
+        if html.trim().is_empty() {
+            return;
+        }
+        let tokens = html::tokenize(&html);
+        // Offsets are block-relative at best — every fold and table in one
+        // block keys off the block start plus its index, which is stable
+        // across re-renders and unique per element.
+        let mut seq = 0u64;
+        let mut loose: Vec<html::Token> = Vec::new();
+        let mut i = 0usize;
+        while i < tokens.len() {
+            match &tokens[i] {
+                html::Token::Open { name, .. } if name == "table" => {
+                    self.flush_html_text(&mut loose, &range);
+                    let (table, next) = html::parse_table(&tokens, i);
+                    seq += 1;
+                    self.push_html_table(table, range.start as u64 + seq, range.clone());
+                    i = next;
+                }
+                html::Token::Open { name, attrs, .. } if name == "details" => {
+                    self.flush_html_text(&mut loose, &range);
+                    let default_open = html::attr(attrs, "open").is_some();
+                    seq += 1;
+                    let id = range.start as u64 + seq;
+                    let (summary, next) = html_summary(&tokens, i + 1);
+                    let summary = summary.unwrap_or_else(|| {
+                        vec![html::Fragment {
+                            text: "Details".to_string(),
+                            emph: html::Emphasis::default(),
+                            href: None,
+                        }]
+                    });
+                    let summary = self.html_runs(&summary);
+                    self.fold_stack.push(id);
+                    self.push_block(
+                        Block::FoldStart {
+                            id,
+                            summary,
+                            default_open,
+                        },
+                        range.clone(),
+                    );
+                    i = next;
+                }
+                html::Token::Close(n) if n == "details" => {
+                    self.flush_html_text(&mut loose, &range);
+                    if self.fold_stack.pop().is_some() {
+                        self.push_block(Block::FoldEnd, range.clone());
+                        self.push_blank();
+                    }
+                    i += 1;
+                }
+                html::Token::Open { name, .. } if name == "hr" => {
+                    self.flush_html_text(&mut loose, &range);
+                    self.push_block(Block::Rule, range.clone());
+                    i += 1;
+                }
+                // A stray `<summary>` outside any fold is just its text.
+                _ => {
+                    loose.push(tokens[i].clone());
+                    i += 1;
+                }
+            }
+        }
+        self.flush_html_text(&mut loose, &range);
+    }
+
+    /// Emit the inline HTML collected between recognized structures as a
+    /// paragraph. Whitespace-only leftovers (the newlines between `<tr>`s of a
+    /// table, say) produce nothing.
+    fn flush_html_text(&mut self, loose: &mut Vec<html::Token>, range: &std::ops::Range<usize>) {
+        if loose.is_empty() {
+            return;
+        }
+        let frags = html::fragments(&std::mem::take(loose));
+        if frags.iter().all(|f| f.text.trim().is_empty()) {
+            return;
+        }
+        let runs = self.html_runs(&frags);
+        let prefix = self.quote_prefix();
+        let hanging = self.quote_prefix();
+        self.push_block(
+            Block::Paragraph {
+                runs,
+                prefix,
+                hanging,
+            },
+            range.clone(),
+        );
+        self.push_blank();
+    }
+
+    /// Emit a parsed HTML table. Column alignment is taken from the first row
+    /// that states one, so a `<thead>` that marks a column `align="right"`
+    /// right-aligns the body too, as a browser does.
+    fn push_html_table(&mut self, table: html::Table, id: u64, range: std::ops::Range<usize>) {
+        if table.cols == 0 {
+            return;
+        }
+        let mut alignments = vec![Alignment::None; table.cols];
+        for row in table.head.iter().chain(table.body.iter()) {
+            let mut c = 0usize;
+            for cell in row {
+                if cell.colspan == 1
+                    && c < table.cols
+                    && alignments[c] == Alignment::None
+                    && let Some(a) = cell.align
+                {
+                    alignments[c] = html_align(a);
+                }
+                c += cell.colspan;
+            }
+        }
+        let header: Vec<Vec<TableCell>> = table
+            .head
+            .iter()
+            .map(|r| self.html_row(r))
+            .collect::<Vec<_>>();
+        let rows: Vec<Vec<TableCell>> = table.body.iter().map(|r| self.html_row(r)).collect();
+        self.push_block(
+            Block::Table {
+                id,
+                alignments,
+                header,
+                rows,
+            },
+            range,
+        );
+        self.push_blank();
+    }
+
+    fn html_row(&mut self, row: &[html::Cell]) -> Vec<TableCell> {
+        row.iter()
+            .map(|c| {
+                let mut runs = self.html_runs(&c.frags);
+                // A cell is laid out on one line; a `<br>` inside it becomes a
+                // space rather than breaking the frame.
+                for r in runs.iter_mut() {
+                    if r.text.contains('\n') {
+                        r.text = r.text.replace('\n', " ");
+                    }
+                }
+                TableCell {
+                    runs,
+                    span: c.colspan,
+                    align: c.align.map(html_align),
+                }
+            })
+            .collect()
+    }
+
+    /// Convert HTML inline fragments to styled runs, registering every
+    /// `<a href>` as a followable link.
+    fn html_runs(&mut self, frags: &[html::Fragment]) -> Vec<Run> {
+        let mut out: Vec<Run> = Vec::new();
+        for f in frags {
+            let e = f.emph;
+            let mut style = self.cur_style();
+            if e.bold {
+                style = style.add_modifier(self.theme.strong);
+            }
+            if e.italic {
+                style = style.add_modifier(self.theme.emphasis);
+            }
+            if e.underline {
+                style = style.add_modifier(Modifier::UNDERLINED);
+            }
+            if e.strike {
+                style = style.add_modifier(self.theme.strikethrough);
+            }
+            if e.mark {
+                style = style.add_modifier(Modifier::REVERSED);
+            }
+            if e.code || e.kbd {
+                style = style.fg(self.theme.code_fg).bg_opt(self.theme.code_bg);
+            }
+            if e.kbd {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            let link = f.href.as_ref().map(|href| {
+                let idx = self.links.len();
+                self.links.push(PendingLink {
+                    target: links::resolve(href, self.base_dir.as_deref()),
+                });
+                idx
+            });
+            if link.is_some() {
+                style = style
+                    .fg(self.theme.link)
+                    .add_modifier(self.theme.link_modifier);
+            }
+            let mut text = script_text(&f.text, e);
+            if e.code || e.kbd {
+                text = format!(" {} ", text.trim());
+            }
+            out.push(Run {
+                text,
+                style,
+                link,
+                checkbox: None,
+                image: None,
+                inline_range: None,
+                text_range: None,
+                cursor_at: None,
+            });
+        }
+        out
     }
 
     fn push_block(&mut self, block: Block, source_range: std::ops::Range<usize>) {
@@ -566,7 +839,15 @@ impl Builder {
                     self.heading_buf.push_str(&s);
                 }
             }
-            Event::Html(_) | Event::InlineHtml(_) => {}
+            Event::Html(s) => {
+                // pulldown-cmark hands an html block out line by line; the
+                // whole block has to be in hand before it can be parsed.
+                self.html_buf.push_str(&s);
+                if !self.in_html_block {
+                    self.flush_html_block(range.clone());
+                }
+            }
+            Event::InlineHtml(_) => {}
             Event::FootnoteReference(name) => {
                 let style = self.cur_style().fg(self.theme.muted);
                 self.cur_runs.push(Run {
@@ -741,6 +1022,10 @@ impl Builder {
                     cursor_at: None,
                 });
             }
+            Tag::HtmlBlock => {
+                self.html_buf.clear();
+                self.in_html_block = true;
+            }
             Tag::Table(aligns) => {
                 self.table = Some(TableState {
                     alignments: aligns,
@@ -910,10 +1195,12 @@ impl Builder {
                 self.open_link = None;
                 self.inline_range_stack.pop();
             }
+            TagEnd::HtmlBlock => self.flush_html_block(range),
             TagEnd::Table => {
                 if let Some(t) = self.table.take() {
                     self.push_block(
                         Block::Table {
+                            id: range.start as u64,
                             alignments: t.alignments,
                             header: t.header,
                             rows: t.rows,
@@ -925,7 +1212,7 @@ impl Builder {
             }
             TagEnd::TableHead => {
                 if let Some(t) = &mut self.table {
-                    t.header = std::mem::take(&mut t.current_row);
+                    t.header = vec![std::mem::take(&mut t.current_row)];
                 }
             }
             TagEnd::TableRow => {
@@ -936,7 +1223,7 @@ impl Builder {
             TagEnd::TableCell => {
                 if let Some(t) = &mut self.table {
                     let cell: Vec<Run> = self.cur_runs.drain(t.cell_start..).collect();
-                    t.current_row.push(cell);
+                    t.current_row.push(TableCell::plain(cell));
                 }
             }
             _ => {}
@@ -999,6 +1286,7 @@ impl Builder {
             self.images,
             self.edit,
             &self.tables,
+            &self.folds,
         )
     }
 }
@@ -1372,14 +1660,19 @@ fn layout(
     links: Vec<PendingLink>,
     checkboxes: Vec<PendingCheckbox>,
     images: Vec<PathBuf>,
-    _edit: Option<EditCtx>,
+    edit: Option<EditCtx>,
     tables: &TableExpansions,
+    folds: &Folds,
 ) -> Rendered {
     let mut out_lines: Vec<Line<'static>> = Vec::new();
     let mut row_source: Vec<Option<std::ops::Range<usize>>> = Vec::new();
     let mut out_links: Vec<LinkSpan> = Vec::new();
     let mut out_checkboxes: Vec<CheckboxSpan> = Vec::new();
     let mut out_tables: Vec<TableRegion> = Vec::new();
+    let mut out_folds: Vec<FoldRegion> = Vec::new();
+    // Depth of the collapsed fold currently being skipped, if any: every block
+    // between a closed `FoldStart` and its `FoldEnd` is dropped.
+    let mut fold_skip: Option<usize> = None;
     let mut image_lines: Vec<Option<usize>> = (0..images.len()).map(|_| None).collect();
     let mut anchors = std::collections::HashMap::new();
     let mut block_infos: Vec<BlockInfo> = Vec::new();
@@ -1396,6 +1689,21 @@ fn layout(
         let block_start_line = out_lines.len();
         let block_source_range = entry.source_range.clone();
         let block = entry.block;
+        // Inside a collapsed fold: count nested folds so only the matching
+        // `FoldEnd` reopens output.
+        if let Some(depth) = fold_skip {
+            match block {
+                Block::FoldStart { .. } => fold_skip = Some(depth + 1),
+                Block::FoldEnd => fold_skip = (depth > 1).then_some(depth - 1),
+                _ => {}
+            }
+            block_infos.push(BlockInfo {
+                source_range: block_source_range,
+                display_start: block_start_line,
+                display_end: block_start_line,
+            });
+            continue;
+        }
         match block {
             Block::Blank => {
                 if out_lines
@@ -1407,6 +1715,37 @@ fn layout(
                 }
                 out_lines.push(Line::from(""));
             }
+            Block::FoldStart {
+                id,
+                summary,
+                default_open,
+            } => {
+                // Edit mode shows the document as written, so nothing hides
+                // the source the cursor may be sitting in.
+                let open = edit.is_some() || folds.get(&id).copied().unwrap_or(default_open);
+                let marker = if open { "▾ " } else { "▸ " };
+                let mut spans: Vec<Span<'static>> = vec![Span::styled(
+                    marker.to_string(),
+                    Style::default().fg(theme.accent),
+                )];
+                let mut col = marker.width();
+                for r in &summary {
+                    let style = r.style.add_modifier(Modifier::BOLD);
+                    col += r.text.width();
+                    spans.push(Span::styled(r.text.clone(), style));
+                }
+                out_folds.push(FoldRegion {
+                    id,
+                    line: out_lines.len(),
+                    col_end: col,
+                    open,
+                });
+                out_lines.push(Line::from(spans));
+                if !open {
+                    fold_skip = Some(1);
+                }
+            }
+            Block::FoldEnd => {}
             Block::Rule => {
                 let bar = "─".repeat(width.max(1));
                 out_lines.push(Line::from(Span::styled(
@@ -1470,11 +1809,11 @@ fn layout(
                 );
             }
             Block::Table {
+                id,
                 alignments,
                 header,
                 rows,
             } => {
-                let id = block_source_range.start as u64;
                 layout_table(
                     theme,
                     &alignments,
@@ -1596,6 +1935,7 @@ fn layout(
         table_map: TableMap {
             regions: out_tables,
         },
+        fold_map: FoldMap { regions: out_folds },
         images: images_out,
         width: width as u16,
         blocks: block_infos,
@@ -2132,15 +2472,130 @@ impl StyleExt for Style {
 }
 
 // ---------------------------------------------------------------------------
+// HTML helpers
+// ---------------------------------------------------------------------------
+
+fn html_align(a: html::Align) -> Alignment {
+    match a {
+        html::Align::Left => Alignment::Left,
+        html::Align::Center => Alignment::Center,
+        html::Align::Right => Alignment::Right,
+    }
+}
+
+/// Read a `<details>`'s `<summary>` if it opens the fold. Returns the summary
+/// fragments (`None` when there is no summary) and the index to resume at.
+fn html_summary(tokens: &[html::Token], start: usize) -> (Option<Vec<html::Fragment>>, usize) {
+    let mut i = start;
+    // Skip the newline between `<details>` and `<summary>`.
+    while matches!(tokens.get(i), Some(html::Token::Text(t)) if t.trim().is_empty()) {
+        i += 1;
+    }
+    if !tokens.get(i).map(|t| t.opens("summary")).unwrap_or(false) {
+        return (None, start);
+    }
+    let open = i;
+    i += 1;
+    let content = i;
+    while i < tokens.len() && !tokens[i].closes("summary") {
+        i += 1;
+    }
+    let frags = html::fragments(&tokens[content..i]);
+    if i < tokens.len() {
+        i += 1;
+    }
+    if frags.is_empty() {
+        return (None, open + 1);
+    }
+    (Some(frags), i)
+}
+
+/// Fold text into unicode super/subscript glyphs when every character has one,
+/// so `x<sup>2</sup>` reads as `x²`. Otherwise mark it with `^`/`_` — better a
+/// visible marker than silently flattening the distinction.
+fn script_text(text: &str, emph: html::Emphasis) -> String {
+    if !emph.sub && !emph.sup {
+        return text.to_string();
+    }
+    let table = if emph.sup {
+        "0⁰1¹2²3³4⁴5⁵6⁶7⁷8⁸9⁹+⁺-⁻=⁼(⁽)⁾nⁿiⁱ"
+    } else {
+        "0₀1₁2₂3₃4₄5₅6₆7₇8₈9₉+₊-₋=₌(₍)₎aₐeₑoₒxₓ"
+    };
+    let map = |c: char| -> Option<char> {
+        if c == ' ' {
+            return Some(' ');
+        }
+        let mut it = table.chars();
+        while let (Some(from), Some(to)) = (it.next(), it.next()) {
+            if from == c {
+                return Some(to);
+            }
+        }
+        None
+    };
+    match text.chars().map(map).collect::<Option<String>>() {
+        Some(m) => m,
+        None if emph.sup => format!("^{text}"),
+        None => format!("_{text}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Table layout: column-aligned with box-drawing borders.
 // ---------------------------------------------------------------------------
+
+/// Display width a cell spanning `span` columns from `col` gets: the columns
+/// themselves plus the borders and padding it swallows between them.
+fn span_width(col_widths: &[usize], col: usize, span: usize) -> usize {
+    let end = (col + span).min(col_widths.len());
+    col_widths[col..end].iter().sum::<usize>() + 3 * (end - col).saturating_sub(1)
+}
+
+/// Widen `cols` by `amount` in total, one column at a time starting from the
+/// narrowest, so a wide `colspan` header spreads over its columns evenly.
+fn grow_columns(cols: &mut [usize], amount: usize) {
+    if cols.is_empty() {
+        return;
+    }
+    for _ in 0..amount {
+        let narrowest = cols
+            .iter()
+            .enumerate()
+            .min_by_key(|&(i, w)| (*w, i))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        cols[narrowest] += 1;
+    }
+}
+
+/// Grid columns a row's cells are separated at: `out[i]` is true when a `│`
+/// sits at boundary `i`. The outer two are always set; an interior boundary is
+/// clear where a `colspan` cell runs across it.
+fn row_boundaries(row: &[TableCell], n_cols: usize) -> Vec<bool> {
+    let mut out = vec![false; n_cols + 1];
+    out[0] = true;
+    out[n_cols] = true;
+    let mut c = 0usize;
+    for cell in row {
+        if c > 0 && c < n_cols {
+            out[c] = true;
+        }
+        c += cell.span;
+    }
+    // A short row is padded out with single-column cells at layout time.
+    for b in out.iter_mut().take(n_cols).skip(c) {
+        *b = true;
+    }
+    out
+}
 
 #[allow(clippy::too_many_arguments)]
 fn layout_table(
     theme: &Theme,
     alignments: &[Alignment],
-    header: &[Vec<Run>],
-    rows: &[Vec<Vec<Run>>],
+    header: &[Vec<TableCell>],
+    rows: &[Vec<TableCell>],
     max_width: usize,
     out_lines: &mut Vec<Line<'static>>,
     out_links: &mut Vec<LinkSpan>,
@@ -2149,27 +2604,43 @@ fn layout_table(
     expand: Option<&TableExpand>,
     out_tables: &mut Vec<TableRegion>,
 ) {
+    let row_cols = |row: &Vec<TableCell>| -> usize { row.iter().map(|c| c.span).sum() };
     let n_cols = header
-        .len()
-        .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
+        .iter()
+        .chain(rows.iter())
+        .map(row_cols)
+        .max()
+        .unwrap_or(0);
     if n_cols == 0 {
         return;
     }
 
     let cell_w = |runs: &[Run]| -> usize { runs.iter().map(|r| r.text.width()).sum() };
 
-    // Natural (untruncated) width of every column.
+    // Natural (untruncated) width of every column. Single-column cells set the
+    // baseline; a spanning cell then tops its columns up only if they can't
+    // already hold it between them.
     let mut natural = vec![0usize; n_cols];
-    for (i, c) in header.iter().enumerate() {
-        if i < n_cols {
-            natural[i] = natural[i].max(cell_w(c));
+    for row in header.iter().chain(rows.iter()) {
+        let mut c = 0usize;
+        for cell in row {
+            if cell.span == 1 && c < n_cols {
+                natural[c] = natural[c].max(cell_w(&cell.runs));
+            }
+            c += cell.span;
         }
     }
-    for row in rows {
-        for (i, c) in row.iter().enumerate() {
-            if i < n_cols {
-                natural[i] = natural[i].max(cell_w(c));
+    for row in header.iter().chain(rows.iter()) {
+        let mut c = 0usize;
+        for cell in row {
+            if cell.span > 1 && c + cell.span <= n_cols {
+                let want = cell_w(&cell.runs);
+                let have = span_width(&natural, c, cell.span);
+                if want > have {
+                    grow_columns(&mut natural[c..c + cell.span], want - have);
+                }
             }
+            c += cell.span;
         }
     }
 
@@ -2202,6 +2673,11 @@ fn layout_table(
     }
 
     let border = Style::default().fg(theme.muted);
+    let solid = vec![true; n_cols + 1];
+    let head_top = header.first().map(|r| row_boundaries(r, n_cols));
+    let head_bottom = header.last().map(|r| row_boundaries(r, n_cols));
+    let body_top = rows.first().map(|r| row_boundaries(r, n_cols));
+    let body_bottom = rows.last().map(|r| row_boundaries(r, n_cols));
 
     // Border x-positions: a │ sits at x=0 and after each column's
     // (pad + content + pad). Column click area is the span between borders.
@@ -2220,25 +2696,43 @@ fn layout_table(
     let mut border_lines: Vec<usize> = Vec::new();
 
     border_lines.push(out_lines.len());
-    out_lines.push(border_line(&col_widths, '┌', '┬', '┐', border));
+    out_lines.push(border_line(
+        &col_widths,
+        '┌',
+        '┐',
+        None,
+        head_top.as_deref().or(body_top.as_deref()).or(Some(&solid)),
+        border,
+    ));
 
     let header_start = out_lines.len();
-    emit_row(
-        theme,
-        header,
-        &col_widths,
-        alignments,
-        true,
-        &|c| col_expanded(c),
-        out_lines,
-        out_links,
-        links,
-        border,
-    );
+    for row in header {
+        emit_row(
+            theme,
+            row,
+            &col_widths,
+            alignments,
+            true,
+            &col_expanded,
+            out_lines,
+            out_links,
+            links,
+            border,
+        );
+    }
     let header_end = out_lines.len();
 
-    border_lines.push(out_lines.len());
-    out_lines.push(border_line(&col_widths, '├', '┼', '┤', border));
+    if !header.is_empty() {
+        border_lines.push(out_lines.len());
+        out_lines.push(border_line(
+            &col_widths,
+            '├',
+            '┤',
+            head_bottom.as_deref(),
+            body_top.as_deref().or(Some(&solid)),
+            border,
+        ));
+    }
 
     let mut body_rows: Vec<(usize, usize)> = Vec::with_capacity(rows.len());
     for (ri, row) in rows.iter().enumerate() {
@@ -2259,7 +2753,17 @@ fn layout_table(
     }
 
     border_lines.push(out_lines.len());
-    out_lines.push(border_line(&col_widths, '└', '┴', '┘', border));
+    out_lines.push(border_line(
+        &col_widths,
+        '└',
+        '┘',
+        body_bottom
+            .as_deref()
+            .or(head_bottom.as_deref())
+            .or(Some(&solid)),
+        None,
+        border,
+    ));
 
     out_tables.push(TableRegion {
         id: table_id,
@@ -2298,32 +2802,47 @@ fn shrink_columns(widths: &mut [usize], cols: &[usize], amount: usize) -> usize 
     removed
 }
 
+/// A horizontal rule across the table. `above`/`below` say which column
+/// boundaries carry a `│` on the neighbouring row — a boundary swallowed by a
+/// `colspan` on both sides draws straight through.
 fn border_line(
     col_widths: &[usize],
     left: char,
-    mid: char,
     right: char,
+    above: Option<&[bool]>,
+    below: Option<&[bool]>,
     style: Style,
 ) -> Line<'static> {
+    let at = |side: Option<&[bool]>, i: usize| side.map(|s| s[i]).unwrap_or(false);
     let mut s = String::new();
     s.push(left);
     for (i, w) in col_widths.iter().enumerate() {
         for _ in 0..(w + 2) {
             s.push('─');
         }
-        s.push(if i + 1 < col_widths.len() { mid } else { right });
+        if i + 1 == col_widths.len() {
+            s.push(right);
+            break;
+        }
+        let b = i + 1;
+        s.push(match (at(above, b), at(below, b)) {
+            (true, true) => '┼',
+            (true, false) => '┴',
+            (false, true) => '┬',
+            (false, false) => '─',
+        });
     }
     Line::from(Span::styled(s, style))
 }
 
 /// Emit one logical table row, which may span several physical lines: an
 /// expanded cell word-wraps to its column width while its siblings stay on the
-/// first line. `expanded(col)` decides per-column whether to wrap (full
-/// content) or truncate to a single line.
+/// first line. `expanded(col)` decides per-cell (keyed by its first column)
+/// whether to wrap (full content) or truncate to a single line.
 #[allow(clippy::too_many_arguments)]
 fn emit_row(
     theme: &Theme,
-    row: &[Vec<Run>],
+    row: &[TableCell],
     col_widths: &[usize],
     alignments: &[Alignment],
     is_header: bool,
@@ -2333,18 +2852,42 @@ fn emit_row(
     links: &[PendingLink],
     border: Style,
 ) {
-    let empty: Vec<Run> = Vec::new();
+    let n_cols = col_widths.len();
 
-    // Per-column physical lines: truncated cells are a single line; expanded
-    // cells wrap to many. Row height is the tallest column.
-    let mut cell_lines: Vec<Vec<Vec<Run>>> = Vec::with_capacity(col_widths.len());
+    // Place every cell on the grid, padding a short row out with empty
+    // single-column cells so the frame always closes.
+    let mut placed: Vec<(usize, TableCell)> = Vec::new();
+    let mut col = 0usize;
+    for cell in row {
+        if col >= n_cols {
+            break;
+        }
+        let span = cell.span.min(n_cols - col);
+        placed.push((
+            col,
+            TableCell {
+                runs: cell.runs.clone(),
+                span,
+                align: cell.align,
+            },
+        ));
+        col += span;
+    }
+    while col < n_cols {
+        placed.push((col, TableCell::plain(Vec::new())));
+        col += 1;
+    }
+
+    // Per-cell physical lines: truncated cells are a single line; expanded
+    // cells wrap to many. Row height is the tallest cell.
+    let mut cell_lines: Vec<Vec<Vec<Run>>> = Vec::with_capacity(placed.len());
     let mut height = 1usize;
-    for (i, w) in col_widths.iter().enumerate() {
-        let cell = row.get(i).unwrap_or(&empty);
-        let lines = if expanded(i) {
-            wrap_runs_to_lines(cell, *w)
+    for (c, cell) in &placed {
+        let w = span_width(col_widths, *c, cell.span);
+        let lines = if expanded(*c) {
+            wrap_runs_to_lines(&cell.runs, w)
         } else {
-            vec![truncate_runs(cell, *w)]
+            vec![truncate_runs(&cell.runs, w)]
         };
         height = height.max(lines.len());
         cell_lines.push(lines);
@@ -2358,8 +2901,12 @@ fn emit_row(
         spans.push(Span::styled("│".to_string(), border));
         col += 1;
 
-        for (i, w) in col_widths.iter().enumerate() {
-            let align = alignments.get(i).copied().unwrap_or(Alignment::None);
+        for (i, (c, cell)) in placed.iter().enumerate() {
+            let w = span_width(col_widths, *c, cell.span);
+            let align = cell
+                .align
+                .or_else(|| alignments.get(*c).copied())
+                .unwrap_or(Alignment::None);
             let content: &[Run] = cell_lines[i].get(k).map(|v| v.as_slice()).unwrap_or(&[]);
             let cw: usize = content.iter().map(|r| r.text.width()).sum();
             let extra = w.saturating_sub(cw);
@@ -2747,6 +3294,138 @@ mod tests {
 
     /// Render `src` with a specific table expansion state applied to the only
     /// table in the document (id = the table block's source byte offset).
+    fn rendered_text(r: &Rendered) -> String {
+        r.lines
+            .iter()
+            .map(|l| format!("{}\n", line_text_of(l)))
+            .collect()
+    }
+
+    fn render_folds(src: &str, folds: &Folds) -> Rendered {
+        render_with_edit(
+            src,
+            None,
+            100,
+            &Theme::dark(),
+            None,
+            &TableExpansions::new(),
+            folds,
+        )
+    }
+
+    #[test]
+    fn renders_html_table_with_merged_cells() {
+        let src = "\
+<table>\n\
+<thead>\n\
+<tr><th rowspan=\"2\">program</th><th colspan=\"2\">time</th></tr>\n\
+<tr><th align=\"right\">gpu</th><th align=\"right\">cpu</th></tr>\n\
+</thead>\n\
+<tbody>\n\
+<tr><td><code>sha256</code></td><td align=\"right\">21.0</td><td align=\"right\">57.3</td></tr>\n\
+</tbody>\n\
+</table>\n";
+        let r = render(src, None, 60, &Theme::dark());
+        let text = rendered_text(&r);
+        assert!(text.contains("program"), "{text}");
+        assert!(text.contains("21.0") && text.contains("57.3"), "{text}");
+        let reg = &r.table_map.regions[0];
+        // Two header rows, one body row.
+        assert_eq!(reg.header_end - reg.header_start, 2);
+        assert_eq!(reg.body_rows.len(), 1);
+        // The `rowspan` cell leaves the second header row's first column empty.
+        let second = line_text_of(&r.lines[reg.header_start + 1]);
+        assert!(second.starts_with("│  "), "{second:?}");
+        // No column divider runs through the `colspan="2"` header cell.
+        let first = line_text_of(&r.lines[reg.header_start]);
+        assert_eq!(first.matches('│').count(), 3, "{first:?}");
+    }
+
+    #[test]
+    fn html_table_column_alignment_follows_the_cells() {
+        let src = "<table><tr><th>n</th><th align=\"right\">v</th></tr>\
+                   <tr><td>a</td><td align=\"right\">1</td></tr></table>\n";
+        let r = render(src, None, 40, &Theme::dark());
+        let reg = &r.table_map.regions[0];
+        let body = line_text_of(&r.lines[reg.body_rows[0].0]);
+        assert!(body.trim_end().ends_with("1 │"), "{body:?}");
+    }
+
+    #[test]
+    fn details_starts_collapsed_and_opens_on_toggle() {
+        let src = "<details>\n<summary>More</summary>\n\nhidden body\n\n</details>\n";
+        let r = render(src, None, 60, &Theme::dark());
+        let text = rendered_text(&r);
+        assert!(text.contains("▸ More"), "{text}");
+        assert!(!text.contains("hidden body"), "{text}");
+
+        let id = r.fold_map.regions[0].id;
+        let mut folds = Folds::new();
+        folds.insert(id, true);
+        let open = rendered_text(&render_folds(src, &folds));
+        assert!(open.contains("▾ More"), "{open}");
+        assert!(open.contains("hidden body"), "{open}");
+    }
+
+    #[test]
+    fn details_open_attribute_starts_expanded() {
+        let src = "<details open>\n<summary>Shown</summary>\n\nbody text\n\n</details>\n";
+        let text = rendered_text(&render(src, None, 60, &Theme::dark()));
+        assert!(
+            text.contains("▾ Shown") && text.contains("body text"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn details_without_summary_still_folds() {
+        let src = "<details>\n\nbody text\n\n</details>\n";
+        let r = render(src, None, 60, &Theme::dark());
+        let text = rendered_text(&r);
+        assert!(text.contains("▸ Details"), "{text}");
+        assert!(!text.contains("body text"), "{text}");
+        assert_eq!(r.fold_map.regions.len(), 1);
+    }
+
+    #[test]
+    fn nested_details_collapse_together() {
+        let src = "<details>\n<summary>Outer</summary>\n\n\
+                   <details>\n<summary>Inner</summary>\n\ndeep\n\n</details>\n\n\
+                   after outer\n\n</details>\n\ntail\n";
+        let text = rendered_text(&render(src, None, 60, &Theme::dark()));
+        assert!(text.contains("▸ Outer"), "{text}");
+        assert!(!text.contains("Inner"), "{text}");
+        assert!(!text.contains("after outer"), "{text}");
+        assert!(text.contains("tail"), "{text}");
+    }
+
+    #[test]
+    fn fold_hit_test_covers_only_the_summary() {
+        let src = "<details>\n<summary>More</summary>\n\nbody\n\n</details>\n";
+        let r = render(src, None, 60, &Theme::dark());
+        let line = r.fold_map.regions[0].line;
+        assert_eq!(r.fold_map.at(line, 0), Some(0));
+        assert_eq!(r.fold_map.at(line, 40), None);
+        assert_eq!(r.fold_map.at(line + 1, 0), None);
+    }
+
+    #[test]
+    fn unknown_html_keeps_its_text() {
+        let src = "<div class=\"note\"><span>kept text</span></div>\n";
+        let text = rendered_text(&render(src, None, 60, &Theme::dark()));
+        assert!(text.contains("kept text"), "{text}");
+    }
+
+    #[test]
+    fn html_link_in_a_table_cell_is_followable() {
+        let src = "<table><tr><td><a href=\"https://x.test\">site</a></td></tr></table>\n";
+        let r = render(src, None, 40, &Theme::dark());
+        assert_eq!(
+            r.link_map.links[0].target,
+            LinkTarget::Url("https://x.test".to_string())
+        );
+    }
+
     fn render_table(src: &str, width: u16, mutate: impl FnOnce(&mut TableExpand)) -> Rendered {
         // First render to discover the table's id from its hit-test region.
         let probe = render(src, None, width, &Theme::dark());
@@ -2755,7 +3434,15 @@ mod tests {
         let mut st = TableExpand::default();
         mutate(&mut st);
         tables.insert(id, st);
-        render_with_edit(src, None, width, &Theme::dark(), None, &tables)
+        render_with_edit(
+            src,
+            None,
+            width,
+            &Theme::dark(),
+            None,
+            &tables,
+            &Folds::new(),
+        )
     }
 
     #[test]
@@ -2959,7 +3646,15 @@ mod tests {
         let tables = TableExpansions::new();
         // Cursor inside the fence → editor keeps the raw source visible.
         let ctx = EditCtx { cursor: 20 };
-        let r = render_with_edit(src, None, 120, &Theme::dark(), Some(ctx), &tables);
+        let r = render_with_edit(
+            src,
+            None,
+            120,
+            &Theme::dark(),
+            Some(ctx),
+            &tables,
+            &Folds::new(),
+        );
         let text: String = r
             .lines
             .iter()

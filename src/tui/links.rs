@@ -155,6 +155,42 @@ impl TableMap {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Folds: `<details>` open/closed state + hit-test geometry
+// ---------------------------------------------------------------------------
+
+/// Per-fold open state, keyed by the `<details>` source byte offset. An entry
+/// is written only once the user toggles the fold; absent means "as the
+/// document wrote it" (open for `<details open>`, closed otherwise).
+pub type Folds = HashMap<u64, bool>;
+
+/// A rendered `<details>` summary line, and the state it toggles.
+#[derive(Clone, Debug)]
+pub struct FoldRegion {
+    /// Stable id = source byte offset of the `<details>` tag.
+    pub id: u64,
+    pub line: usize,
+    /// One past the last column of the summary glyphs.
+    pub col_end: usize,
+    /// Whether the fold is currently showing its body.
+    pub open: bool,
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct FoldMap {
+    pub regions: Vec<FoldRegion>,
+}
+
+impl FoldMap {
+    /// Index of the fold header covering display `(line, col)`. Clicks past the
+    /// end of the summary text miss, so they fall through like any other row.
+    pub fn at(&self, line: usize, col: usize) -> Option<usize> {
+        self.regions
+            .iter()
+            .position(|f| f.line == line && col < f.col_end)
+    }
+}
+
 impl CheckboxMap {
     pub fn at(&self, line: usize, col: usize) -> Option<usize> {
         self.items

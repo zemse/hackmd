@@ -1392,6 +1392,7 @@ fn draw_edit_split(f: &mut Frame, app: &mut App, area: Rect) {
                 theme,
                 None,
                 &crate::tui::links::TableExpansions::new(),
+                &crate::tui::links::Folds::new(),
             );
             // Always show the slide number here — it orients the author even
             // when the deck's `paginate` directive is off.
