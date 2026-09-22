@@ -325,6 +325,13 @@ struct Builder {
     // stack tags every Run created while inside via `Run::inline_range`.
     inline_range_stack: Vec<std::ops::Range<usize>>,
 
+    /// Open inline HTML tags (`<b>`, `<a>`, `<kbd>`…), innermost last. Each
+    /// frame remembers what to restore when its closing tag shows up.
+    inline_html_stack: Vec<InlineHtmlFrame>,
+    /// Set while inside `<sub>`/`<sup>`: text is folded to the matching
+    /// unicode glyphs on the way in.
+    inline_script: Option<html::Emphasis>,
+
     // html block state: raw text of the block being accumulated, and the
     // source offset of each `<details>` still open (they nest, and their
     // bodies are ordinary markdown blocks parsed between the html blocks).
@@ -357,6 +364,14 @@ struct PendingCheckbox {
     /// Byte offset in source where the `[` character begins.
     source_offset: usize,
     checked: bool,
+}
+
+/// One open inline HTML tag, with the builder state its closing tag restores.
+#[derive(Clone, Debug)]
+struct InlineHtmlFrame {
+    name: String,
+    script: Option<html::Emphasis>,
+    link: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -398,6 +413,8 @@ impl Builder {
             in_code_block: false,
             open_link: None,
             inline_range_stack: Vec::new(),
+            inline_html_stack: Vec::new(),
+            inline_script: None,
             html_buf: String::new(),
             in_html_block: false,
             fold_stack: Vec::new(),
@@ -493,6 +510,140 @@ impl Builder {
             cursor_at: None,
         }];
         (prefix, hanging)
+    }
+
+    /// Apply one inline HTML tag. CommonMark leaves inline HTML as raw text
+    /// and emits the text between tags as ordinary events, so the tag only has
+    /// to move the style stack: `<b>` bolds what follows, `</b>` restores.
+    fn inline_html(&mut self, raw: &str, range: std::ops::Range<usize>) {
+        for tok in html::tokenize(raw) {
+            match tok {
+                html::Token::Text(t) => self.push_text(&t, range.clone()),
+                html::Token::Close(name) => self.close_inline_html(&name),
+                html::Token::Open {
+                    name,
+                    attrs,
+                    self_closing,
+                } => {
+                    match name.as_str() {
+                        "br" => self.cur_runs.push(Run {
+                            text: "\n".to_string(),
+                            style: self.cur_style(),
+                            link: self.open_link,
+                            checkbox: None,
+                            image: None,
+                            inline_range: None,
+                            text_range: None,
+                            cursor_at: None,
+                        }),
+                        "img" => {
+                            let src = html::attr(&attrs, "src").unwrap_or("");
+                            let alt = html::attr(&attrs, "alt").unwrap_or("");
+                            self.push_html_image(src, alt, range.clone());
+                        }
+                        _ => {}
+                    }
+                    if self_closing {
+                        continue;
+                    }
+                    let mut style = self.cur_style();
+                    let mut script = self.inline_script;
+                    let link = self.open_link;
+                    match name.as_str() {
+                        "b" | "strong" => style = style.add_modifier(self.theme.strong),
+                        "i" | "em" | "cite" | "var" | "dfn" => {
+                            style = style.add_modifier(self.theme.emphasis)
+                        }
+                        "u" | "ins" => style = style.add_modifier(Modifier::UNDERLINED),
+                        "s" | "del" | "strike" => {
+                            style = style.add_modifier(self.theme.strikethrough)
+                        }
+                        "mark" => style = style.add_modifier(Modifier::REVERSED),
+                        "code" | "samp" | "tt" => {
+                            style = style.fg(self.theme.code_fg).bg_opt(self.theme.code_bg)
+                        }
+                        "kbd" => {
+                            style = style
+                                .fg(self.theme.code_fg)
+                                .bg_opt(self.theme.code_bg)
+                                .add_modifier(Modifier::BOLD)
+                        }
+                        "sub" | "sup" => {
+                            script = Some(html::Emphasis {
+                                sub: name == "sub",
+                                sup: name == "sup",
+                                ..Default::default()
+                            })
+                        }
+                        "a" => {
+                            if let Some(href) = html::attr(&attrs, "href") {
+                                let idx = self.links.len();
+                                self.links.push(PendingLink {
+                                    target: links::resolve(href, self.base_dir.as_deref()),
+                                });
+                                self.open_link = Some(idx);
+                                style = style
+                                    .fg(self.theme.link)
+                                    .add_modifier(self.theme.link_modifier);
+                            }
+                        }
+                        _ => {}
+                    }
+                    self.inline_html_stack.push(InlineHtmlFrame {
+                        name,
+                        script: self.inline_script,
+                        link,
+                    });
+                    self.inline_script = script;
+                    self.style_stack.push(style);
+                }
+            }
+        }
+    }
+
+    /// Unwind to the matching opening tag, restoring what it saved. Tags that
+    /// close in the wrong order (or never opened) can't corrupt the stack.
+    fn close_inline_html(&mut self, name: &str) {
+        let Some(at) = self.inline_html_stack.iter().rposition(|f| f.name == name) else {
+            return;
+        };
+        let frame = self.inline_html_stack[at].clone();
+        for _ in at..self.inline_html_stack.len() {
+            self.pop_style();
+        }
+        self.inline_html_stack.truncate(at);
+        self.inline_script = frame.script;
+        self.open_link = frame.link;
+    }
+
+    /// Placeholder + image embed for an inline `<img>`, matching how markdown
+    /// image syntax is handled.
+    fn push_html_image(&mut self, src: &str, alt: &str, range: std::ops::Range<usize>) {
+        if src.is_empty() {
+            return;
+        }
+        let label = if alt.is_empty() {
+            format!("[image: {src}]")
+        } else {
+            format!("[image: {alt} ({src})]")
+        };
+        let is_url = src.starts_with("http://") || src.starts_with("https://");
+        let resolved: PathBuf = match (is_url, self.base_dir.as_ref()) {
+            (false, Some(b)) => b.join(src),
+            _ => PathBuf::from(src),
+        };
+        let img_idx = self.images.len();
+        self.images.push(resolved);
+        self.cur_runs.push(Run {
+            text: label,
+            style: Style::default().fg(self.theme.muted),
+            link: None,
+            checkbox: None,
+            image: Some(img_idx),
+            inline_range: Some(range),
+            text_range: None,
+            cursor_at: None,
+        });
     }
 
     /// Turn one HTML block's raw text into blocks. Recognized structure —
@@ -728,6 +879,13 @@ impl Builder {
     }
 
     fn finish_paragraph(&mut self, source_range: std::ops::Range<usize>) {
+        // An inline tag left open at the end of a block stops there rather
+        // than styling the rest of the document.
+        while let Some(frame) = self.inline_html_stack.pop() {
+            self.pop_style();
+            self.inline_script = frame.script;
+            self.open_link = frame.link;
+        }
         if self.cur_runs.is_empty() && self.cur_prefix.is_empty() {
             return;
         }
@@ -756,6 +914,21 @@ impl Builder {
         }
         let style = self.cur_style();
         let inline_range = self.cur_inline_range();
+        // `<sub>`/`<sup>` text is folded to unicode glyphs, so it no longer
+        // maps to source bytes character for character.
+        if let Some(script) = self.inline_script {
+            self.cur_runs.push(Run {
+                text: script_text(text, script),
+                style,
+                link: self.open_link,
+                checkbox: None,
+                image: None,
+                inline_range,
+                text_range: None,
+                cursor_at: None,
+            });
+            return;
+        }
         // Inside an explicit markdown/angle-bracket link the whole run is
         // already a click target — emit verbatim, don't autolink within it.
         if self.open_link.is_some() {
@@ -847,7 +1020,7 @@ impl Builder {
                     self.flush_html_block(range.clone());
                 }
             }
-            Event::InlineHtml(_) => {}
+            Event::InlineHtml(s) => self.inline_html(&s, range.clone()),
             Event::FootnoteReference(name) => {
                 let style = self.cur_style().fg(self.theme.muted);
                 self.cur_runs.push(Run {
@@ -3294,6 +3467,77 @@ mod tests {
 
     /// Render `src` with a specific table expansion state applied to the only
     /// table in the document (id = the table block's source byte offset).
+    #[test]
+    fn inline_html_styles_text_and_drops_the_tags() {
+        let r = render("a <b>bold</b> c\n", None, 40, &Theme::dark());
+        let line = &r.lines[0];
+        assert_eq!(line_text_of(line), "a bold c");
+        let bold = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("bold"))
+            .expect("bold span");
+        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn inline_html_br_breaks_the_line() {
+        let r = render("one<br>two\n", None, 40, &Theme::dark());
+        assert_eq!(line_text_of(&r.lines[0]), "one");
+        assert_eq!(line_text_of(&r.lines[1]), "two");
+    }
+
+    #[test]
+    fn inline_html_anchor_is_followable() {
+        let r = render(
+            "see <a href=\"https://x.test\">here</a>\n",
+            None,
+            40,
+            &Theme::dark(),
+        );
+        assert_eq!(
+            r.link_map.links[0].target,
+            LinkTarget::Url("https://x.test".to_string())
+        );
+        let l = &r.link_map.links[0];
+        let text = line_text_of(&r.lines[l.line]);
+        assert_eq!(&text[l.col_start..l.col_end], "here");
+    }
+
+    #[test]
+    fn inline_html_sub_and_sup_fold_to_unicode() {
+        let r = render(
+            "H<sub>2</sub>O and x<sup>2</sup>\n",
+            None,
+            40,
+            &Theme::dark(),
+        );
+        assert_eq!(line_text_of(&r.lines[0]), "H₂O and x²");
+    }
+
+    #[test]
+    fn inline_html_sup_without_glyphs_keeps_a_marker() {
+        let r = render("E<sup>abc</sup>\n", None, 40, &Theme::dark());
+        assert_eq!(line_text_of(&r.lines[0]), "E^abc");
+    }
+
+    #[test]
+    fn unclosed_inline_html_stops_at_the_paragraph() {
+        let r = render("<b>bold para\n\nplain para\n", None, 40, &Theme::dark());
+        let plain = r
+            .lines
+            .iter()
+            .find(|l| line_text_of(l).contains("plain para"))
+            .expect("second paragraph");
+        assert!(
+            plain
+                .spans
+                .iter()
+                .all(|s| !s.style.add_modifier.contains(Modifier::BOLD)),
+            "bold leaked past its paragraph"
+        );
+    }
+
     fn rendered_text(r: &Rendered) -> String {
         r.lines
             .iter()
