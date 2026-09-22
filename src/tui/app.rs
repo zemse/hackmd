@@ -488,6 +488,9 @@ pub struct Reader {
     /// reader can advertise that clicking it copies a link to that section.
     /// `None` whenever a link or checkbox owns the same cell — those win.
     pub hover_heading: Option<usize>,
+    /// Hover index into `Rendered::fold_map.regions`, for the same feedback a
+    /// hovered link gets.
+    pub hover_fold: Option<usize>,
     pub doc_search: Option<DocSearch>,
     /// In-house edit mode. `Some` while the user is editing this buffer.
     pub edit: Option<EditState>,
@@ -821,6 +824,8 @@ pub enum DiffRowKind {
 pub enum Focus {
     Link(usize),
     Checkbox(usize),
+    /// A `<details>` summary line — Enter opens or closes the fold.
+    Fold(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -5369,6 +5374,7 @@ impl Reader {
             hover_link: None,
             hover_checkbox: None,
             hover_heading: None,
+            hover_fold: None,
             doc_search: None,
             edit: None,
             last_meta,
@@ -5396,6 +5402,9 @@ impl Reader {
         for (i, c) in rd.checkbox_map.items.iter().enumerate() {
             out.push((Focus::Checkbox(i), c.line, c.col_start));
         }
+        for (i, f) in rd.fold_map.regions.iter().enumerate() {
+            out.push((Focus::Fold(i), f.line, 0));
+        }
         out.sort_by_key(|&(_, line, col)| (line, col));
         out
     }
@@ -5406,6 +5415,7 @@ impl Reader {
         match self.focus? {
             Focus::Link(i) => rd.link_map.links.get(i).map(|l| (l.line, l.col_start)),
             Focus::Checkbox(i) => rd.checkbox_map.items.get(i).map(|c| (c.line, c.col_start)),
+            Focus::Fold(i) => rd.fold_map.regions.get(i).map(|f| (f.line, 0)),
         }
     }
 
@@ -5540,6 +5550,7 @@ impl Reader {
             hover_link: None,
             hover_checkbox: None,
             hover_heading: None,
+            hover_fold: None,
             doc_search: None,
             edit: None,
             last_meta: None,
@@ -8412,6 +8423,7 @@ index abc..def 100644\n\
             .map(|(f, _, _)| match f {
                 Focus::Link(_) => "link",
                 Focus::Checkbox(_) => "cb",
+                Focus::Fold(_) => "fold",
             })
             .collect();
         assert_eq!(

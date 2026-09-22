@@ -833,6 +833,13 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
                         }
                     }
                 }
+                Some(Focus::Fold(fi)) => {
+                    if let Some(f) = rendered.fold_map.regions.get(fi) {
+                        if f.line == idx {
+                            highlight_checkbox_hover(&mut line, 0, f.col_end);
+                        }
+                    }
+                }
                 None => {}
             }
         }
@@ -840,6 +847,13 @@ fn draw_reader(f: &mut Frame, app: &mut App, area: Rect) {
             if let Some(link) = rendered.link_map.links.get(hi) {
                 if link.line == idx {
                     highlight_focused(&mut line, link, theme);
+                }
+            }
+        }
+        if let Some(fi) = r.hover_fold {
+            if let Some(f) = rendered.fold_map.regions.get(fi) {
+                if f.line == idx {
+                    highlight_checkbox_hover(&mut line, 0, f.col_end);
                 }
             }
         }
@@ -2540,6 +2554,21 @@ fn compute_middle(app: &App) -> Mid {
                         on_last_row,
                     };
                 }
+            }
+            // A hovered fold says which way a click swings it.
+            if let (Some(rendered), Some(fi)) = (r.rendered.as_ref(), r.hover_fold)
+                && let Some(f) = rendered.fold_map.regions.get(fi)
+            {
+                let last_row_idx =
+                    r.scroll as usize + (app.viewport.height as usize).saturating_sub(1);
+                return Mid::Url {
+                    text: if f.open {
+                        "click to collapse".to_string()
+                    } else {
+                        "click to expand".to_string()
+                    },
+                    on_last_row: f.line == last_row_idx,
+                };
             }
             // Same idea for a hovered heading: show the link a click copies.
             if let (Some(rendered), Some(hi)) = (r.rendered.as_ref(), r.hover_heading)

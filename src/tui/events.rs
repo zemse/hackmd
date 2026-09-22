@@ -4742,6 +4742,19 @@ fn activate(app: &mut App) -> Result<()> {
             app.toggle_checkbox(ci)?;
             return Ok(());
         }
+        Some(Focus::Fold(fi)) => {
+            if let View::Reader(r) = &mut app.view {
+                let hit = r
+                    .rendered
+                    .as_ref()
+                    .and_then(|rd| rd.fold_map.regions.get(fi))
+                    .map(|f| (f.id, f.open));
+                if let Some((id, open)) = hit {
+                    r.toggle_fold(id, open);
+                }
+            }
+            return Ok(());
+        }
         None => {}
     }
     if let View::Browser(b) = &app.view {
@@ -4826,6 +4839,7 @@ fn update_hover(app: &mut App, col: u16, row: u16) {
             r.hover_link = None;
             r.hover_checkbox = None;
             r.hover_heading = None;
+            r.hover_fold = None;
             r.hover_jsonl = None;
             return;
         }
@@ -4842,6 +4856,7 @@ fn update_hover(app: &mut App, col: u16, row: u16) {
             } else {
                 rendered.heading_at(line_idx, local_col)
             };
+        r.hover_fold = rendered.fold_map.at(line_idx, local_col);
         r.hover_jsonl = r
             .jsonl_overlay
             .as_ref()
@@ -5000,7 +5015,7 @@ fn click_at(app: &mut App, col: u16, row: u16) -> Result<()> {
 #[cfg(test)]
 mod copy_tests {
     use super::{extract_selection_text, leading_markup_len};
-    use crate::tui::app::{App, Options, Selection, Source, View};
+    use crate::tui::app::{App, Focus, Options, Selection, Source, View};
     use crate::tui::theme::Theme;
 
     fn render_app(tag: &str, body: &str) -> App {
@@ -5066,6 +5081,50 @@ mod copy_tests {
         };
         assert!(r.hover_link.is_some());
         assert!(r.hover_heading.is_none());
+    }
+
+    #[test]
+    fn clicking_and_activating_a_fold_toggles_it() {
+        let mut app = render_app(
+            "fold",
+            "<details>\n<summary>More</summary>\n\nhidden body\n\n</details>\n",
+        );
+        let line = line_containing(&app, "More");
+        assert!(rendered_lines(&app).iter().all(|l| !l.contains("hidden")));
+
+        super::click_at(&mut app, 1, line as u16).unwrap();
+        app.ensure_rendered(80);
+        assert!(
+            rendered_lines(&app)
+                .iter()
+                .any(|l| l.contains("hidden body")),
+            "click should open the fold"
+        );
+
+        // Keyboard: focus the summary and press Enter to close it again.
+        let View::Reader(r) = &mut app.view else {
+            panic!("expected reader")
+        };
+        r.focus = Some(Focus::Fold(0));
+        super::activate(&mut app).unwrap();
+        app.ensure_rendered(80);
+        assert!(
+            rendered_lines(&app).iter().all(|l| !l.contains("hidden")),
+            "Enter should close the fold again"
+        );
+    }
+
+    fn rendered_lines(app: &App) -> Vec<String> {
+        let View::Reader(r) = &app.view else {
+            panic!("expected reader")
+        };
+        r.rendered
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
     }
 
     fn sel(line: usize, from: u16, to: u16) -> Selection {
