@@ -2497,6 +2497,14 @@ fn extend_body_drag(app: &mut App, col: u16, row: u16) {
 /// Keep scrolling a held drag-selection while the pointer sits outside the
 /// body without moving (terminals only report motion).
 fn drag_autoscroll_tick(app: &mut App) {
+    if app.body_drag_held && in_split_edit(app) {
+        let (c, r) = (app.last_mouse_col, app.last_mouse_row);
+        let area = app.edit_raw_area;
+        if r < area.y || r >= area.y + area.height {
+            split_drag_raw(app, c, r);
+        }
+        return;
+    }
     if app.body_drag_held && app.selection.is_some() {
         let (c, r) = (app.last_mouse_col, app.last_mouse_row);
         let body = app.viewport;
@@ -2573,6 +2581,7 @@ fn handle_split_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
                 split_click_raw(app, m.column, m.row);
                 // Arm a selection at the click position; it only activates
                 // if a drag moves the focus off this anchor.
+                app.body_drag_held = true;
                 if let View::Reader(r) = &mut app.view {
                     if let Some(e) = r.edit.as_mut() {
                         e.selection = Some(crate::tui::app::EditSelection {
@@ -2592,6 +2601,7 @@ fn handle_split_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
             split_drag_raw(app, m.column, m.row);
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            app.body_drag_held = false;
             // A plain click leaves no selection behind. A real drag keeps
             // it highlighted; the statusline offers y copy / Del delete /
             // Esc cancel (handled in `handle_edit_key`).
@@ -2616,6 +2626,13 @@ fn split_drag_raw(app: &mut App, col: u16, row: u16) {
     let area = app.edit_raw_area;
     if area.width == 0 || area.height == 0 {
         return;
+    }
+    // A pointer above/below the pane scrolls it so the selection can grow
+    // past the visible rows.
+    if row < area.y {
+        split_scroll_raw(app, -(((area.y - row) as i32).min(3)));
+    } else if row >= area.y + area.height {
+        split_scroll_raw(app, ((row + 1 - area.y - area.height) as i32).min(3));
     }
     let col = col.clamp(area.x, area.x + area.width - 1);
     let row = row.clamp(area.y, area.y + area.height - 1);
