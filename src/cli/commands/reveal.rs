@@ -45,11 +45,16 @@ async fn export_to_temp(
             ));
         }
     };
-    // One folder per note id so two notes with the same title don't collide.
+    write_temp_note(note_id, &body.title, &body.content)
+}
+
+/// Write a cloud note to `<tmp>/hackmd-reveal/<id>/<title>.md`. One folder per
+/// note id so two notes with the same title don't collide.
+pub(crate) fn write_temp_note(note_id: &str, title: &str, content: &str) -> Result<PathBuf> {
     let dir = std::env::temp_dir().join("hackmd-reveal").join(note_id);
     std::fs::create_dir_all(&dir)?;
-    let file = dir.join(format!("{}.md", file_stem(&body.title)));
-    std::fs::write(&file, body.content)?;
+    let file = dir.join(format!("{}.md", file_stem(title)));
+    std::fs::write(&file, content)?;
     Ok(file)
 }
 
@@ -75,7 +80,7 @@ fn file_stem(title: &str) -> String {
 }
 
 /// Show `file` selected in the platform's file manager.
-fn reveal(file: &Path) -> Result<()> {
+pub(crate) fn reveal(file: &Path) -> Result<()> {
     if cfg!(target_os = "macos") {
         run_ok(Command::new("open").arg("-R").arg(file))
     } else if cfg!(target_os = "windows") {

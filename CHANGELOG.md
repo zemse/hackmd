@@ -8,7 +8,9 @@
   can be dragged into a chat app: `hackmd reveal notes/page.md`, or
   `hackmd reveal --note-id <id>` to export a cloud note to a temp file first.
   Uses Finder on macOS, Explorer on Windows, and the file manager's D-Bus
-  `ShowItems` (falling back to `xdg-open` on the folder) on Linux.
+  `ShowItems` (falling back to `xdg-open` on the folder) on Linux. In the TUI,
+  `F` does the same for the open file, the browser's selected markdown file, or
+  an open cloud note.
 - **Marp presentations** — a local markdown file that enables
   [Marp](https://marp.app) now opens as a slide deck instead of a scrolling
   document. A deck is recognized by a `marp: true` line, a leading

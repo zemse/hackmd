@@ -2681,7 +2681,7 @@ fn default_hint(app: &App) -> String {
         // Most important keys first; the full reference lives behind `?`.
         View::Reader(r) => match &r.origin {
             ReaderOrigin::CloudNote { .. } => {
-                "j/k:scroll  /:find  t:toc  e:edit  y:link  ?:help  q:quit".into()
+                "j/k:scroll  /:find  t:toc  e:edit  y:link  F:reveal  ?:help  q:quit".into()
             }
             // `gc` commits a local file; only surface it when the repo has
             // uncommitted changes (same signal as the browser `[uncommitted]`
@@ -2695,7 +2695,7 @@ fn default_hint(app: &App) -> String {
                 // A Marp deck viewed as a scrolling doc: offer to present it.
                 let present = if r.marp.is_some() { "  p:present" } else { "" };
                 format!(
-                    "j/k:scroll  /:find  e:edit  U:publish  Tab:links{present}{commit}  ?:help  q:quit"
+                    "j/k:scroll  /:find  e:edit  U:publish  F:reveal  Tab:links{present}{commit}  ?:help  q:quit"
                 )
             }
         },
@@ -3207,6 +3207,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         Line::from("  A                browser: toggle showing all files & hidden"),
         Line::from("  U                publish to HackMD — links the file, then"),
         Line::from("                   pushes up on save; asks before fetching on open"),
+        Line::from("  F                reveal file in Finder / Explorer (drag it elsewhere)"),
         Line::from("  conflicts        l:local u:upstream b:both n:drop Enter:apply"),
         Line::from("  Ctrl-G           git lens (diff vs HEAD; staged + unstaged)"),
         Line::from("  c / gc           git commit (file / folder / repo; Space picks)"),

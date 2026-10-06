@@ -485,6 +485,9 @@ fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         {
             copy_publish_link(app);
         }
+        // Reveal the open file (or the browser's selected markdown file) in
+        // the system file manager, to drag it into another app.
+        KeyCode::Char('F') => reveal_in_file_manager(app),
         // Publish a local file to HackMD — creates a new note the first time
         // (stamping the file with a managed link block) and updates the linked
         // note on subsequent pushes.
@@ -2016,6 +2019,31 @@ fn copy_publish_link(app: &mut App) {
     }
     copy_to_clipboard(&link);
     app.status = format!("Copied: {link}");
+}
+
+/// `F`: show the open file selected in the system file manager. A cloud note
+/// has no file, so its text is written to a temp file first.
+fn reveal_in_file_manager(app: &mut App) {
+    use crate::cli::commands::reveal;
+    let file = match &app.view {
+        View::Reader(r) => match &r.origin {
+            crate::tui::app::ReaderOrigin::CloudNote { id, title, .. } => {
+                reveal::write_temp_note(id, title, &r.raw)
+            }
+            _ => match local_push_target(app) {
+                Some(p) => Ok(p),
+                None => return,
+            },
+        },
+        _ => match local_push_target(app) {
+            Some(p) => Ok(p),
+            None => return,
+        },
+    };
+    app.status = match file.and_then(|f| reveal::reveal(&f).map(|()| f)) {
+        Ok(f) => format!("Revealed {}", f.display()),
+        Err(e) => format!("Reveal failed: {e}"),
+    };
 }
 
 /// The local file `U` would push: the open file reader's path, or the
