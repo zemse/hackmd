@@ -52,7 +52,9 @@ pub fn run(term: &mut ui::Term, app: &mut App) -> Result<()> {
         // so edits made just before the user stops typing aren't left only in
         // memory past the autosave throttle window.
         app.autosave_recovery(false);
-        if !event::poll(Duration::from_millis(250))? {
+        let wait = if app.body_drag_held { 60 } else { 250 };
+        if !event::poll(Duration::from_millis(wait))? {
+            drag_autoscroll_tick(app);
             continue;
         }
         match event::read()? {
@@ -2390,6 +2392,7 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
             // drag — a click elsewhere always dismisses it); it only
             // "activates" once a Drag arrives with a different position.
             app.pending_click = Some((m.column, m.row));
+            app.body_drag_held = true;
             app.selection =
                 body_pos(app, m.column, m.row).map(|(line_idx, col)| crate::tui::app::Selection {
                     anchor_line: line_idx,
@@ -2400,22 +2403,10 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
                 });
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some((line_idx, col)) = body_pos(app, m.column, m.row) {
-                if let Some(s) = app.selection.as_mut() {
-                    s.focus_line = line_idx;
-                    s.focus_col = col;
-                    if !s.dragged && (s.anchor_line != s.focus_line || s.anchor_col != s.focus_col)
-                    {
-                        s.dragged = true;
-                        // Drag claimed the gesture; cancel the pending click
-                        // so Up doesn't follow a link the user was trying to
-                        // copy text from.
-                        app.pending_click = None;
-                    }
-                }
-            }
+            extend_body_drag(app, m.column, m.row);
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            app.body_drag_held = false;
             // A completed drag *persists* the selection (highlighted) rather
             // than copying immediately, so the user can pick an action — copy
             // (`c`) or look up (`l`) — from the statusline hint. The highlight
@@ -2442,6 +2433,49 @@ fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+/// Extend the reader drag-selection to the pointer. A pointer above or below
+/// the body is clamped to its edge and scrolls the page, so a selection can
+/// grow past the visible rows.
+fn extend_body_drag(app: &mut App, col: u16, row: u16) {
+    let body = app.viewport;
+    if body.height == 0 || app.selection.is_none() || !matches!(app.view, View::Reader(_)) {
+        return;
+    }
+    let last = body.y + body.height - 1;
+    if row < body.y {
+        scroll_by(app, -(((body.y - row) as i32).min(3)));
+    } else if row > last {
+        scroll_by(app, ((row - last) as i32).min(3));
+    }
+    let col = col.max(body.x);
+    let row = row.clamp(body.y, last);
+    let Some((line_idx, col)) = body_pos(app, col, row) else {
+        return;
+    };
+    if let Some(s) = app.selection.as_mut() {
+        s.focus_line = line_idx;
+        s.focus_col = col;
+        if !s.dragged && (s.anchor_line != s.focus_line || s.anchor_col != s.focus_col) {
+            s.dragged = true;
+            // Drag claimed the gesture; cancel the pending click so Up
+            // doesn't follow a link the user was trying to copy text from.
+            app.pending_click = None;
+        }
+    }
+}
+
+/// Keep scrolling a held drag-selection while the pointer sits outside the
+/// body without moving (terminals only report motion).
+fn drag_autoscroll_tick(app: &mut App) {
+    if app.body_drag_held && app.selection.is_some() {
+        let (c, r) = (app.last_mouse_col, app.last_mouse_row);
+        let body = app.viewport;
+        if r < body.y || r >= body.y + body.height {
+            extend_body_drag(app, c, r);
+        }
+    }
 }
 
 /// True when the active reader is in split-screen edit mode.

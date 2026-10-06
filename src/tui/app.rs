@@ -79,6 +79,9 @@ pub struct App {
     /// Armed on mouse-down over the path, resolved on mouse-up (click →
     /// full path, drag → the column-selected slice).
     pub statusline_path_drag: Option<(u16, u16)>,
+    /// Left button is held after a reader mouse-down, so a pointer parked
+    /// above/below the body keeps auto-scrolling the drag-selection.
+    pub body_drag_held: bool,
     /// Pending vim count prefix (e.g. user typed `5` waiting for `j`). Reset
     /// after the motion key consumes it, or on Esc.
     pub count_prefix: Option<u32>,
@@ -1107,6 +1110,7 @@ impl App {
             statusline_badge_hit: None,
             statusline_path_hit: None,
             statusline_path_drag: None,
+            body_drag_held: false,
             count_prefix: None,
             pending_g: None,
             pending_z: None,
