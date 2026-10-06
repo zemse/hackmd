@@ -81,6 +81,8 @@ pub enum Command {
     History(HistoryArgs),
     /// Export a note's raw markdown content to stdout.
     Export(ExportArgs),
+    /// Show a markdown file selected in the file manager (Finder, Explorer, ...).
+    Reveal(RevealArgs),
     /// List teams.
     Teams(TeamsArgs),
     /// Manage notes (bare = list, or list/get/create/update/delete).
@@ -121,6 +123,20 @@ pub struct ExportArgs {
     /// HackMD note id.
     #[arg(long = "note-id", alias = "noteId")]
     pub note_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct RevealArgs {
+    /// Local file to reveal.
+    #[arg(
+        value_name = "PATH",
+        required_unless_present = "note_id",
+        conflicts_with = "note_id"
+    )]
+    pub path: Option<PathBuf>,
+    /// Reveal a HackMD note instead, exported to a temp file first.
+    #[arg(long = "note-id", alias = "noteId")]
+    pub note_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -571,6 +587,16 @@ pub async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Export(args) => {
             commands::export::run(config_dir, endpoint, token, &args.note_id).await
+        }
+        Command::Reveal(args) => {
+            commands::reveal::run(
+                config_dir,
+                endpoint,
+                token,
+                args.path,
+                args.note_id.as_deref(),
+            )
+            .await
         }
         Command::Teams(args) => {
             commands::teams::run(config_dir, endpoint, token, &args.output).await

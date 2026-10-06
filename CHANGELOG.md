@@ -4,6 +4,11 @@
 
 ### Added
 
+- **`hackmd reveal`** — shows a file selected in the system file manager so it
+  can be dragged into a chat app: `hackmd reveal notes/page.md`, or
+  `hackmd reveal --note-id <id>` to export a cloud note to a temp file first.
+  Uses Finder on macOS, Explorer on Windows, and the file manager's D-Bus
+  `ShowItems` (falling back to `xdg-open` on the folder) on Linux.
 - **Marp presentations** — a local markdown file that enables
   [Marp](https://marp.app) now opens as a slide deck instead of a scrolling
   document. A deck is recognized by a `marp: true` line, a leading

@@ -5,6 +5,7 @@ pub mod export;
 pub mod folders;
 pub mod history;
 pub mod notes;
+pub mod reveal;
 pub mod team_folders;
 pub mod team_notes;
 pub mod teams;
