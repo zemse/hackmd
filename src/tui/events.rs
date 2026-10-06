@@ -2205,6 +2205,11 @@ fn open_search_result(app: &mut App, r: SearchResult) -> Result<()> {
 }
 
 fn handle_mouse(app: &mut App, m: MouseEvent) -> Result<()> {
+    // Releasing the button ends any auto-scrolling drag, wherever it lands
+    // (including on rows other handlers claim, like the statusline).
+    if matches!(m.kind, MouseEventKind::Up(_)) {
+        app.body_drag_held = false;
+    }
     // A modal prompt owns the screen; ignore the mouse until it resolves.
     if app.prompt.is_some() {
         return Ok(());
