@@ -308,6 +308,7 @@ struct Builder {
 
     // structural state
     list_stack: Vec<ListFrame>,
+    item_start: usize,
     quote_depth: usize,
     in_heading: Option<HeadingLevel>,
     heading_buf: String,
@@ -405,6 +406,7 @@ impl Builder {
             cur_hanging: Vec::new(),
             style_stack: vec![Style::default()],
             list_stack: Vec::new(),
+            item_start: 0,
             quote_depth: 0,
             in_heading: None,
             heading_buf: String::new(),
@@ -1314,9 +1316,14 @@ impl Builder {
                 };
             }
             Tag::List(start) => {
+                // Tight lists have no paragraph-end event before a nested list.
+                if !self.list_stack.is_empty() {
+                    self.finish_paragraph(self.item_start..range.start);
+                }
                 self.list_stack.push(ListFrame { ordered: start });
             }
             Tag::Item => {
+                self.item_start = range.start;
                 let (prefix, hanging) = self.list_prefixes();
                 self.cur_prefix = prefix;
                 self.cur_hanging = hanging;
@@ -4237,6 +4244,62 @@ mod tests {
         for l in &r.link_map.links {
             assert_eq!(l.target, LinkTarget::Url("https://x".to_string()));
         }
+    }
+
+    #[test]
+    fn nested_task_items_keep_separate_rows_and_hit_targets() {
+        let src =
+            "- [ ] **Parent**\n  - [ ] **Child**\n    - [x] Leaf\n  - [ ] Sibling\n- [ ] Next\n";
+        let r = render(src, None, 80, &Theme::dark());
+        let rows: Vec<_> = r.lines.iter().map(line_text_of).collect();
+        let content: Vec<_> = rows.iter().filter(|s| !s.is_empty()).cloned().collect();
+        assert_eq!(
+            content,
+            vec![
+                "• [ ] Parent",
+                "  • [ ] Child",
+                "    • [x] Leaf",
+                "  • [ ] Sibling",
+                "• [ ] Next",
+            ]
+        );
+        assert_eq!(r.checkbox_map.items.len(), 5);
+        for (cb, label) in r
+            .checkbox_map
+            .items
+            .iter()
+            .zip(["Parent", "Child", "Leaf", "Sibling", "Next"])
+        {
+            assert!(rows[cb.line as usize].ends_with(label));
+            assert_eq!(
+                &src[cb.source_offset..cb.source_offset + 3],
+                if cb.checked { "[x]" } else { "[ ]" }
+            );
+        }
+        let parent = r.blocks.iter().find(|b| b.source_range.start == 0).unwrap();
+        assert_eq!(parent.source_range.end, src.find("  -").unwrap() + 2);
+    }
+
+    #[test]
+    fn nested_ordered_items_keep_parent_numbering() {
+        let src = "3. Parent\n   - Child\n     - Leaf\n   - Sibling\n4. Next\n";
+        let r = render(src, None, 80, &Theme::dark());
+        let rows: Vec<_> = r
+            .lines
+            .iter()
+            .map(line_text_of)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                "3. Parent",
+                "  • Child",
+                "    • Leaf",
+                "  • Sibling",
+                "4. Next"
+            ]
+        );
     }
 
     #[test]
