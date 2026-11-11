@@ -1,8 +1,8 @@
 [package]
 name = "hackmd"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Rust client library and CLI for HackMD"
+description = "Terminal Markdown editor with HackMD sync, CLI, and async Rust SDK"
 license = "MIT"
 repository = "https://github.com/zemse/hackmd"
 readme = "README.md"

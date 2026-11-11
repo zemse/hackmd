@@ -1,108 +1,44 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-11-12)
 
 ### Added
 
-- **`hackmd reveal`** — shows a file selected in the system file manager so it
-  can be dragged into a chat app: `hackmd reveal notes/page.md`, or
-  `hackmd reveal --note-id <id>` to export a cloud note to a temp file first.
-  Uses Finder on macOS, Explorer on Windows, and the file manager's D-Bus
-  `ShowItems` (falling back to `xdg-open` on the folder) on Linux. In the TUI,
-  `F` does the same for the open file, the browser's selected markdown file, or
-  an open cloud note.
-- **Marp presentations** — a local markdown file that enables
-  [Marp](https://marp.app) now opens as a slide deck instead of a scrolling
-  document. A deck is recognized by a `marp: true` line, a leading
-  `<!-- marp: true -->` comment, or (like the canonical marp.app example, which
-  omits `marp: true`) any Marp-distinctive front-matter directive — `paginate`,
-  `backgroundColor`/`backgroundImage`, or a `_`-prefixed spot directive — while
-  ordinary Jekyll/Hugo front matter stays a plain document. Slides split on `---` page breaks; front-matter and
-  `<!-- ... -->` directives/presenter-notes are hidden from the render. Arrow
-  keys, `Space`, and PageUp/PageDown switch slides (they don't scroll);
-  `Home`/`End` jump to the first/last slide; the status bar shows `Slide n/m`.
-  Global `header`/`footer`/`paginate` directives carry across slides (locals like
-  `_class: lead` apply to one slide and center it), and the page number renders
-  bottom-right when `paginate` is on. `p` (or `Esc`) toggles between the deck and
-  the ordinary scrolling reader. A `---` inside a fenced code block no longer
-  splits the deck, and front-matter spot directives (`_class: lead`) scope to the
-  first slide.
-- **Live slide preview while editing a deck** — the split editor's preview pane
-  now shows the single slide the cursor is in (rendered as a slide, with
-  centering, header/footer and a `n / total` label) instead of the whole
-  document, and follows the cursor across slides as you type or move.
-- **Marp background images** — a `![bg left:40%](url)` / `![bg right](url)`
-  background now reserves that fraction of the slide for the image and flows the
-  slide text into the remaining column (the image is pulled out of the text flow
-  instead of rendering as an inline `[image: …]` placeholder). Plain `![bg](url)`
-  fills the slide. The text re-wraps to the narrower content width.
-- **Remote and SVG images in the reader** — images now load off the render
-  thread: remote `http(s)://` assets are downloaded (and cached), and `.svg`
-  sources are rasterized (via `resvg`) before being handed to the terminal
-  graphics protocol (kitty / iTerm2 / sixel). Previously only local raster files
-  rendered; a Marp deck's remote SVG logos now appear too. Terminals without a
-  graphics protocol still show the `[image: …]` placeholder.
-- **Mermaid diagrams in the view pane** — a ` ```mermaid ` fenced block now
-  renders as a Unicode box-drawing diagram in the reader instead of raw source
-  (sequence, flowchart, class, ER, and xychart types via `merman-core` +
-  `merman-ascii`). The editor still shows the raw source so it stays editable,
-  and any unsupported diagram type or parse error falls back to the normal
-  highlighted code block.
-- **Git commit from the TUI** — uncommitted files (modified, added, deleted,
-  untracked, renamed) now carry an `[uncommitted]` badge in the browser, on
-  both files and the folders containing them. Press `gc` on an open file, a
-  selected file, or a selected folder to open a commit screen: it lists every
-  uncommitted file in the repo with per-file `+adds -dels` counts, pre-checks
-  the ones in the current selection's scope, and scrolls when the list
-  overflows. `Space` toggles a file, `a` toggles all, `Tab` moves between the
-  file list and the message box, `Enter` commits the checked files, `Esc`
-  cancels. The message box is multi-line: `Shift+Enter` (or `Alt+Enter` where
-  the terminal can't report Shift+Enter) inserts a newline and the box grows to
-  fit. Commits touch only the checked paths, leaving other changes untouched.
-- **HTML in markdown renders** — the HTML a document falls back to when
-  markdown's own syntax runs out is now parsed and laid out instead of being
-  dropped. `<table>` grids render with `colspan`/`rowspan` honoured (a spanning
-  header draws across its columns with no divider through it) and per-cell
-  `align`, sharing the click-to-expand behaviour of markdown tables.
-  `<details>`/`<summary>` becomes a fold: `▸` closed, `▾` open, toggled by
-  click or by `Enter` on the focused summary, starting from the document's own
-  `open` state. Structure carries too — `<h1>`–`<h6>` join the outline and
-  anchor list, `<ul>`/`<ol>`/`<li>` get markers, numbering and nesting,
-  `<blockquote>` takes the quote bar, `<pre>` keeps its whitespace, and `<img>`
-  is a real image embed inline with its text. Inline tags style their contents
-  (`<b>`, `<i>`, `<u>`, `<s>`, `<mark>`, `<code>`, `<kbd>`, `<a href>`, `<br>`,
-  with `<sub>`/`<sup>` folding to unicode glyphs where they exist: H₂O, x²),
-  and `<span style="color: …">` / `<font color>` paint the text. Unrecognized
-  tags contribute their text rather than vanishing.
-- **Create folders and move entries in the browser** — ending a `n` (new) name
-  with `/` creates a folder instead of a file and browses straight into it, so
-  `notes/drafts/` makes both levels at once. `m` moves the selected file or
-  folder: the destination is read relative to the browsed directory, Tab
-  ghost-completes existing folders, a trailing `/` (or a name that already is a
-  folder) means "into there, keep the name", and anything else is the full new
-  path, so a move can rename in the same keystroke. Existing destinations are
-  never clobbered and a folder can't be moved inside itself.
+- Marp slide presentations with background images and cursor-following slide
+  previews in the editor.
+- Mermaid diagrams rendered as Unicode art.
+- Remote and SVG images, HTML tables, collapsible details, and inline HTML
+  styling.
+- Git commit screen with per-file selection, multiline messages, and
+  uncommitted-file badges.
+- Folder creation, file moves, natural sorting, and Shift-held numbered
+  navigation in the browser.
+- Heading-link copying, heading-anchor completion, editor line numbers, and
+  document-based terminal titles.
+- `hackmd reveal` and a viewer `F` shortcut for revealing files in the system
+  file manager.
+- Live API quota reporting and clearer rate-limit messages.
 
 ### Changed
 
-- **Browser keys**: `r` renames (was `c`, `F2` still works), `m` moves, `c`
-  commits (the `gc` chord is unchanged), and `R` marks read (was `r`). `m` still
-  toggles mouse capture everywhere outside the browser, where `M` now does it.
-- Empty directories are listed in the browser. They hold nothing to read, but
-  hiding them made a folder just created (with `n`, or with `mkdir` outside the
-  app) look like it had failed.
+- Browser shortcuts: `r` renames, `m` moves, `c` commits, `R` marks read, and `M`
+  toggles mouse capture.
+- Cloud refreshes ask before fetching instead of polling in the background.
 
 ### Fixed
 
-- Renaming or moving a HackMD-linked file no longer orphans its sync base
-  snapshot. The cache is keyed by the file's path, so the next sync used to find
-  no common ancestor and turn a clean pull into a whole-file conflict.
-- Renaming or moving a file no longer resets it to `[unread]`, and history
-  entries pointing at it are rewritten so `h`/Back doesn't dead-end on the old
-  path.
-- The browser now notices a change one level down (a folder gaining its first
-  markdown file), which previously left the folder hidden until something else
-  in the listed directory happened to change.
+- Trailing-newline differences causing false sync conflicts.
+- Mouse-selection boundaries, drag auto-scrolling, and links in the split-editor
+  preview.
+- Marp detection, front-matter handling, and slide separators inside code fences.
+- Nested-list rendering and file-move state preservation.
+
+### Known issues
+
+- The viewer's `Shift+F` shortcut has a reported no-op that remains unresolved.
+  The CLI reveal command returned successfully on macOS.
+
+**Install/update:** `cargo install hackmd --version 0.2.0 --locked`
 
 ## 0.1.0 (2026-06-25)
 
